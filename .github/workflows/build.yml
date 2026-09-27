@@ -7,7 +7,8 @@ name: Build patched image
 
 on:
   schedule:
-    - cron: "17 9 * * 1"   # Mondays 09:17 UTC (5:17 AM Eastern)
+    - cron: "0 9 * * 1"   # Mondays 9:00 AM Eastern
+      timezone: "America/New_York"
   push:
     branches: [main]
     paths:
@@ -308,6 +309,9 @@ jobs:
       - name: Ask Gemini to resolve the conflict
         if: env.HAS_KEY == 'true'
         uses: google-github-actions/run-gemini-cli@v0.1.22
+        env:
+          # The throwaway CI checkout is the workspace Gemini is meant to edit.
+          GEMINI_CLI_TRUST_WORKSPACE: "true"
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           prompt: |

@@ -12,7 +12,7 @@ Use it anywhere you'd use upstream's image; the data volume and settings are the
 
 ## How it stays current
 
-This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` and a workflow that rebuilds on top of upstream once a week (Mondays), or whenever you run it by hand from the Actions tab:
+This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` and a workflow that rebuilds on top of upstream once a week (Mondays, 9 AM Eastern), or whenever you run it by hand from the Actions tab:
 
 1. **Check for changes.** It reads upstream `development`'s newest commit and the newest FastChannels Player release. If neither they nor the patch changed since the last build, it stops without rebuilding.
 2. **Apply the patch** to a fresh upstream checkout with `git am --3way`. A 3-way merge means upstream can move, add or edit code around our changes and the patch still lands. It fails only if upstream rewrites the same lines the patch changes.

@@ -20,7 +20,7 @@ scripts/
 
 ## Build lifecycle
 
-Weekly, on a manual run, or when `patches/`, `scripts/` or the workflow change:
+Weekly (Mondays, 9 AM Eastern), on a manual run, or when `patches/`, `scripts/` or the workflow change:
 
 1. Read upstream `development`'s newest commit and the newest Player APK release. Skip if that exact combination with these patches was already built.
 2. `git am --3way` the patches onto a fresh upstream checkout.
