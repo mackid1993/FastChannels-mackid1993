@@ -19,6 +19,14 @@ on:
         description: Rebuild even if upstream, the patches and the Player APK are unchanged
         type: boolean
         default: false
+      upstream_repo:
+        description: "Test only: build against this repo instead (nothing is published)"
+        type: string
+        default: ""
+      upstream_branch:
+        description: "Test only: build against this branch instead (nothing is published)"
+        type: string
+        default: ""
 
 concurrency:
   group: build
@@ -30,14 +38,21 @@ permissions:
   issues: write
 
 env:
-  UPSTREAM_REPO: kineticman/FastChannels
-  UPSTREAM_BRANCH: development
+  UPSTREAM_REPO: ${{ inputs.upstream_repo || 'kineticman/FastChannels' }}
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'development' }}
+  # A test run (against another repo/branch) builds and checks but never publishes,
+  # refreshes the patches, or files issues.
+  TEST_RUN: ${{ (inputs.upstream_repo != '' || inputs.upstream_branch != '') && 'true' || 'false' }}
   IMAGE: ghcr.io/${{ github.repository_owner }}/fastchannels-mackid1993
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      conflict: ${{ steps.apply.outputs.conflict }}
+      sha: ${{ steps.inputs.outputs.sha }}
+      short: ${{ steps.inputs.outputs.short }}
     steps:
       - name: Check out this repo
         uses: actions/checkout@v5
@@ -98,16 +113,18 @@ jobs:
         id: apply
         if: steps.skip.outputs.skip != 'true'
         continue-on-error: true
-        run: overlay/scripts/apply-patches.sh upstream
+        run: overlay/scripts/apply-patches.sh upstream || { echo "conflict=true" >> "$GITHUB_OUTPUT"; exit 1; }
 
       - name: Report a patch conflict
-        if: steps.skip.outputs.skip != 'true' && steps.apply.outcome == 'failure'
+        if: steps.skip.outputs.skip != 'true' && steps.apply.outcome == 'failure' && env.TEST_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           title="Patches no longer apply to upstream"
           body=$(cat <<BODY
           Upstream \`$UPSTREAM_BRANCH\` moved to [\`${{ steps.inputs.outputs.short }}\`](https://github.com/$UPSTREAM_REPO/commit/${{ steps.inputs.outputs.sha }}) and a patch in \`patches/\` conflicts with it, even with a 3-way merge. No image was published; \`:latest\` still points at the last good build.
+
+          If the \`GEMINI_API_KEY\` secret is set, Gemini is attempting the port now and will open a pull request for review.
 
           Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -121,6 +138,10 @@ jobs:
             gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
           fi
           exit 1
+
+      - name: Stop after a test-run conflict
+        if: steps.apply.outcome == 'failure' && env.TEST_RUN == 'true'
+        run: exit 1
 
       - name: Set up Python
         if: steps.skip.outputs.skip != 'true'
@@ -173,7 +194,7 @@ jobs:
         run: overlay/scripts/boot_test.sh fastchannels:ci
 
       - name: Publish to GHCR
-        if: steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true'
         uses: docker/build-push-action@v6
         with:
           context: upstream
@@ -196,7 +217,7 @@ jobs:
           cache-from: type=gha
 
       - name: Refresh patches against this upstream
-        if: steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true'
         run: |
           overlay/scripts/refresh-patches.sh upstream "${{ steps.inputs.outputs.sha }}"
           cd overlay
@@ -210,7 +231,7 @@ jobs:
           fi
 
       - name: Close the conflict issue
-        if: steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -220,6 +241,7 @@ jobs:
 
       - name: Keep the schedule alive
         # GitHub pauses scheduled workflows in repos with no activity for 60 days.
+        if: env.TEST_RUN != 'true'
         run: |
           cd overlay
           last=$(git log -1 --format=%ct)
@@ -228,4 +250,153 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git commit -q --allow-empty -m "Keep the scheduled build active"
             git push
+          fi
+
+  # Runs only when the patch conflicts. Gemini gets a read-only token, no git
+  # credentials and no other secrets, and works in a throwaway checkout. Its result
+  # must touch only the conflicted files and pass the static checks, then comes to
+  # you as a pull request. Merging it triggers the normal build (image, APK check,
+  # smoke test, boot test) before anything is published.
+  resolve:
+    needs: build
+    if: always() && needs.build.outputs.conflict == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      HAS_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
+    steps:
+      - name: Check out this repo
+        if: env.HAS_KEY == 'true'
+        uses: actions/checkout@v5
+        with:
+          path: overlay
+          persist-credentials: false
+
+      - name: Recreate the conflict
+        if: env.HAS_KEY == 'true'
+        run: |
+          git clone --branch "$UPSTREAM_BRANCH" "https://github.com/$UPSTREAM_REPO.git" upstream
+          cd upstream
+          git checkout -q "${{ needs.build.outputs.sha }}"
+          git config user.name "fastchannels-ci"
+          git config user.email "fastchannels-ci@users.noreply.github.com"
+          # Stops at the conflicting patch, leaving conflict markers in the files.
+          git am --3way --keep-cr ../overlay/patches/*.patch || true
+          [ -d .git/rebase-apply ] || { echo "::error::expected git am to stop at a conflict"; exit 1; }
+          echo "Conflicted files:"; git diff --name-only --diff-filter=U
+
+      - name: Ask Gemini to resolve the conflict
+        if: env.HAS_KEY == 'true'
+        uses: google-github-actions/run-gemini-cli@v0.1.22
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          prompt: |
+            The directory ./upstream is a checkout of the FastChannels repository. A
+            patch that adds an opt-in "DirecTV ad insertion (DAI)" feature no longer
+            applies cleanly: `git am --3way` stopped with conflict markers
+            (<<<<<<< ======= >>>>>>>) in the files listed by
+            `git -C upstream diff --name-only --diff-filter=U`. The patch being
+            applied is ./upstream/.git/rebase-apply/patch.
+
+            Resolve every conflict in those files. Rules:
+            - The result must be upstream's current code plus exactly the behavior the
+              patch adds. Read the whole patch first so you understand what it does.
+            - Keep every upstream change. If upstream renamed or restructured code the
+              patch relies on, adapt the patch's code to the new structure.
+            - Edit only the conflicted files, and only what the conflicts require.
+              Don't refactor, reformat or change anything else.
+            - Leave no conflict markers. `python3 -m compileall -q upstream/app` must
+              succeed.
+            - Only edit files. Don't run git commands that change the index or
+              history (no add, commit, am, reset, checkout or push).
+
+      - name: Check the result and finish the merge
+        if: env.HAS_KEY == 'true'
+        run: |
+          cd upstream
+          conflicted=$(git diff --name-only --diff-filter=U)
+          [ -n "$conflicted" ] || { echo "::error::no conflicted files recorded"; exit 1; }
+          if grep -nE '^(<<<<<<<|=======|>>>>>>>)( |$)' $conflicted; then
+            echo "::error::conflict markers remain after Gemini's pass"; exit 1
+          fi
+          stray=$(git status --porcelain --untracked-files=all | awk '{print $NF}' | grep -vxF -f <(printf '%s\n' $conflicted) | grep -v '^\.gemini/' || true)
+          [ -z "$stray" ] || { echo "::error::Gemini changed files outside the conflict: $stray"; exit 1; }
+          git add -- $conflicted
+          GIT_EDITOR=true git am --continue
+
+      - name: Set up Python
+        if: env.HAS_KEY == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Static checks
+        if: env.HAS_KEY == 'true'
+        env:
+          UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          pip install --quiet ruff jinja2
+          overlay/scripts/validate.sh upstream
+
+      - name: Export the ported patch
+        if: env.HAS_KEY == 'true'
+        run: overlay/scripts/refresh-patches.sh upstream "${{ needs.build.outputs.sha }}"
+
+      - name: Upload the ported patch
+        if: env.HAS_KEY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ported-patches
+          path: overlay/patches/
+
+  open-pr:
+    needs: [build, resolve]
+    if: always() && needs.build.outputs.conflict == 'true' && needs.resolve.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v5
+
+      - name: Download the ported patch
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ported-patches
+          path: ported
+
+      - name: Open a pull request
+        if: steps.download.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ needs.build.outputs.short }}
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          branch="auto/port-$SHORT"
+          rm -f patches/*.patch
+          cp ported/*.patch patches/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -A patches
+          git commit -q -m "Port patches to upstream $SHORT (conflict resolved by Gemini)"
+          git push -f origin "$branch"
+          issue=$(gh issue list --state open --search 'in:title "Patches no longer apply to upstream"' --json number --jq '.[0].number')
+          body=$(cat <<BODY
+          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and the patch conflicted. Gemini resolved the conflict, changing only the conflicted files, and the result passed the static checks: compile, no new ruff errors, templates parse, DAI code present.
+
+          **Review the diff before merging.** Merging runs the full build: image, Player APK check, DAI smoke test and boot test. \`:latest\` only updates if all of them pass.
+
+          ${issue:+Refs #$issue}
+          BODY
+          )
+          if [ -z "$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')" ]; then
+            title="Port patches to upstream $SHORT"
+            [ "$TEST_RUN" != true ] || title="[test run, don't merge] $title"
+            gh pr create --head "$branch" --base main --title "$title" --body "$body"
           fi
