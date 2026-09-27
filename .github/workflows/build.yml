@@ -1,0 +1,231 @@
+name: Build patched image
+
+# Every two hours: take kineticman/FastChannels' development branch as it is right
+# now, apply the patches in patches/, validate, build, smoke-test and boot-test the
+# image, then publish it to GHCR. Nothing is published unless every check passes.
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - "scripts/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if upstream, the patches and the Player APK are unchanged
+        type: boolean
+        default: false
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: kineticman/FastChannels
+  UPSTREAM_BRANCH: development
+  IMAGE: ghcr.io/${{ github.repository_owner }}/fastchannels-mackid1993
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v5
+        with:
+          path: overlay
+          fetch-depth: 0
+
+      - name: Resolve upstream commit and Player APK release
+        id: inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)
+          [ -n "$sha" ] || { echo "::error::could not read upstream $UPSTREAM_BRANCH"; exit 1; }
+          # The image bundles the Player APK from upstream's latest release, so a new
+          # release must trigger a rebuild even when no code changed.
+          apk=$(gh api "repos/$UPSTREAM_REPO/releases/latest" \
+                --jq '.tag_name + "@" + ([.assets[] | select(.name == "FastChannelsPlayer.apk") | "\(.id)-\(.updated_at)"] | first // "none")')
+          # Only the patches' added/removed lines count, so the automatic context
+          # refresh below doesn't trigger a pointless rebuild of identical code.
+          overlay=$(cd overlay && { git ls-files -s scripts .github/workflows/build.yml; grep -hE '^[-+]' patches/*.patch; } | sha256sum | cut -c1-12)
+          key=$(printf '%s|%s|%s' "$sha" "$apk" "$overlay" | sha256sum | cut -c1-12)
+          {
+            echo "sha=$sha"
+            echo "short=${sha:0:7}"
+            echo "apk=$apk"
+            echo "apk_tag=${apk%%@*}"
+            echo "key=$key"
+          } >> "$GITHUB_OUTPUT"
+          echo "Upstream $UPSTREAM_BRANCH: $sha | Player APK: $apk | build key: $key"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if this exact build already exists
+        id: skip
+        run: |
+          if [ "${{ inputs.force }}" != "true" ] && docker manifest inspect "$IMAGE:build-${{ steps.inputs.outputs.key }}" >/dev/null 2>&1; then
+            echo "Already built: upstream ${{ steps.inputs.outputs.short }}, APK ${{ steps.inputs.outputs.apk_tag }}, same patches."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out upstream
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          # Full history, so git am --3way can find the original version of any
+          # file a patch touches.
+          git clone --branch "$UPSTREAM_BRANCH" "https://github.com/$UPSTREAM_REPO.git" upstream
+          git -C upstream checkout -q "${{ steps.inputs.outputs.sha }}"
+
+      - name: Apply patches
+        id: apply
+        if: steps.skip.outputs.skip != 'true'
+        continue-on-error: true
+        run: overlay/scripts/apply-patches.sh upstream
+
+      - name: Report a patch conflict
+        if: steps.skip.outputs.skip != 'true' && steps.apply.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Patches no longer apply to upstream"
+          body=$(cat <<BODY
+          Upstream \`$UPSTREAM_BRANCH\` moved to [\`${{ steps.inputs.outputs.short }}\`](https://github.com/$UPSTREAM_REPO/commit/${{ steps.inputs.outputs.sha }}) and a patch in \`patches/\` conflicts with it, even with a 3-way merge. No image was published; \`:latest\` still points at the last good build.
+
+          Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          To fix: clone upstream at that commit, run \`scripts/apply-patches.sh\`, resolve the conflict, finish with \`git am --continue\`, then run \`scripts/refresh-patches.sh <checkout> ${{ steps.inputs.outputs.sha }}\` and commit the updated patch here. The push rebuilds automatically.
+          BODY
+          )
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+          exit 1
+
+      - name: Set up Python
+        if: steps.skip.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Static checks
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.inputs.outputs.sha }}
+        run: |
+          pip install --quiet ruff jinja2
+          overlay/scripts/validate.sh upstream
+
+      - name: Set up Docker Buildx
+        if: steps.skip.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        if: steps.skip.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: fastchannels:ci
+          # Unique per run, so every build re-downloads yt-dlp and the newest
+          # Player APK from upstream's latest release.
+          build-args: |
+            YTDLP_REFRESH=${{ github.run_id }}
+            FC_PLAYER_APK_REFRESH=${{ steps.inputs.outputs.apk }}-${{ github.run_id }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check the Player APK is bundled
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          docker run --rm --entrypoint sh fastchannels:ci -c 'test -s /app/fc_player_release.apk' \
+            || { echo "::error::the image has no FastChannels Player APK (upstream release ${{ steps.inputs.outputs.apk_tag }})"; exit 1; }
+          echo "Bundled the Player APK from ${{ steps.inputs.outputs.apk_tag }}."
+
+      - name: Smoke test the DAI code in the image
+        if: steps.skip.outputs.skip != 'true'
+        run: docker run --rm -w /app -v "$PWD/overlay/scripts:/ci:ro" --entrypoint python fastchannels:ci /ci/smoke_test.py
+
+      - name: Boot test
+        if: steps.skip.outputs.skip != 'true'
+        run: overlay/scripts/boot_test.sh fastchannels:ci
+
+      - name: Publish to GHCR
+        if: steps.skip.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:upstream-${{ steps.inputs.outputs.short }}
+            ${{ env.IMAGE }}:build-${{ steps.inputs.outputs.key }}
+          labels: |
+            org.opencontainers.image.title=FastChannels (mackid1993)
+            org.opencontainers.image.description=kineticman/FastChannels development plus the DirecTV DAI patch
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.inputs.outputs.sha }}
+            fastchannels.player-apk=${{ steps.inputs.outputs.apk_tag }}
+          build-args: |
+            YTDLP_REFRESH=${{ github.run_id }}
+            FC_PLAYER_APK_REFRESH=${{ steps.inputs.outputs.apk }}-${{ github.run_id }}
+          cache-from: type=gha
+
+      - name: Refresh patches against this upstream
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          overlay/scripts/refresh-patches.sh upstream "${{ steps.inputs.outputs.sha }}"
+          cd overlay
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain patches)" ]; then
+            git add -A patches
+            git commit -q -m "Refresh patches against upstream ${{ steps.inputs.outputs.short }}"
+            git push
+            echo "Patch context updated for upstream ${{ steps.inputs.outputs.short }}."
+          fi
+
+      - name: Close the conflict issue
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list -R "$GITHUB_REPOSITORY" --state open --search 'in:title "Patches no longer apply to upstream"' --json number --jq '.[].number'); do
+            gh issue close "$n" -R "$GITHUB_REPOSITORY" --comment "Fixed: built and published upstream ${{ steps.inputs.outputs.short }} with the patches."
+          done
+
+      - name: Keep the schedule alive
+        # GitHub pauses scheduled workflows in repos with no activity for 60 days.
+        run: |
+          cd overlay
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 45 * 86400 )) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -q --allow-empty -m "Keep the scheduled build active"
+            git push
+          fi
