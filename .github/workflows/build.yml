@@ -1,12 +1,13 @@
 name: Build patched image
 
-# Every two hours: take kineticman/FastChannels' development branch as it is right
+# Once a week: take kineticman/FastChannels' development branch as it is right
 # now, apply the patches in patches/, validate, build, smoke-test and boot-test the
 # image, then publish it to GHCR. Nothing is published unless every check passes.
+# Run it by hand (Actions > Build patched image > Run workflow) for a build sooner.
 
 on:
   schedule:
-    - cron: "17 */2 * * *"
+    - cron: "17 9 * * 1"   # Mondays 09:17 UTC (5:17 AM Eastern)
   push:
     branches: [main]
     paths:
@@ -43,6 +44,8 @@ env:
   # A test run (against another repo/branch) builds and checks but never publishes,
   # refreshes the patches, or files issues.
   TEST_RUN: ${{ (inputs.upstream_repo != '' || inputs.upstream_branch != '') && 'true' || 'false' }}
+  # The Dockerfile always downloads the Player APK from kineticman's latest release.
+  APK_REPO: kineticman/FastChannels
   IMAGE: ghcr.io/${{ github.repository_owner }}/fastchannels-mackid1993
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
@@ -69,7 +72,7 @@ jobs:
           [ -n "$sha" ] || { echo "::error::could not read upstream $UPSTREAM_BRANCH"; exit 1; }
           # The image bundles the Player APK from upstream's latest release, so a new
           # release must trigger a rebuild even when no code changed.
-          apk=$(gh api "repos/$UPSTREAM_REPO/releases/latest" \
+          apk=$(gh api "repos/$APK_REPO/releases/latest" \
                 --jq '.tag_name + "@" + ([.assets[] | select(.name == "FastChannelsPlayer.apk") | "\(.id)-\(.updated_at)"] | first // "none")')
           # Only the patches' added/removed lines count, so the automatic context
           # refresh below doesn't trigger a pointless rebuild of identical code.
@@ -124,7 +127,7 @@ jobs:
           body=$(cat <<BODY
           Upstream \`$UPSTREAM_BRANCH\` moved to [\`${{ steps.inputs.outputs.short }}\`](https://github.com/$UPSTREAM_REPO/commit/${{ steps.inputs.outputs.sha }}) and a patch in \`patches/\` conflicts with it, even with a 3-way merge. No image was published; \`:latest\` still points at the last good build.
 
-          If the \`GEMINI_API_KEY\` secret is set, Gemini is attempting the port now and will open a pull request for review.
+          If the \`GEMINI_API_KEY\` secret is set, Gemini is resolving the conflict now. If its fix passes the checks, it is merged automatically and a new image is built and tested; this issue closes when that build succeeds.
 
           Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -235,9 +238,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for n in $(gh issue list -R "$GITHUB_REPOSITORY" --state open --search 'in:title "Patches no longer apply to upstream"' --json number --jq '.[].number'); do
+          for n in $(gh issue list -R "$GITHUB_REPOSITORY" --state open --search 'in:title "Patches no longer apply to upstream" OR in:title "Build failed"' --json number --jq '.[].number'); do
             gh issue close "$n" -R "$GITHUB_REPOSITORY" --comment "Fixed: built and published upstream ${{ steps.inputs.outputs.short }} with the patches."
           done
+
+      - name: Report a failed build
+        if: failure() && steps.apply.outcome != 'failure' && env.TEST_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Build failed"
+          body="Upstream \`${{ steps.inputs.outputs.short }}\` with the patches failed a check. No image was published; \`:latest\` still points at the last good build. Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body "$body"
+          else gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"; fi
 
       - name: Keep the schedule alive
         # GitHub pauses scheduled workflows in repos with no activity for 60 days.
@@ -286,12 +300,19 @@ jobs:
           [ -d .git/rebase-apply ] || { echo "::error::expected git am to stop at a conflict"; exit 1; }
           echo "Conflicted files:"; git diff --name-only --diff-filter=U
 
+      - name: Give Gemini the repo background
+        if: env.HAS_KEY == 'true'
+        # Gemini CLI loads GEMINI.md from its working directory as context.
+        run: cp overlay/AGENTS.md GEMINI.md
+
       - name: Ask Gemini to resolve the conflict
         if: env.HAS_KEY == 'true'
         uses: google-github-actions/run-gemini-cli@v0.1.22
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           prompt: |
+            Read ./overlay/AGENTS.md first: it explains this repo and the DAI patch.
+
             The directory ./upstream is a checkout of the FastChannels repository. A
             patch that adds an opt-in "DirecTV ad insertion (DAI)" feature no longer
             applies cleanly: `git am --3way` stopped with conflict markers
@@ -358,6 +379,7 @@ jobs:
       contents: write
       pull-requests: write
       issues: read
+      actions: write
     steps:
       - name: Check out this repo
         uses: actions/checkout@v5
@@ -390,13 +412,24 @@ jobs:
           body=$(cat <<BODY
           Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and the patch conflicted. Gemini resolved the conflict, changing only the conflicted files, and the result passed the static checks: compile, no new ruff errors, templates parse, DAI code present.
 
-          **Review the diff before merging.** Merging runs the full build: image, Player APK check, DAI smoke test and boot test. \`:latest\` only updates if all of them pass.
+          This PR is merged automatically, which starts the full build: image, Player APK check, DAI smoke test and boot test. \`:latest\` only updates if all of them pass.
 
           ${issue:+Refs #$issue}
           BODY
           )
-          if [ -z "$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')" ]; then
-            title="Port patches to upstream $SHORT"
-            [ "$TEST_RUN" != true ] || title="[test run, don't merge] $title"
-            gh pr create --head "$branch" --base main --title "$title" --body "$body"
+          title="Port patches to upstream $SHORT"
+          [ "$TEST_RUN" != true ] || title="[test run, don't merge] $title"
+          pr=$(gh pr list --head "$branch" --state open --json url --jq '.[0].url')
+          [ -n "$pr" ] || pr=$(gh pr create --head "$branch" --base main --title "$title" --body "$body")
+          echo "Opened $pr"
+          if [ "$TEST_RUN" = true ]; then
+            echo "Test run: leaving the PR open and publishing nothing."
+            exit 0
           fi
+          # Merge it and start a normal build. That build runs every check (image,
+          # APK, smoke test, boot test) and only publishes if all of them pass.
+          # workflow_dispatch is used because pushes made with GITHUB_TOKEN don't
+          # trigger workflows.
+          gh pr merge "$pr" --squash --delete-branch
+          gh workflow run build.yml --ref main
+          echo "Merged $pr and started the publishing build."

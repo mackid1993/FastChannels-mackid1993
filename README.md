@@ -12,9 +12,9 @@ Use it anywhere you'd use upstream's image; the data volume and settings are the
 
 ## How it stays current
 
-This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` and a workflow that rebuilds on top of upstream every two hours:
+This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` and a workflow that rebuilds on top of upstream once a week (Mondays), or whenever you run it by hand from the Actions tab:
 
-1. **Check for changes.** It reads upstream `development`'s newest commit and the newest FastChannels Player release. If neither they nor the patch changed since the last build, it stops.
+1. **Check for changes.** It reads upstream `development`'s newest commit and the newest FastChannels Player release. If neither they nor the patch changed since the last build, it stops without rebuilding.
 2. **Apply the patch** to a fresh upstream checkout with `git am --3way`. A 3-way merge means upstream can move, add or edit code around our changes and the patch still lands. It fails only if upstream rewrites the same lines the patch changes.
 3. **Static checks:** every Python file compiles; ruff's error rules (syntax errors, undefined names) find nothing new compared with pristine upstream; every template parses; the DAI code is present.
 4. **Build** the image, which downloads the latest Player APK from upstream's latest release, and confirm the APK is bundled.
@@ -27,7 +27,11 @@ If any step fails, nothing is published and `:latest` stays on the last good bui
 
 ## When the patch conflicts
 
-If upstream rewrites the lines the patch changes, step 2 fails and the workflow opens an issue here with the upstream commit and instructions. To fix it:
+If upstream rewrites the lines the patch changes, step 2 fails and the workflow opens an issue here with the upstream commit and instructions.
+
+It then asks Gemini (free API key in the `GEMINI_API_KEY` secret) to resolve the conflict, with `AGENTS.md` as background. Gemini runs with a read-only token and no other secrets, and may only edit the conflicted files. If its result passes the static checks, CI opens a pull request with it, merges it, and starts a normal build. That build must pass every check (image, Player APK, smoke test, boot test) before `:latest` changes, and the issue closes when it succeeds. The merged PR stays in the history if you want to see what Gemini changed.
+
+To fix a conflict by hand instead:
 
 ```
 git clone https://github.com/kineticman/FastChannels.git up && cd up
