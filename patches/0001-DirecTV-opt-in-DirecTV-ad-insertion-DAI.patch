@@ -9,9 +9,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
 ---
  app/routes/api_sources.py        |   2 +
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 350 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 352 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 4 files changed, 370 insertions(+), 2 deletions(-)
+ 4 files changed, 372 insertions(+), 2 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -149,10 +149,10 @@ index e796bf3..1eb6939 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..6b38b4a
+index 0000000..eeba96a
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,352 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -203,7 +203,9 @@ index 0000000..6b38b4a
 +    'nielsen_platform': 'plt,OTT', 'nielsen_dev_group': 'devgrp,STV',
 +    'comscore_platform': 'android', 'comscore_impl_type': 'a',
 +    '_fw_nielsen_app_id': 'P7CFE36DB-A8D9-4801-95FE-51C29101342C',
-+    'yo.fr': 'true', 'yo.av': '5',
++    # yo.lpa/yo.lp: live-pause mode, which the yospace.pool=livepause session
++    # needs (the Osprey sends yo.lpa; without them no ads were inserted).
++    'yo.fr': 'true', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
 +    # The Android TV app's own live Yospace params (its bundled client config:
 +    # the shared YSLiveParams plus the 'atv' platform overrides). yo.cps is the
 +    # value it sends on a fresh tune (<min> = 3 minutes = 180 s). yo.vm is its
