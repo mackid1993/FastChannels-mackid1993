@@ -300,6 +300,8 @@ jobs:
           git am --3way --keep-cr ../overlay/patches/*.patch || true
           [ -d .git/rebase-apply ] || { echo "::error::expected git am to stop at a conflict"; exit 1; }
           echo "Conflicted files:"; git diff --name-only --diff-filter=U
+          # Gemini can't read inside .git, so hand it a copy of the patch being applied.
+          cp .git/rebase-apply/patch ../conflict.patch
 
       - name: Give Gemini the repo background
         if: env.HAS_KEY == 'true'
@@ -314,6 +316,9 @@ jobs:
           GEMINI_CLI_TRUST_WORKSPACE: "true"
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          # Optional repo variable. Pick the model with the most free daily requests
+          # at https://aistudio.google.com/rate-limit; empty uses Gemini CLI's default.
+          gemini_model: ${{ vars.GEMINI_MODEL }}
           prompt: |
             Read ./overlay/AGENTS.md first: it explains this repo and the DAI patch.
 
@@ -322,7 +327,7 @@ jobs:
             applies cleanly: `git am --3way` stopped with conflict markers
             (<<<<<<< ======= >>>>>>>) in the files listed by
             `git -C upstream diff --name-only --diff-filter=U`. The patch being
-            applied is ./upstream/.git/rebase-apply/patch.
+            applied is ./conflict.patch.
 
             Resolve every conflict in those files. Rules:
             - The result must be upstream's current code plus exactly the behavior the
