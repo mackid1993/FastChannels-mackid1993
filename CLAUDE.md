@@ -46,6 +46,7 @@ Every value comes from DirecTV's own clients. None is guessed.
 
 ### Hard-won facts
 
+- **The User-Agent of the request that creates the Yospace session matters.** For the bridge, FastChannels fetches the master itself (`/play/directv/<id>/browser.m3u8`), and that fetch creates the ad session. Upstream sends it with python-requests' User-Agent. DirecTV's apps set their real player User-Agent on the session (Osprey: `YospaceAdsProvider` → `SessionProperties.setUserAgent`, value `QPExoPlayer/<ver> (Linux;Android <rel>;<model>) AndroidXMedia3/1.8.0`). The patch forwards the playing device's own User-Agent (`session_headers()`). With the python-requests UA, every inserted ad's AC-3 rendition measured was band-limited to 7 kHz (8 of 8 on 2026-09-28).
 - **`d` is what the ad server keys on.** Same account, same breaks, run side by side:
   - no `d`: **0** inserted ads;
   - `d=android_tv`, `firetv`, `osprey` or `desktop`: ads inserted;
