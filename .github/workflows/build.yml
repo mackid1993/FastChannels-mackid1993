@@ -142,6 +142,8 @@ jobs:
 
           If the \`OPENROUTER_API_KEY\` secret is set, an AI is resolving the conflict now. If its fix passes the checks, it is merged automatically and a new image is built and tested; this issue closes when that build succeeds.
 
+          cc @${{ github.repository_owner }}
+
           Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
           To fix: clone upstream at that commit, run \`scripts/apply-patches.sh\`, resolve the conflict, finish with \`git am --continue\`, then run \`scripts/refresh-patches.sh <checkout> ${{ steps.inputs.outputs.sha }}\` and commit the updated patch here. The push rebuilds automatically.
@@ -261,7 +263,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           title="Build failed"
-          body="Upstream \`${{ steps.inputs.outputs.short }}\` with the patches failed a check. No image was published; \`:latest\` still points at the last good build. Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          body="Upstream \`${{ steps.inputs.outputs.short }}\` with the patches failed a check. No image was published; \`:latest\` still points at the last good build. Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} cc @${{ github.repository_owner }}"
           existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
           if [ -n "$existing" ]; then gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body "$body"
           else gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"; fi
@@ -445,6 +447,8 @@ jobs:
           This PR is merged automatically, which starts the full build: image, Player APK check, DAI smoke test and boot test. \`:latest\` only updates if all of them pass.
 
           ${issue:+Refs #$issue}
+
+          cc @${{ github.repository_owner }}
           BODY
           )
           title="Port patches to upstream $SHORT"
