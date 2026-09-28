@@ -79,6 +79,12 @@ other = dai.build_query({**config, 'dai_gpp_sid': '8'}, {}, '123')
 assert 'is_lat' not in other, 'is_lat derived from a non-US-National GPP section'
 assert 'net' not in other
 
+# Never identify as a desktop browser: that pulled web ad inventory (other markets'
+# spots, band-limited audio) instead of the account's local TV ads.
+for key in ('d', 'nielsen_dev_group', 'nielsen_platform', 'comscore_platform', '_fw_nielsen_app_id'):
+    assert key not in query, f'desktop identity flag {key!r} is being sent'
+assert query.get('m') == 'live' and query.get('yo.lp') == 'true', 'general client flags missing'
+
 # Values that weren't sourced from the account are omitted, never invented.
 bare = dai.build_query({}, {}, '123')
 for key in ('hhid', 'u', 'profid', 'dma_location', 'gpp', 'is_lat', 'adid'):

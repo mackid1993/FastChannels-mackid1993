@@ -9,9 +9,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
 ---
  app/routes/api_sources.py        |   2 +
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 323 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 328 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 4 files changed, 343 insertions(+), 2 deletions(-)
+ 4 files changed, 348 insertions(+), 2 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -149,10 +149,10 @@ index e796bf3..1eb6939 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..48609aa
+index 0000000..6f7fae5
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,328 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -180,6 +180,16 @@ index 0000000..48609aa
 +
 +_LOCATION_URL = "https://api.cld.dtvce.com/right/location/area/v2/service/location"
 +_BASICINFO_URL = "https://api.cld.dtvce.com/profile/information/basicinfogo/service"
++
++# General client flags from the DirecTV web client's DAI request that say nothing
++# about the device type. The desktop identity it also sends (d=desktop, the
++# Nielsen/comScore "DSK"/"PC" platform tags and the Nielsen web-app id) is left out
++# on purpose: it pulled web ad inventory, with other markets' spots and
++# band-limited audio, instead of the TV inventory for the account's DMA.
++_CLIENT_PARAMS = {
++    'e': 'prod', 'm': 'live', 'at': 'NOW.RR', 'ut': 'bbtv', 'us_privacy': 'null',
++    'yo.po': '32', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
++}
 +
 +CONFIG_FIELD = ConfigField(
 +    'use_dai', 'Use DirecTV ad insertion (DAI)',
@@ -245,17 +255,12 @@ index 0000000..48609aa
 +
 +
 +def build_query(config: dict, dai_channel_names: dict, ccid: str) -> dict:
-+    """The account's own ad-targeting values for the DAI request: household/
-+    profile/DMA, its real ad-personalization choice (is_lat derived from the
-+    account's GPP consent string), our device's own ad ids, and the per-channel
-+    net tag. Only values actually sourced from the account (or minted for our own
-+    device) are included.
-+
-+    The desktop web client's platform flags (d=desktop and its Nielsen/comScore/
-+    Yospace client flags) are deliberately not sent: identifying as a desktop
-+    browser pulled web ad inventory, with other markets' spots and band-limited
-+    audio, instead of the TV inventory for the account's DMA."""
-+    q = {}
++    """The DAI request flags: the general client flags (never a desktop device
++    identity; see _CLIENT_PARAMS), the account's own household/profile/DMA, its
++    real ad-personalization choice (is_lat derived from the account's GPP consent
++    string), our device's own ad ids, and the per-channel net tag. Only values
++    actually sourced from the account (or minted for our own device) are included."""
++    q = dict(_CLIENT_PARAMS)
 +    pid = config.get('dai_partner_profile_id')
 +    if pid:
 +        q['hhid'] = pid
