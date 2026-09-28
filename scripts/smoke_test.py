@@ -81,8 +81,10 @@ assert 'net' not in other
 
 # Never identify as a desktop browser: that pulled web ad inventory (other markets'
 # spots, band-limited audio) instead of the account's local TV ads.
-for key in ('d', 'nielsen_dev_group', 'nielsen_platform', 'comscore_platform', '_fw_nielsen_app_id'):
+for key in ('d', 'comscore_platform', 'comscore_impl_type'):
     assert key not in query, f'desktop identity flag {key!r} is being sent'
+assert query.get('nielsen_platform') == 'plt,OTT' and query.get('nielsen_dev_group') == 'devgrp,STV', \
+    'must send the Android TV Nielsen values, never desktop (plt,DSK / devgrp,DSK)'
 assert query.get('m') == 'live' and query.get('yo.lp') == 'true', 'general client flags missing'
 assert query.get('attnid') == 'dfw003' and query.get('p') == 'dfw', 'DirecTV app constants missing'
 assert query.get('metr') == '1071', "metr must be DirecTV's TV device-class code"
