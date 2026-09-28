@@ -2,12 +2,15 @@ name: Build patched image
 
 # Once a week: take kineticman/FastChannels' development branch as it is right
 # now, apply the patches in patches/, validate, build, smoke-test and boot-test the
-# image, then publish it to GHCR. Nothing is published unless every check passes.
-# Run it by hand (Actions > Build patched image > Run workflow) for a build sooner.
+# image, then publish that tested image to GHCR. Nothing is published unless every
+# check passes. Run it by hand (Actions > Build patched image > Run workflow) for a
+# build sooner.
 #
 # The other days: a drift check. Apply the patches to upstream's latest code,
 # run the static checks and refresh the patches' context, without building an
-# image. A conflict is caught (and fixed by the AI) the day it appears.
+# image. A conflict is caught (and fixed by the AI) the day it appears. If the last
+# build failed, the drift check does a full build instead, so a one-off failure is
+# retried the next day rather than the next week.
 
 on:
   schedule:
@@ -60,6 +63,8 @@ env:
   # The Dockerfile always downloads the Player APK from kineticman's latest release.
   APK_REPO: kineticman/FastChannels
   IMAGE: ghcr.io/${{ github.repository_owner }}/fastchannels-mackid1993
+  CONFLICT_TITLE: Patches no longer apply to upstream
+  FAILED_TITLE: Build failed
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
@@ -69,6 +74,8 @@ jobs:
       conflict: ${{ steps.apply.outputs.conflict }}
       sha: ${{ steps.inputs.outputs.sha }}
       short: ${{ steps.inputs.outputs.short }}
+      apk: ${{ steps.inputs.outputs.apk }}
+      apk_tag: ${{ steps.inputs.outputs.apk_tag }}
     steps:
       - name: Check out this repo
         uses: actions/checkout@v5
@@ -76,7 +83,7 @@ jobs:
           path: overlay
           fetch-depth: 0
 
-      - name: Resolve upstream commit and Player APK release
+      - name: Resolve upstream commit, Player APK release and run mode
         id: inputs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -91,14 +98,22 @@ jobs:
           # refresh below doesn't trigger a pointless rebuild of identical code.
           overlay=$(cd overlay && { git ls-files -s scripts .github/workflows/build.yml; grep -hE '^[-+]' patches/*.patch; } | sha256sum | cut -c1-12)
           key=$(printf '%s|%s|%s' "$sha" "$apk" "$overlay" | sha256sum | cut -c1-12)
+          # A drift day does a full build instead while the last build's failure is
+          # unresolved, so a one-off failure is retried daily.
+          drift=$DRIFT_ONLY
+          if [ "$drift" = true ] && [ "$TEST_RUN" != true ] && overlay/scripts/issue.sh exists "$FAILED_TITLE"; then
+            echo "The last build failed; doing a full build instead of a drift check."
+            drift=false
+          fi
           {
             echo "sha=$sha"
             echo "short=${sha:0:7}"
             echo "apk=$apk"
             echo "apk_tag=${apk%%@*}"
             echo "key=$key"
+            echo "drift=$drift"
           } >> "$GITHUB_OUTPUT"
-          echo "Upstream $UPSTREAM_BRANCH: $sha | Player APK: $apk | build key: $key"
+          echo "Upstream $UPSTREAM_BRANCH: $sha | Player APK: $apk | build key: $key | drift check only: $drift"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -110,7 +125,7 @@ jobs:
       - name: Skip if this exact build already exists
         id: skip
         run: |
-          if [ "${{ inputs.force }}" != "true" ] && docker manifest inspect "$IMAGE:build-${{ steps.inputs.outputs.key }}" >/dev/null 2>&1; then
+          if [ "${{ inputs.force }}" != "true" ] && docker buildx imagetools inspect "$IMAGE:build-${{ steps.inputs.outputs.key }}" >/dev/null 2>&1; then
             echo "Already built: upstream ${{ steps.inputs.outputs.short }}, APK ${{ steps.inputs.outputs.apk_tag }}, same patches."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -136,25 +151,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          title="Patches no longer apply to upstream"
-          body=$(cat <<BODY
+          cat > body.md <<BODY
           Upstream \`$UPSTREAM_BRANCH\` moved to [\`${{ steps.inputs.outputs.short }}\`](https://github.com/$UPSTREAM_REPO/commit/${{ steps.inputs.outputs.sha }}) and a patch in \`patches/\` conflicts with it, even with a 3-way merge. No image was published; \`:latest\` still points at the last good build.
 
-          If the \`OPENROUTER_API_KEY\` secret is set, an AI is resolving the conflict now. If its fix passes the checks, it is merged automatically and a new image is built and tested; this issue closes when that build succeeds.
+          If the \`OPENROUTER_API_KEY\` secret is set, an AI is resolving the conflict now. Its fix must pass the static checks and a full image build, smoke test and boot test before it is merged; then a new image is published and this issue closes. If the AI can't fix it, you'll get a comment here.
 
           cc @${{ github.repository_owner }}
 
           Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-          To fix: clone upstream at that commit, run \`scripts/apply-patches.sh\`, resolve the conflict, finish with \`git am --continue\`, then run \`scripts/refresh-patches.sh <checkout> ${{ steps.inputs.outputs.sha }}\` and commit the updated patch here. The push rebuilds automatically.
+          To fix it by hand: clone upstream at that commit, run \`scripts/apply-patches.sh\`, resolve the conflict, finish with \`git am --continue\`, then run \`scripts/refresh-patches.sh <checkout> ${{ steps.inputs.outputs.sha }}\` and commit the updated patch here. The push rebuilds automatically.
           BODY
-          )
-          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body "$body"
-          else
-            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
-          fi
+          overlay/scripts/issue.sh open "$CONFLICT_TITLE" body.md
           exit 1
 
       - name: Stop after a test-run conflict
@@ -176,11 +184,11 @@ jobs:
           overlay/scripts/validate.sh upstream
 
       - name: Set up Docker Buildx
-        if: steps.skip.outputs.skip != 'true' && env.DRIFT_ONLY != 'true'
+        if: steps.skip.outputs.skip != 'true' && steps.inputs.outputs.drift != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build image
-        if: steps.skip.outputs.skip != 'true' && env.DRIFT_ONLY != 'true'
+        if: steps.skip.outputs.skip != 'true' && steps.inputs.outputs.drift != 'true'
         uses: docker/build-push-action@v6
         with:
           context: upstream
@@ -188,6 +196,12 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: fastchannels:ci
+          labels: |
+            org.opencontainers.image.title=FastChannels (mackid1993)
+            org.opencontainers.image.description=kineticman/FastChannels development plus the DirecTV DAI patch
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.inputs.outputs.sha }}
+            fastchannels.player-apk=${{ steps.inputs.outputs.apk_tag }}
           # Unique per run, so every build re-downloads yt-dlp and the newest
           # Player APK from upstream's latest release.
           build-args: |
@@ -197,80 +211,82 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Check the Player APK is bundled
-        if: steps.skip.outputs.skip != 'true' && env.DRIFT_ONLY != 'true'
+        if: steps.skip.outputs.skip != 'true' && steps.inputs.outputs.drift != 'true'
         run: |
           docker run --rm --entrypoint sh fastchannels:ci -c 'test -s /app/fc_player_release.apk' \
             || { echo "::error::the image has no FastChannels Player APK (upstream release ${{ steps.inputs.outputs.apk_tag }})"; exit 1; }
           echo "Bundled the Player APK from ${{ steps.inputs.outputs.apk_tag }}."
 
       - name: Smoke test the DAI code in the image
-        if: steps.skip.outputs.skip != 'true' && env.DRIFT_ONLY != 'true'
+        if: steps.skip.outputs.skip != 'true' && steps.inputs.outputs.drift != 'true'
         run: docker run --rm -w /app -v "$PWD/overlay/scripts:/ci:ro" --entrypoint python fastchannels:ci /ci/smoke_test.py
 
       - name: Boot test
-        if: steps.skip.outputs.skip != 'true' && env.DRIFT_ONLY != 'true'
+        if: steps.skip.outputs.skip != 'true' && steps.inputs.outputs.drift != 'true'
         run: overlay/scripts/boot_test.sh fastchannels:ci
 
-      - name: Publish to GHCR
-        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true' && env.DRIFT_ONLY != 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: upstream
-          file: upstream/Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:upstream-${{ steps.inputs.outputs.short }}
-            ${{ env.IMAGE }}:build-${{ steps.inputs.outputs.key }}
-          labels: |
-            org.opencontainers.image.title=FastChannels (mackid1993)
-            org.opencontainers.image.description=kineticman/FastChannels development plus the DirecTV DAI patch
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ steps.inputs.outputs.sha }}
-            fastchannels.player-apk=${{ steps.inputs.outputs.apk_tag }}
-          build-args: |
-            YTDLP_REFRESH=${{ github.run_id }}
-            FC_PLAYER_APK_REFRESH=${{ steps.inputs.outputs.apk }}-${{ github.run_id }}
-          cache-from: type=gha
+      - name: Publish the tested image to GHCR
+        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true' && steps.inputs.outputs.drift != 'true'
+        run: |
+          # Push the exact image that passed the tests, not a rebuild. The build-<key>
+          # tag goes last: its presence is what marks this build as done.
+          for tag in latest "upstream-${{ steps.inputs.outputs.short }}" "build-${{ steps.inputs.outputs.key }}"; do
+            docker tag fastchannels:ci "$IMAGE:$tag"
+            docker push -q "$IMAGE:$tag"
+          done
+          echo "Published upstream ${{ steps.inputs.outputs.short }} with the patches as $IMAGE:latest."
 
       - name: Refresh patches against this upstream
         if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true'
         run: |
           overlay/scripts/refresh-patches.sh upstream "${{ steps.inputs.outputs.sha }}"
           cd overlay
+          [ -n "$(git status --porcelain patches)" ] || exit 0
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain patches)" ]; then
-            git add -A patches
-            git commit -q -m "Refresh patches against upstream ${{ steps.inputs.outputs.short }}"
-            git push
-            echo "Patch context updated for upstream ${{ steps.inputs.outputs.short }}."
+          git add -A patches
+          git commit -q -m "Refresh patches against upstream ${{ steps.inputs.outputs.short }}"
+          if ! git push -q; then
+            # main moved during this run. Rebase onto it only if nobody changed
+            # patches/ in the meantime; otherwise their version wins and this
+            # refresh is simply redone on the next run.
+            git fetch -q origin main
+            if git diff --quiet HEAD~1 origin/main -- patches; then
+              git rebase -q origin/main && git push -q
+            else
+              echo "::notice::patches/ changed on main during this run; skipping this refresh."
+              exit 0
+            fi
           fi
+          echo "Patch context updated for upstream ${{ steps.inputs.outputs.short }}."
 
-      - name: Close the conflict issue
-        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true' && env.DRIFT_ONLY != 'true'
+      - name: Close resolved issues
+        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true' && steps.inputs.outputs.drift != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for n in $(gh issue list -R "$GITHUB_REPOSITORY" --state open --search 'in:title "Patches no longer apply to upstream" OR in:title "Build failed"' --json number --jq '.[].number'); do
-            gh issue close "$n" -R "$GITHUB_REPOSITORY" --comment "Fixed: built and published upstream ${{ steps.inputs.outputs.short }} with the patches."
-          done
+          msg="Fixed: built, tested and published upstream ${{ steps.inputs.outputs.short }} with the patches."
+          overlay/scripts/issue.sh close "$CONFLICT_TITLE" "$msg"
+          overlay/scripts/issue.sh close "$FAILED_TITLE" "$msg"
 
       - name: Report a failed build
         if: failure() && steps.apply.outcome != 'failure' && env.TEST_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          title="Build failed"
-          body="Upstream \`${{ steps.inputs.outputs.short }}\` with the patches failed a check. No image was published; \`:latest\` still points at the last good build. Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} cc @${{ github.repository_owner }}"
-          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
-          if [ -n "$existing" ]; then gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body "$body"
-          else gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"; fi
+          cat > body.md <<BODY
+          Upstream \`${{ steps.inputs.outputs.short }}\` with the patches failed a check. No image was published; \`:latest\` still points at the last good build. The next daily run retries with a full build.
+
+          Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          cc @${{ github.repository_owner }}
+          BODY
+          overlay/scripts/issue.sh open "$FAILED_TITLE" body.md
 
       - name: Keep the schedule alive
         # GitHub pauses scheduled workflows in repos with no activity for 60 days.
-        if: env.TEST_RUN != 'true'
+        # Runs even when the job failed, so a long-running failure can't silence it.
+        if: ${{ !cancelled() && env.TEST_RUN != 'true' }}
         run: |
           cd overlay
           last=$(git log -1 --format=%ct)
@@ -278,14 +294,14 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git commit -q --allow-empty -m "Keep the scheduled build active"
-            git push
+            git push -q || echo "main moved during this run, which already counts as activity."
           fi
 
   # Runs only when the patch conflicts. Aider (with an OpenRouter model) runs with a
   # read-only token and no git credentials, and can edit only the conflicted files in
-  # a throwaway checkout. If the result passes the static checks, open-pr merges it
-  # and starts a normal build (image, APK check, smoke test, boot test), which must
-  # pass before anything is published.
+  # a throwaway checkout. Its result must pass the static checks AND a full image
+  # build, APK check, smoke test and boot test before open-pr merges it. A bad fix
+  # never reaches main, so the conflict stays reproducible and is retried next run.
   resolve:
     needs: build
     if: always() && needs.build.outputs.conflict == 'true'
@@ -323,7 +339,7 @@ jobs:
           # Snapshot every file, to prove afterwards the AI changed only the conflicted ones.
           find . -path ./.git -prune -o -type f -print0 | xargs -0 sha1sum | sort -k2 > ../before.sha1
 
-      - name: Set up Python for Aider
+      - name: Set up Python
         if: env.HAS_KEY == 'true'
         uses: actions/setup-python@v5
         with:
@@ -338,7 +354,8 @@ jobs:
           # AI_MODEL repo variable.
           AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
         run: |
-          pip install --quiet aider-chat
+          # Pinned: a new Aider release can change or drop flags this step relies on.
+          pip install --quiet aider-chat==0.86.2
           cd upstream
           cat > ../prompt.txt <<'PROMPT'
           The files you can edit are from the FastChannels repository. A patch that
@@ -358,16 +375,18 @@ jobs:
           PROMPT
           # Aider can edit only the files named on the command line; the brief, the
           # patch and AGENTS.md are read-only context. CI does all git operations and
-          # validation, so Aider's own git, lint and test loops are off.
+          # validation, so Aider's own git, lint, test, shell and URL features are off.
           aider --model "$AI_MODEL" --edit-format diff --yes-always --no-git \
                 --no-auto-commits --no-auto-lint --no-auto-test --no-suggest-shell-commands \
-                --no-show-model-warnings --no-check-update --no-analytics --no-pretty \
-                --map-tokens 0 --read ../conflicts.md --read ../conflict.patch \
+                --no-detect-urls --no-show-model-warnings --no-check-update --no-analytics \
+                --no-pretty --map-tokens 0 --read ../conflicts.md --read ../conflict.patch \
                 --read ../overlay/AGENTS.md --message-file ../prompt.txt \
                 $(cat ../conflicted.txt)
 
       - name: Check the result and finish the merge
         if: env.HAS_KEY == 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           cd upstream
           conflicted=$(cat ../conflicted.txt)
@@ -380,6 +399,11 @@ jobs:
           if grep -nE '^(<<<<<<<|=======|>>>>>>>)( |$)' $conflicted; then
             echo "::error::conflict markers in the result"; exit 1
           fi
+          # Belt and braces: the key is never in the model's context, but make sure
+          # it can't end up in files that become a public PR.
+          if grep -qF -- "$OPENROUTER_API_KEY" $conflicted; then
+            echo "::error::the API key appeared in an edited file"; exit 1
+          fi
           rm -rf .aider*
           git add -- $conflicted
           GIT_EDITOR=true git am --continue
@@ -391,6 +415,32 @@ jobs:
         run: |
           pip install --quiet ruff jinja2
           overlay/scripts/validate.sh upstream
+
+      - name: Set up Docker Buildx
+        if: env.HAS_KEY == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the image with the fix
+        if: env.HAS_KEY == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: fastchannels:ci
+          build-args: |
+            YTDLP_REFRESH=${{ github.run_id }}
+            FC_PLAYER_APK_REFRESH=${{ needs.build.outputs.apk }}-${{ github.run_id }}
+          cache-from: type=gha
+
+      - name: Test the image with the fix
+        if: env.HAS_KEY == 'true'
+        run: |
+          docker run --rm --entrypoint sh fastchannels:ci -c 'test -s /app/fc_player_release.apk' \
+            || { echo "::error::the image has no FastChannels Player APK"; exit 1; }
+          docker run --rm -w /app -v "$PWD/overlay/scripts:/ci:ro" --entrypoint python fastchannels:ci /ci/smoke_test.py
+          overlay/scripts/boot_test.sh fastchannels:ci
 
       - name: Export the ported patch
         if: env.HAS_KEY == 'true'
@@ -424,7 +474,7 @@ jobs:
           name: ported-patches
           path: ported
 
-      - name: Open a pull request
+      - name: Open and merge a pull request
         if: steps.download.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -440,30 +490,56 @@ jobs:
           git add -A patches
           git commit -q -m "Port patches to upstream $SHORT (conflict resolved by AI)"
           git push -f origin "$branch"
-          issue=$(gh issue list --state open --search 'in:title "Patches no longer apply to upstream"' --json number --jq '.[0].number')
-          body=$(cat <<BODY
-          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and the patch conflicted. The AI (\`${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}\` via Aider) resolved the conflict, changing only the conflicted files, and the result passed the static checks: compile, no new ruff errors, templates parse, DAI code present.
+          issue=$(gh issue list --state open --limit 100 --json number,title --jq ".[] | select(.title == \"$CONFLICT_TITLE\") | .number" | head -1)
+          cat > body.md <<BODY
+          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and the patch conflicted. The AI (\`${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}\` via Aider) resolved the conflict, changing only the conflicted files. The result passed the static checks and a full image build, Player APK check, DAI smoke test and boot test.
 
-          This PR is merged automatically, which starts the full build: image, Player APK check, DAI smoke test and boot test. \`:latest\` only updates if all of them pass.
+          This PR is merged automatically, which starts the publishing build. \`:latest\` only updates if that build passes too.
 
           ${issue:+Refs #$issue}
 
           cc @${{ github.repository_owner }}
           BODY
-          )
           title="Port patches to upstream $SHORT"
           [ "$TEST_RUN" != true ] || title="[test run, don't merge] $title"
           pr=$(gh pr list --head "$branch" --state open --json url --jq '.[0].url')
-          [ -n "$pr" ] || pr=$(gh pr create --head "$branch" --base main --title "$title" --body "$body")
+          [ -n "$pr" ] || pr=$(gh pr create --head "$branch" --base main --title "$title" --body-file body.md)
           echo "Opened $pr"
           if [ "$TEST_RUN" = true ]; then
             echo "Test run: leaving the PR open and publishing nothing."
             exit 0
           fi
-          # Merge it and start a normal build. That build runs every check (image,
-          # APK, smoke test, boot test) and only publishes if all of them pass.
           # workflow_dispatch is used because pushes made with GITHUB_TOKEN don't
           # trigger workflows.
           gh pr merge "$pr" --squash --delete-branch
           gh workflow run build.yml --ref main
           echo "Merged $pr and started the publishing build."
+
+  # If the AI couldn't produce a fix that passes every check, say so on the
+  # conflict issue (which pings you) instead of leaving it saying "resolving now".
+  ai-failed:
+    needs: [build, resolve, open-pr]
+    if: >-
+      always() && needs.build.outputs.conflict == 'true' &&
+      (inputs.upstream_repo || '') == '' && (inputs.upstream_branch || '') == '' &&
+      (needs.resolve.result == 'failure' || needs.open-pr.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v5
+
+      - name: Comment on the conflict issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > body.md <<BODY
+          The AI could not produce a fix for upstream \`${{ needs.build.outputs.short }}\` that passes every check, so nothing was merged or published. It will try again on the next daily run; if upstream doesn't change, it will likely fail the same way, so this needs a manual fix (steps above).
+
+          Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          cc @${{ github.repository_owner }}
+          BODY
+          scripts/issue.sh open "$CONFLICT_TITLE" body.md

@@ -30,9 +30,9 @@ Weekly (Mondays, 9 AM Eastern), on a manual run, or when `patches/`, `scripts/` 
 6. Publish `:latest`, `:upstream-<sha>`, `:build-<key>`.
 7. Regenerate `patches/` against that upstream and commit it, so the patch context stays current.
 
-The other six days at 9 AM Eastern, a drift check runs steps 1-3 and 7 without building an image, so a conflict is caught and fixed the day upstream introduces it.
+The other six days at 9 AM Eastern, a drift check runs steps 1-3 and 7 without building an image, so a conflict is caught and fixed the day upstream introduces it. While a "Build failed" issue is open, the drift check does a full build instead, so failures are retried daily. Step 6 pushes the exact image steps 4-5 tested.
 
-If step 2 conflicts, the `resolve` job asks an AI (Aider, with the model in the `AI_MODEL` variable) to resolve the conflict. If the result passes the static checks, the `open-pr` job merges it and starts a normal build, which must pass every check before anything is published.
+If step 2 conflicts, the `resolve` job asks an AI (Aider, with the model in the `AI_MODEL` variable) to resolve the conflict. The result must pass the static checks and a full image build, APK check, smoke test and boot test; only then does the `open-pr` job merge it and start the publishing build. If it fails, `ai-failed` comments on the conflict issue.
 
 ## The DAI patch
 

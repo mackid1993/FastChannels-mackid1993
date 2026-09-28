@@ -28,8 +28,25 @@ def us_national_gpp(targeted_ad_opt_out: int) -> str:
     return 'DBABLA~' + b64url(section)
 
 
+import inspect  # noqa: E402
+
 from app.scrapers import directv, directv_dai as dai  # noqa: E402
+from app.scrapers.base import BaseScraper  # noqa: E402
 from app.routes import api_sources  # noqa: E402,F401
+from app.config_store import persist_source_cache_updates  # noqa: E402,F401
+
+# The upstream APIs the hooks call. These run on every scrape and tune, even with
+# DAI off, and upstream can rename them without any textual conflict in the patch.
+assert callable(getattr(BaseScraper, '_update_cache', None)), 'BaseScraper._update_cache is gone'
+assert isinstance(inspect.getattr_static(BaseScraper, 'cache'), property), 'BaseScraper.cache is no longer a property'
+assert {'dai', 'dai_extra'} <= set(inspect.signature(directv._fetch_channel_playback).parameters), \
+    '_fetch_channel_playback lost its dai/dai_extra parameters'
+resolve_src = inspect.getsource(directv.DirectvScraper.resolve)
+for hook in ('directv_dai.cached_url_usable(', 'directv_dai.request_flags(', 'dai=directv_dai.enabled('):
+    assert hook in resolve_src, f'resolve() is missing the {hook} hook'
+save_src = inspect.getsource(api_sources.save_source_config)
+assert 'directv_dai.clear_cache_if_toggled(' in save_src, 'save_source_config lost the cache-clear hook'
+assert 'directv_dai.store_login_result(' in inspect.getsource(directv.run_directv_auth)
 
 # The toggle is wired into the DirecTV source settings.
 keys = {field.key for field in directv.DirectvScraper.config_schema}

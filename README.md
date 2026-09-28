@@ -27,13 +27,15 @@ The other six days, a drift check applies the patch to upstream's latest code, r
 
 The DAI code itself lives in its own file, `app/scrapers/directv_dai.py`, which upstream doesn't have and so can't conflict with. Upstream's files only get about 20 one-line hooks, which keeps conflicts rare and trivial to fix.
 
-If any step fails, nothing is published and `:latest` stays on the last good build.
+If any step fails, nothing is published, `:latest` stays on the last good build, and a "Build failed" issue pings you. Until it's resolved, the daily run does a full build instead of a drift check, so a one-off failure (a registry hiccup, say) fixes itself the next day.
 
 ## When the patch conflicts
 
 If upstream rewrites the lines the patch changes, step 2 fails and the workflow opens an issue here with the upstream commit and instructions.
 
-It then asks an AI to resolve the conflict: [Aider](https://aider.chat) with an OpenRouter model (the `OPENROUTER_API_KEY` secret; the model defaults to `openrouter/z-ai/glm-5.3-flash` and can be changed with the `AI_MODEL` repo variable), given the patch and `AGENTS.md` as background. It runs with a read-only token, can edit only the conflicted files, and gets two attempts. If its result passes the static checks, CI opens a pull request with it, merges it, and starts a normal build. That build must pass every check (image, Player APK, smoke test, boot test) before `:latest` changes, and the issue closes when it succeeds. The merged PR stays in the history if you want to see what the AI changed.
+It then asks an AI to resolve the conflict: [Aider](https://aider.chat) with an OpenRouter model (the `OPENROUTER_API_KEY` secret; the model defaults to `openrouter/z-ai/glm-5.3-flash` and can be changed with the `AI_MODEL` repo variable), given the patch and `AGENTS.md` as background. It runs with a read-only token and can edit only the conflicted files. Its result must pass the static checks **and** a full image build, Player APK check, smoke test and boot test before anything is merged. Then CI opens a pull request with it, merges it, and runs the publishing build; the issue closes when that succeeds. If the AI can't produce a passing fix, nothing is merged and the issue gets a comment saying so.
+
+The AI's PRs and every status issue @mention you, so GitHub emails you whenever something happens.
 
 To fix a conflict by hand instead:
 
