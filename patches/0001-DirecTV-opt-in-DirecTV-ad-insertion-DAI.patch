@@ -9,9 +9,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
 ---
  app/routes/api_sources.py        |   2 +
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 329 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 323 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 4 files changed, 349 insertions(+), 2 deletions(-)
+ 4 files changed, 343 insertions(+), 2 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -149,16 +149,16 @@ index e796bf3..1eb6939 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..c7270d0
+index 0000000..48609aa
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,323 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
 +ad-insertion session (``streamURL``) instead of ``fallbackStreamUrl``, carrying
-+the ad flags the desktop web client sends, filled from each account's own data
-+(DMA, privacy consent, household/profile ids) plus this device's own ad ids.
++the account's own ad-targeting values (DMA, privacy consent, household/profile
++ids) plus this device's own ad ids.
 +When off, everything behaves exactly as before.
 +
 +Everything lives in this module so the hooks in directv.py, api_sources.py and
@@ -180,17 +180,6 @@ index 0000000..c7270d0
 +
 +_LOCATION_URL = "https://api.cld.dtvce.com/right/location/area/v2/service/location"
 +_BASICINFO_URL = "https://api.cld.dtvce.com/profile/information/basicinfogo/service"
-+
-+# Platform flags the desktop web client puts on its Yospace DAI session request
-+# (from a real stream.directv.com capture). None are account- or device-specific
-+# — identical for every desktop session — so they carry no personal data.
-+_PLATFORM_PARAMS = {
-+    'd': 'desktop', 'e': 'prod', 'm': 'live', 'at': 'NOW.RR', 'ut': 'bbtv',
-+    'nielsen_dev_group': 'devgrp,DSK', 'nielsen_platform': 'plt,DSK',
-+    'comscore_platform': 'PC', 'comscore_impl_type': 'b',
-+    '_fw_nielsen_app_id': 'P7CFE36DB-A8D9-4801-95FE-51C29101342C',
-+    'us_privacy': 'null', 'yo.po': '32', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
-+}
 +
 +CONFIG_FIELD = ConfigField(
 +    'use_dai', 'Use DirecTV ad insertion (DAI)',
@@ -221,8 +210,8 @@ index 0000000..c7270d0
 +    # one DirecTV's own apps use.
 +    if url and 'yospace.com' in url and 'yospace.pool=' not in url:
 +        url += ('&' if '?' in url else '?') + 'yospace.pool=livepause'
-+    # Add the desktop web client's DAI flags (account DMA/consent, our device ids,
-+    # per-channel net, platform constants) so ad insertion targets the right market
++    # Add the account's DAI targeting values (DMA/consent, our device ids, per-channel
++    # net) so ad insertion targets the right market
 +    # and honors the account's real ad-personalization choice. Only values we truly
 +    # have are sent; nothing is invented.
 +    if url and dai and dai_extra and 'yospace.com' in url:
@@ -256,12 +245,17 @@ index 0000000..c7270d0
 +
 +
 +def build_query(config: dict, dai_channel_names: dict, ccid: str) -> dict:
-+    """The DAI request flags the desktop web client sends: the account's own
-+    household/profile/DMA, its real ad-personalization choice (is_lat derived
-+    from the account's GPP consent string), our device's own ad ids, the
-+    per-channel net tag, and the platform constants. Only values actually
-+    sourced from the account (or minted for our own device) are included."""
-+    q = dict(_PLATFORM_PARAMS)
++    """The account's own ad-targeting values for the DAI request: household/
++    profile/DMA, its real ad-personalization choice (is_lat derived from the
++    account's GPP consent string), our device's own ad ids, and the per-channel
++    net tag. Only values actually sourced from the account (or minted for our own
++    device) are included.
++
++    The desktop web client's platform flags (d=desktop and its Nielsen/comScore/
++    Yospace client flags) are deliberately not sent: identifying as a desktop
++    browser pulled web ad inventory, with other markets' spots and band-limited
++    audio, instead of the TV inventory for the account's DMA."""
++    q = {}
 +    pid = config.get('dai_partner_profile_id')
 +    if pid:
 +        q['hhid'] = pid

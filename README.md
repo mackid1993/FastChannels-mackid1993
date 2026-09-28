@@ -2,7 +2,7 @@
 
 [kineticman/FastChannels](https://github.com/kineticman/FastChannels) (`development`) with one addition, kept up to date automatically:
 
-- **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the web client's ad flags filled from each account's own data (DMA, privacy consent, household/profile ids).
+- **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with each account's own ad-targeting values (DMA, privacy consent, household/profile ids).
 
 ```
 docker pull ghcr.io/mackid1993/fastchannels-mackid1993:latest
