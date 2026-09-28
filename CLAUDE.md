@@ -46,7 +46,8 @@ Every value comes from DirecTV's own clients. None is guessed.
 
 ### Hard-won facts
 
-- **The User-Agent of the request that creates the Yospace session matters.** For the bridge, FastChannels fetches the master itself (`/play/directv/<id>/browser.m3u8`), and that fetch creates the ad session. Upstream sends it with python-requests' User-Agent. DirecTV's apps set their real player User-Agent on the session (Osprey: `YospaceAdsProvider` → `SessionProperties.setUserAgent`, value `QPExoPlayer/<ver> (Linux;Android <rel>;<model>) AndroidXMedia3/1.8.0`). The patch forwards the playing device's own User-Agent (`session_headers()`). With the python-requests UA, every inserted ad's AC-3 rendition measured was band-limited to 7 kHz (8 of 8 on 2026-09-28).
+- **Don't forward the stick's User-Agent to Yospace.** Tried 2026-09-28 (the bridge's server-side master fetch sent the Fire TV's `Dalvik/... AFTKRT` UA instead of python-requests'). It did not fix the 7 kHz AC-3 ads (the encode is fixed per ad file, the same for every viewer), and the next break served wrong-market local ads (a St. Louis Kia dealer for a DMA 501 account). Reverted.
+- **The 7 kHz ads are in DirecTV's ad files.** Each inserted ad has one AC-3 and one AAC encode at a fixed CDN path; many ads' AC-3 encode is band-limited to ~7 kHz while their AAC is full range. No request flag or header changes which file is served. On the stick, an inserted ad shows as a switch from the secure to the non-secure video decoder (EventLogger `videoDecoderInitialized`).
 - **`d` is what the ad server keys on.** Same account, same breaks, run side by side:
   - no `d`: **0** inserted ads;
   - `d=android_tv`, `firetv`, `osprey` or `desktop`: ads inserted;

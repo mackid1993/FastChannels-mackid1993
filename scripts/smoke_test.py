@@ -95,13 +95,6 @@ assert query.get('yo.d.cp') == 'true' and query.get('yo.sl') == '3' and query.ge
 assert 'com.att.tv' in base64.b64decode(query.get('yo.vm', '')).decode(), \
     "yo.vm must carry the Android TV app's ad-macro map (APPBUNDLE com.att.tv)"
 
-# The server-side Yospace master fetch creates the ad session, so it must carry
-# the playing device's own User-Agent, not python-requests'.
-ua = 'Dalvik/2.1.0 (Linux; U; Android 11; AFTKRT)'
-assert dai.session_headers('https://csm-e-x.tls1.yospace.com/csm/extlive/a.m3u8', ua) == {'User-Agent': ua}
-assert dai.session_headers('https://dfwlive.akamaized.net/x.m3u8', ua) == {}
-assert dai.session_headers('https://csm-e-x.tls1.yospace.com/a.m3u8', None) == {}
-
 # Values that weren't sourced from the account are omitted, never invented.
 bare = dai.build_query({}, {}, '123')
 for key in ('hhid', 'u', 'profid', 'dma_location', 'gpp', 'is_lat', 'adid'):
