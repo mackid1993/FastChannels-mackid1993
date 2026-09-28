@@ -84,6 +84,8 @@ assert 'net' not in other
 for key in ('d', 'nielsen_dev_group', 'nielsen_platform', 'comscore_platform', '_fw_nielsen_app_id'):
     assert key not in query, f'desktop identity flag {key!r} is being sent'
 assert query.get('m') == 'live' and query.get('yo.lp') == 'true', 'general client flags missing'
+assert query.get('attnid') == 'dfw003' and query.get('p') == 'dfw', 'DirecTV app constants missing'
+assert query.get('metr') == '1071', "metr must be DirecTV's TV device-class code"
 
 # Values that weren't sourced from the account are omitted, never invented.
 bare = dai.build_query({}, {}, '123')

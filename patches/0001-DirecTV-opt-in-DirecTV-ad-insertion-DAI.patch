@@ -9,9 +9,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
 ---
  app/routes/api_sources.py        |   2 +
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 328 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 334 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 4 files changed, 348 insertions(+), 2 deletions(-)
+ 4 files changed, 354 insertions(+), 2 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -149,10 +149,10 @@ index e796bf3..1eb6939 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..6f7fae5
+index 0000000..81b9c70
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,334 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -186,8 +186,14 @@ index 0000000..6f7fae5
 +# Nielsen/comScore "DSK"/"PC" platform tags and the Nielsen web-app id) is left out
 +# on purpose: it pulled web ad inventory, with other markets' spots and
 +# band-limited audio, instead of the TV inventory for the account's DMA.
++#
++# attnid and p are constants in every platform profile of DirecTV's own web app.
++# metr is a device-class code from the app's own table ({tv: "1071", phone: "47",
++# tablet: "47"}); the desktop sends 47. Playback here always ends on a TV, so it
++# sends the app's TV value.
 +_CLIENT_PARAMS = {
-+    'e': 'prod', 'm': 'live', 'at': 'NOW.RR', 'ut': 'bbtv', 'us_privacy': 'null',
++    'p': 'dfw', 'e': 'prod', 'm': 'live', 'at': 'NOW.RR', 'ut': 'bbtv', 'us_privacy': 'null',
++    'attnid': 'dfw003', 'metr': '1071',
 +    'yo.po': '32', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
 +}
 +
