@@ -24,11 +24,13 @@ Weekly (Mondays, 9 AM Eastern), on a manual run, or when `patches/`, `scripts/` 
 
 1. Read upstream `development`'s newest commit and the newest Player APK release. Skip if that exact combination with these patches was already built.
 2. `git am --3way` the patches onto a fresh upstream checkout.
-3. Static checks: compile, no new ruff error-class findings, templates parse, the DAI code is present.
+3. Static checks: compile, no new ruff error-class findings, templates parse, the DAI module and every hook are present.
 4. Build the image (bundles the latest Player APK from kineticman's releases) and confirm the APK is inside.
 5. Smoke test the DAI code inside the image; boot the container and wait for the web UI.
 6. Publish `:latest`, `:upstream-<sha>`, `:build-<key>`.
 7. Regenerate `patches/` against that upstream and commit it, so the patch context stays current.
+
+The other six days at 9 AM Eastern, a drift check runs steps 1-3 and 7 without building an image, so a conflict is caught and fixed the day upstream introduces it.
 
 If step 2 conflicts, the `resolve` job asks an AI (Aider, with the model in the `AI_MODEL` variable) to resolve the conflict. If the result passes the static checks, the `open-pr` job merges it and starts a normal build, which must pass every check before anything is published.
 
@@ -36,21 +38,30 @@ If step 2 conflicts, the `resolve` job asks an AI (Aider, with the model in the 
 
 It adds an opt-in DirecTV source setting, **Use DirecTV ad insertion (DAI)** (`use_dai`). Off is upstream's behavior. When on, playback uses the stream DirecTV's own apps use: the Yospace ad-insertion session (`streamURL`) instead of `fallbackStreamUrl`, with the ad flags the DirecTV desktop web client sends.
 
-Files it touches:
+Nearly all of it lives in **`app/scrapers/directv_dai.py`**, a file upstream doesn't have, so it can't conflict:
 
-- `app/scrapers/directv.py`: nearly everything.
-  - `_DAI_PLATFORM_PARAMS`: the web client's platform constants.
-  - `_gpp_targeted_ad_opt_out()`: decodes the US-National GPP section (id 7).
-  - `_fetch_dai_account_context()`: the account's DMA and GPP consent string, fetched at login.
-  - `_ids_from_bearer_jwt()`: backfills household/profile ids from the bearer token's claims.
-  - `_ensure_dai_device_ids()`: mints this device's own ad/device ids once.
-  - The `use_dai` `ConfigField`, `uses_dai()` and `_build_dai_query()`.
-  - In `_fetch_channel_playback()`: choosing `streamURL`, appending `yospace.pool=livepause`, merging the DAI query with exact-key dedup, and storing `dai` on the cache entry.
-  - In both auth paths (curl_cffi and Playwright): persisting the `dai_*` values.
-  - In the scrape: capturing each channel's `daiChannelName` into the `dai_channel_names` cache.
-  - In `resolve()`: using a cached URL only if its `dai` flag matches the setting.
+- `CONFIG_FIELD`, `enabled()`: the toggle.
+- `pick_stream_url()`: chooses `streamURL` when DAI is on, appends `yospace.pool=livepause`, and merges the DAI query with exact-key dedup.
+- `cached_url_usable()`: a cached URL is reused only under the same toggle setting.
+- `request_flags()` / `build_query()`: the web client's ad flags from the account's own values.
+- `gpp_targeted_ad_opt_out()`: decodes the US-National GPP section (id 7).
+- `login_fields()`, `login_fields_from_cookies()`, `store_login_result()`, `fetch_account_context()`, `ids_from_bearer_jwt()`, `ensure_device_ids()`: login-time capture of DMA, consent and ids.
+- `note_channel()`: each channel's `daiChannelName`.
+- `clear_cache_if_toggled()`: drops cached stream URLs when the toggle changes.
+
+Upstream's files only get one-line hooks, and `scripts/validate.sh` checks every one is present:
+
+- `app/scrapers/directv.py`:
+  - `from . import directv_dai`.
+  - `_fetch_channel_playback()`: the `dai`/`dai_extra` parameters, `pick_stream_url()`, and `'dai': dai` on the cache entry.
+  - Both login paths call `login_fields*()`; `run_directv_auth()` calls `store_login_result()`.
+  - `CONFIG_FIELD` in `config_schema`.
+  - The scrape collects `dai_channel_names` and caches it.
+  - `resolve()` uses `cached_url_usable()` and passes `request_flags()`; the license path passes `dai=`.
+- `app/routes/api_sources.py`: calls `clear_cache_if_toggled()` after saving a source's config.
 - `app/templates/admin/sources.html`: the toggle in `renderDirectvConfig`.
-- `app/routes/api_sources.py`: clears the `directv_playback` cache when `use_dai` changes.
+
+When resolving a conflict in upstream's files, the fix is almost always to put the hook back where upstream's new code needs it.
 
 Invariants a port must keep:
 

@@ -4,10 +4,16 @@ name: Build patched image
 # now, apply the patches in patches/, validate, build, smoke-test and boot-test the
 # image, then publish it to GHCR. Nothing is published unless every check passes.
 # Run it by hand (Actions > Build patched image > Run workflow) for a build sooner.
+#
+# The other days: a drift check. Apply the patches to upstream's latest code,
+# run the static checks and refresh the patches' context, without building an
+# image. A conflict is caught (and fixed by the AI) the day it appears.
 
 on:
   schedule:
-    - cron: "0 9 * * 1"   # Mondays 9:00 AM Eastern
+    - cron: "0 9 * * 1"         # Mondays 9:00 AM Eastern: full build
+      timezone: "America/New_York"
+    - cron: "0 9 * * 0,2-6"     # other days 9:00 AM Eastern: drift check only
       timezone: "America/New_York"
   push:
     branches: [main]
@@ -19,6 +25,10 @@ on:
     inputs:
       force:
         description: Rebuild even if upstream, the patches and the Player APK are unchanged
+        type: boolean
+        default: false
+      drift_only:
+        description: Drift check only (apply, validate and refresh the patches; no image)
         type: boolean
         default: false
       upstream_repo:
@@ -45,6 +55,8 @@ env:
   # A test run (against another repo/branch) builds and checks but never publishes,
   # refreshes the patches, or files issues.
   TEST_RUN: ${{ (inputs.upstream_repo != '' || inputs.upstream_branch != '') && 'true' || 'false' }}
+  # The daily drift check applies, validates and refreshes the patches, but builds no image.
+  DRIFT_ONLY: ${{ (inputs.drift_only || (github.event_name == 'schedule' && github.event.schedule == '0 9 * * 0,2-6')) && 'true' || 'false' }}
   # The Dockerfile always downloads the Player APK from kineticman's latest release.
   APK_REPO: kineticman/FastChannels
   IMAGE: ghcr.io/${{ github.repository_owner }}/fastchannels-mackid1993
@@ -162,11 +174,11 @@ jobs:
           overlay/scripts/validate.sh upstream
 
       - name: Set up Docker Buildx
-        if: steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true' && env.DRIFT_ONLY != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build image
-        if: steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true' && env.DRIFT_ONLY != 'true'
         uses: docker/build-push-action@v6
         with:
           context: upstream
@@ -183,22 +195,22 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Check the Player APK is bundled
-        if: steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true' && env.DRIFT_ONLY != 'true'
         run: |
           docker run --rm --entrypoint sh fastchannels:ci -c 'test -s /app/fc_player_release.apk' \
             || { echo "::error::the image has no FastChannels Player APK (upstream release ${{ steps.inputs.outputs.apk_tag }})"; exit 1; }
           echo "Bundled the Player APK from ${{ steps.inputs.outputs.apk_tag }}."
 
       - name: Smoke test the DAI code in the image
-        if: steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true' && env.DRIFT_ONLY != 'true'
         run: docker run --rm -w /app -v "$PWD/overlay/scripts:/ci:ro" --entrypoint python fastchannels:ci /ci/smoke_test.py
 
       - name: Boot test
-        if: steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true' && env.DRIFT_ONLY != 'true'
         run: overlay/scripts/boot_test.sh fastchannels:ci
 
       - name: Publish to GHCR
-        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true'
+        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true' && env.DRIFT_ONLY != 'true'
         uses: docker/build-push-action@v6
         with:
           context: upstream
@@ -235,7 +247,7 @@ jobs:
           fi
 
       - name: Close the conflict issue
-        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true'
+        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true' && env.DRIFT_ONLY != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

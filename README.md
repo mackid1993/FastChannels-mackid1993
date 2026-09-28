@@ -23,6 +23,10 @@ This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` 
 7. **Publish** to GHCR as `:latest`, `:upstream-<commit>` and `:build-<key>`.
 8. **Refresh the patch.** The patch is regenerated against the upstream it just built on and committed back here. It always carries upstream's newest surrounding code, so small upstream edits never pile up into a conflict.
 
+The other six days, a drift check applies the patch to upstream's latest code, runs the static checks and refreshes the patch, without building an image. A conflict is caught the day it appears.
+
+The DAI code itself lives in its own file, `app/scrapers/directv_dai.py`, which upstream doesn't have and so can't conflict with. Upstream's files only get about 20 one-line hooks, which keeps conflicts rare and trivial to fix.
+
 If any step fails, nothing is published and `:latest` stays on the last good build.
 
 ## When the patch conflicts

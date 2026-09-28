@@ -8,7 +8,7 @@
 #    report nothing NEW compared with pristine upstream. Upstream's own existing
 #    findings don't fail the build; anything our patches introduce does.
 # 3. Every Jinja template parses.
-# 4. The DAI feature is actually present after the merge.
+# 4. The DAI module and every hook into upstream's files are present.
 set -euo pipefail
 
 dir=${1:?usage: validate.sh <patched-checkout>}
@@ -47,13 +47,29 @@ print(f'{len(paths)} templates parsed, {errors} errors')
 sys.exit(1 if errors else 0)
 PY
 
-echo "== DAI feature present"
+echo "== DAI module and hooks present"
+# Nearly all of the DAI code lives in app/scrapers/directv_dai.py, a file upstream
+# doesn't have. What sits in upstream's files is a set of one-line hooks; a merge
+# (or an AI conflict fix) must not lose any of them.
 missing=0
-check() { grep -q "$2" "$1" || { echo "::error file=$1::expected '$2' after patching"; missing=1; }; }
-check app/scrapers/directv.py "ConfigField('use_dai'"
-check app/scrapers/directv.py "def _build_dai_query"
-check app/scrapers/directv.py "yospace.pool=livepause"
-check app/templates/admin/sources.html "use_dai"
-check app/routes/api_sources.py "persist_source_cache_updates"
+check() { grep -qF "$2" "$1" || { echo "::error file=$1::missing DAI hook: $2"; missing=1; }; }
+d=app/scrapers/directv.py
+[ -f app/scrapers/directv_dai.py ] || { echo "::error::app/scrapers/directv_dai.py is missing"; missing=1; }
+check $d "from . import directv_dai"
+check $d "dai: bool = False, dai_extra: dict | None = None,"
+check $d "directv_dai.pick_stream_url(pb, dai, dai_extra)"
+check $d "'dai': dai,"
+check $d "**directv_dai.login_fields(session, bearer, token_data),"
+check $d "captured.update(directv_dai.login_fields_from_cookies(captured))"
+check $d "directv_dai.store_login_result(cfg, result)"
+check $d "directv_dai.CONFIG_FIELD,"
+check $d "dai_channel_names: dict = {}"
+check $d "directv_dai.note_channel(dai_channel_names, row, ccid)"
+check $d "self._update_cache('dai_channel_names', dai_channel_names)"
+check $d "directv_dai.cached_url_usable(cached, directv_dai.enabled(self.config))"
+check $d "dai_extra=directv_dai.request_flags(self.config, self.cache.get('dai_channel_names'), ccid),"
+check $d "dai=directv_dai.enabled(config),"
+check app/routes/api_sources.py "directv_dai.clear_cache_if_toggled(source, old, current)"
+check app/templates/admin/sources.html "toggleHtml('use_dai'"
 [ "$missing" -eq 0 ]
 echo "All static checks passed."

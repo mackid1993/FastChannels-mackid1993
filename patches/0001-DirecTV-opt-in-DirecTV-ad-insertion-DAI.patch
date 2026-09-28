@@ -1,60 +1,190 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
-Date: Sun, 27 Sep 2026 19:07:24 -0400
+Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
 
 Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback uses DirecTV's Yospace ad-insertion stream (streamURL) instead of the fallback, with the same ad flags the DirecTV web client sends, filled from each account's own data (DMA, GPP consent -> is_lat, household/profile ids). Clears the playback cache when the toggle changes.
+
+The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
- app/routes/api_sources.py        |   6 +-
- app/scrapers/directv.py          | 289 ++++++++++++++++++++++++++++++-
+ app/routes/api_sources.py        |   2 +
+ app/scrapers/directv.py          |  18 +-
+ app/scrapers/directv_dai.py      | 329 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 3 files changed, 293 insertions(+), 4 deletions(-)
+ 4 files changed, 349 insertions(+), 2 deletions(-)
+ create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
-index 35da582..509c302 100644
+index 35da582..885cc3b 100644
 --- a/app/routes/api_sources.py
 +++ b/app/routes/api_sources.py
-@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
- _APP_START = _time.time()
- from flask import Blueprint, jsonify, request, current_app
- from sqlalchemy.orm import defer
--from app.config_store import load_source_cache
-+from app.config_store import load_source_cache, persist_source_cache_updates
- from ..extensions import db
- from ..models import Source, Channel, SourceCache
- from ..scrapers import registry
-@@ -682,6 +682,10 @@ def save_source_config(source_id):
+@@ -682,6 +682,8 @@ def save_source_config(source_id):
      db.session.commit()
      if pbs_deleted:
          _invalidate_and_refresh_xml()
-+    # The DAI toggle picks which stream URL resolve() caches (for 55 minutes),
-+    # so drop every cached one; the next tune fetches under the new setting.
-+    if source.name == 'directv' and _toggle_enabled(old, 'use_dai') != _toggle_enabled(current, 'use_dai'):
-+        persist_source_cache_updates(source.id, {'directv_playback': {}})
++    from ..scrapers import directv_dai
++    directv_dai.clear_cache_if_toggled(source, old, current)
      full_scrape_queued = False
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
-index e796bf3..40151ba 100644
+index e796bf3..1eb6939 100644
 --- a/app/scrapers/directv.py
 +++ b/app/scrapers/directv.py
-@@ -106,6 +106,8 @@ _IDENTITY_AUTH_URL = "https://identity.directv.com/am/IdPwdAuth"
- _IDENTITY_AUTHORIZE_URL = "https://identity.directv.com/authorize"
- _AUTHN_TOKEN_URL = "https://api.cld.dtvce.com/authn-tokengo/v3/tokens"
- _LOGIN_REDIRECT_URL = "https://api.cld.dtvce.com/authn-tokengo/v3/loginRedirect"
+@@ -84,6 +84,7 @@ except ImportError:
+     _CFFI_IMPERSONATE = None
+ 
+ from .directv_numbers import assign_provider_numbers
++from . import directv_dai
+ from .base import (
+     BaseScraper, ChannelData, ConfigField, ProgramData, ScrapeSkipError,
+     infer_language_from_metadata,
+@@ -227,6 +228,7 @@ def _license_content_id_from_stream_url(stream_url: str, fallback: str) -> str:
+ 
+ def _fetch_channel_playback(
+     bearer_token: str, cookies: list[dict], client_context: str | None, ccid: str,
++    dai: bool = False, dai_extra: dict | None = None,
+ ) -> dict | None:
+     """GET /right/authorization/channel/v1 for one channel — the manifest +
+     playToken resolve. Used both by resolve() (via the scraper's live
+@@ -286,7 +288,7 @@ def _fetch_channel_playback(
+         return None
+ 
+     pb = data.get('playbackData') or {}
+-    fallback_url = pb.get('fallbackStreamUrl') or pb.get('streamURL')
++    fallback_url = directv_dai.pick_stream_url(pb, dai, dai_extra)
+     play_token = (data.get('dRights') or {}).get('playToken')
+     if not fallback_url or not play_token:
+         return None
+@@ -295,6 +297,7 @@ def _fetch_channel_playback(
+         'play_token': play_token,
+         'license_content_id': _license_content_id_from_stream_url(fallback_url, ccid),
+         'cached_at': time.time(),
++        'dai': dai,
+     }
+ 
+ 
+@@ -932,6 +935,7 @@ def capture_directv_auth_cffi(
+         'cookies': [],
+         'captured_at': time.time(),
+         'auth_method': 'curl_cffi',
++        **directv_dai.login_fields(session, bearer, token_data),
+     }
+ 
+ 
+@@ -1219,6 +1223,7 @@ def capture_directv_auth(
+                 for c in context.cookies()
+             ]
+             captured['captured_at'] = time.time()
++            captured.update(directv_dai.login_fields_from_cookies(captured))
+             _status('success', 'Captured DirecTV session.')
+             return captured
+         finally:
+@@ -1298,6 +1303,7 @@ def run_directv_auth(
+                         cfg.pop('identity_cookie_expires_at', None)
+                     if result.get('auth_method'):
+                         cfg['auth_method'] = result['auth_method']
++                    directv_dai.store_login_result(cfg, result)
+                     source.config = cfg
+                     db.session.commit()
+                     persisted = True
+@@ -1382,6 +1388,7 @@ class DirectvScraper(BaseScraper):
+                         'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). '
+                         'Channels that share a number get subchannels, like 213.1.'
+                     )),
++        directv_dai.CONFIG_FIELD,
+     ]
+ 
+     _FAST_CHANNEL_NUMBER_RANGE = range(4000, 5000)
+@@ -1550,6 +1557,7 @@ class DirectvScraper(BaseScraper):
+         channels: list[ChannelData] = []
+         non_streamable = 0
+         sd_collapsed = 0
++        dai_channel_names: dict = {}
+ 
+         # Hard failures (auth, transport, malformed payload) raise immediately
+         # from _fetch_allchannels_rows() and are not retried here -- only the
+@@ -1613,6 +1621,7 @@ class DirectvScraper(BaseScraper):
+                 # also contain internal channel IDs; retain resolver validation and
+                 # community-map fallback rather than accepting every value.
+                 external_listing_id = _pick(row, 'externalListingId')
++                directv_dai.note_channel(dai_channel_names, row, ccid)
+ 
+                 channels.append(ChannelData(
+                     source_channel_id=ccid,
+@@ -1656,6 +1665,8 @@ class DirectvScraper(BaseScraper):
+                 )
+                 time.sleep(self._ELIGIBILITY_RETRY_DELAY)
+ 
++        self._update_cache('dai_channel_names', dai_channel_names)
++
+         if non_streamable == 0 and baseline_non_streamable >= self._MIN_TRUSTED_NON_STREAMABLE:
+             raise ScrapeSkipError(
+                 f'DirecTV Stream: AllChannels returned 0 non-streamable channels after '
+@@ -1897,7 +1908,7 @@ class DirectvScraper(BaseScraper):
+             raise RuntimeError(f'DirecTV Stream: malformed stream_url: {raw_url}')
+ 
+         cached = (self.cache.get('directv_playback') or {}).get(ccid)
+-        if cached and (time.time() - float(cached.get('cached_at', 0))) < _PLAYBACK_CACHE_TTL:
++        if directv_dai.cached_url_usable(cached, directv_dai.enabled(self.config)) and (time.time() - float(cached.get('cached_at', 0))) < _PLAYBACK_CACHE_TTL:
+             return cached['fallback_url']
+ 
+         bearer = self.config.get('bearer_token')
+@@ -1910,6 +1921,8 @@ class DirectvScraper(BaseScraper):
+         try:
+             result = _fetch_channel_playback(
+                 bearer, self.config.get('cookies') or [], self.config.get('client_context'), ccid,
++                dai=directv_dai.enabled(self.config),
++                dai_extra=directv_dai.request_flags(self.config, self.cache.get('dai_channel_names'), ccid),
+             )
+         except DirectvAuthExpiredError as exc:
+             self._mark_auth_stale_and_reauth(f'channel/v1 expired token for ccid={ccid}')
+@@ -2020,6 +2033,7 @@ class DirectvScraper(BaseScraper):
+             try:
+                 fresh = _fetch_channel_playback(
+                     bearer, config.get('cookies') or [], config.get('client_context'), channel_id,
++                    dai=directv_dai.enabled(config),
+                 )
+             except DirectvAuthExpiredError as exc:
+                 logger.warning(
+diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
+new file mode 100644
+index 0000000..c7270d0
+--- /dev/null
++++ b/app/scrapers/directv_dai.py
+@@ -0,0 +1,329 @@
++"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
++
++When on, playback uses the stream DirecTV's own apps use: the Yospace
++ad-insertion session (``streamURL``) instead of ``fallbackStreamUrl``, carrying
++the ad flags the desktop web client sends, filled from each account's own data
++(DMA, privacy consent, household/profile ids) plus this device's own ad ids.
++When off, everything behaves exactly as before.
++
++Everything lives in this module so the hooks in directv.py, api_sources.py and
++the sources page stay one-liners.
++"""
++from __future__ import annotations
++
++import base64
++import json
++import logging
++import uuid
++from urllib.parse import quote
++
++import requests
++
++from .base import ConfigField
++
++logger = logging.getLogger(__name__)
++
 +_LOCATION_URL = "https://api.cld.dtvce.com/right/location/area/v2/service/location"
 +_BASICINFO_URL = "https://api.cld.dtvce.com/profile/information/basicinfogo/service"
- 
- _FORGEROCK_CLIENT_ID = "fr_web_02"
- _WEB_CLIENT_ID = "UNIFIED_DTV_WEB"
-@@ -225,8 +227,101 @@ def _license_content_id_from_stream_url(stream_url: str, fallback: str) -> str:
-     return fallback
- 
- 
++
 +# Platform flags the desktop web client puts on its Yospace DAI session request
 +# (from a real stream.directv.com capture). None are account- or device-specific
 +# — identical for every desktop session — so they carry no personal data.
-+_DAI_PLATFORM_PARAMS = {
++_PLATFORM_PARAMS = {
 +    'd': 'desktop', 'e': 'prod', 'm': 'live', 'at': 'NOW.RR', 'ut': 'bbtv',
 +    'nielsen_dev_group': 'devgrp,DSK', 'nielsen_platform': 'plt,DSK',
 +    'comscore_platform': 'PC', 'comscore_impl_type': 'b',
@@ -62,8 +192,110 @@ index e796bf3..40151ba 100644
 +    'us_privacy': 'null', 'yo.po': '32', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
 +}
 +
++CONFIG_FIELD = ConfigField(
++    'use_dai', 'Use DirecTV ad insertion (DAI)',
++    field_type='toggle', default='false',
++    help_text=(
++        'On = play the stream DirecTV\'s own apps use, with DirecTV\'s '
++        'local ads in commercial breaks. Off = the national feed '
++        'without DirecTV\'s inserted ads.'
++    ),
++)
 +
-+def _gpp_targeted_ad_opt_out(gpp: str) -> bool | None:
++
++def enabled(config: dict | None) -> bool:
++    return str((config or {}).get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
++
++
++# ── Stream URL ───────────────────────────────────────────────────────────────
++
++def pick_stream_url(playback_data: dict, dai: bool, dai_extra: dict | None) -> str | None:
++    """The stream URL to play from a channel/v1 ``playbackData`` object."""
++    pb = playback_data or {}
++    if dai:
++        url = pb.get('streamURL') or pb.get('fallbackStreamUrl')
++    else:
++        url = pb.get('fallbackStreamUrl') or pb.get('streamURL')
++    # streamURL is a Yospace ad-insertion session URL. Yospace answers it with
++    # 503 "Content not found" unless it names a session pool; livepause is the
++    # one DirecTV's own apps use.
++    if url and 'yospace.com' in url and 'yospace.pool=' not in url:
++        url += ('&' if '?' in url else '?') + 'yospace.pool=livepause'
++    # Add the desktop web client's DAI flags (account DMA/consent, our device ids,
++    # per-channel net, platform constants) so ad insertion targets the right market
++    # and honors the account's real ad-personalization choice. Only values we truly
++    # have are sent; nothing is invented.
++    if url and dai and dai_extra and 'yospace.com' in url:
++        # Match on exact param keys, not a substring (a naive `'e=' in query`
++        # would false-positive against the tail of cdncpDevice=/cdncpCtime= and
++        # silently drop e=prod).
++        query = url.split('?', 1)[1] if '?' in url else ''
++        existing_keys = {pair.split('=', 1)[0] for pair in query.split('&') if pair}
++        for k, v in dai_extra.items():
++            if v in (None, '') or k in existing_keys:
++                continue
++            url += f'&{quote(str(k), safe="")}={quote(str(v), safe="")}'
++            existing_keys.add(k)
++    return url
++
++
++def cached_url_usable(cached: dict | None, dai: bool) -> bool:
++    """A URL cached under the other DAI setting (or a bare Yospace URL cached
++    before the pool fix) must not be served after the toggle changes."""
++    if not cached:
++        return False
++    url = cached.get('fallback_url') or ''
++    return bool(cached.get('dai')) == dai and not ('yospace.com' in url and 'yospace.pool=' not in url)
++
++
++def request_flags(config: dict, channel_names: dict | None, ccid: str) -> dict | None:
++    """The DAI flags for one tune, or None when DAI is off."""
++    if not enabled(config):
++        return None
++    return build_query(config, channel_names or {}, ccid)
++
++
++def build_query(config: dict, dai_channel_names: dict, ccid: str) -> dict:
++    """The DAI request flags the desktop web client sends: the account's own
++    household/profile/DMA, its real ad-personalization choice (is_lat derived
++    from the account's GPP consent string), our device's own ad ids, the
++    per-channel net tag, and the platform constants. Only values actually
++    sourced from the account (or minted for our own device) are included."""
++    q = dict(_PLATFORM_PARAMS)
++    pid = config.get('dai_partner_profile_id')
++    if pid:
++        q['hhid'] = pid
++        q['u'] = pid
++    if config.get('dai_profile_id'):
++        q['profid'] = config['dai_profile_id']
++    if config.get('dai_dma_id'):
++        q['dma_location'] = config['dai_dma_id']
++        q['dma_billing'] = config['dai_dma_id']
++    if config.get('dai_gpp'):
++        q['gpp'] = config['dai_gpp']
++        # is_lat is decoded from the US-National (GPP section 7) bit layout,
++        # so only derive it when the account's consent string is actually
++        # that section. For any other section, pass gpp through untouched and
++        # omit is_lat rather than risk misreporting consent from a wrong layout.
++        if str(config.get('dai_gpp_sid')) == '7':
++            opt_out = gpp_targeted_ad_opt_out(config['dai_gpp'])
++            if opt_out is not None:
++                q['is_lat'] = '1' if opt_out else '0'
++    if config.get('dai_gpp_sid'):
++        q['gpp_sid'] = config['dai_gpp_sid']
++    if config.get('dai_adid'):
++        q['adid'] = config['dai_adid']
++    if config.get('dai_fw_did'):
++        q['_fw_did'] = config['dai_fw_did']
++    if config.get('dai_comscore_device'):
++        q['comscore_device'] = config['dai_comscore_device']
++    net = (dai_channel_names or {}).get(ccid)
++    if net:
++        q['net'] = net
++    return q
++
++
++def gpp_targeted_ad_opt_out(gpp: str) -> bool | None:
 +    """Decode the US-National (GPP section id 7) consent string and report whether
 +    the account has opted OUT of targeted advertising.
 +
@@ -90,7 +322,70 @@ index e796bf3..40151ba 100644
 +        return None
 +
 +
-+def _fetch_dai_account_context(session, bearer: str) -> dict:
++# ── Scrape ───────────────────────────────────────────────────────────────────
++
++def note_channel(channel_names: dict, row: dict, ccid: str) -> None:
++    """Record the per-channel DAI "net" tag the web client sends (daiChannelName)."""
++    value = (row or {}).get('daiChannelName')
++    if isinstance(value, str) and value.strip():
++        channel_names[ccid] = value.strip()
++    elif isinstance(value, (int, float)) and not isinstance(value, bool):
++        channel_names[ccid] = str(value)
++
++
++# ── Login ────────────────────────────────────────────────────────────────────
++
++def login_fields(session, bearer: str, token_data: dict | None) -> dict:
++    """DAI values captured at login on the curl_cffi path: the household/profile
++    ids the web client sends (hhid == u == partnerProfileId in real captures) from
++    the token exchange's valuePairs, plus the account's DMA and consent string."""
++    vp = (token_data or {}).get('valuePairs')
++    vp = vp if isinstance(vp, dict) else {}
++    return {
++        'partner_profile_id': (vp.get('partnerProfileId') or '').strip() or None,
++        'profile_id': (vp.get('profileId') or '').strip() or None,
++        'dai_context': fetch_account_context(session, bearer),
++    }
++
++
++def login_fields_from_cookies(captured: dict) -> dict:
++    """The same account context for the Playwright login path, fetched with the
++    captured bearer and cookies in a throwaway requests session. hhid/u/profid
++    come from the bearer's own claims later (see store_login_result)."""
++    bearer = captured.get('bearer_token')
++    if not bearer:
++        return {}
++    session = requests.Session()
++    for c in captured.get('cookies') or []:
++        try:
++            session.cookies.set(c['name'], c['value'],
++                                domain=c.get('domain') or None, path=c.get('path') or '/')
++        except Exception:
++            continue
++    return {'dai_context': fetch_account_context(session, bearer)}
++
++
++def store_login_result(cfg: dict, result: dict) -> None:
++    """Persist the account's own DAI values from a login result into the source
++    config (used only when the toggle is on), and mint this device's own ad ids once."""
++    partner_profile_id = result.get('partner_profile_id')
++    profile_id = result.get('profile_id')
++    # The Playwright path has no token-exchange valuePairs, so fall back to the
++    # same ids from the bearer JWT's own claims. Also a safety net for curl_cffi.
++    if not partner_profile_id or not profile_id:
++        jwt_pp, jwt_pf = ids_from_bearer_jwt(result.get('bearer_token') or '')
++        partner_profile_id = partner_profile_id or jwt_pp
++        profile_id = profile_id or jwt_pf
++    if partner_profile_id:
++        cfg['dai_partner_profile_id'] = partner_profile_id
++    if profile_id:
++        cfg['dai_profile_id'] = profile_id
++    for k, v in (result.get('dai_context') or {}).items():
++        cfg[f'dai_{k}'] = v
++    cfg.update(ensure_device_ids(cfg))
++
++
++def fetch_account_context(session, bearer: str) -> dict:
 +    """Best-effort fetch of the account's real DMA and privacy-consent string, the
 +    values the web client puts on its DAI session request. Uses the already-authed
 +    login session. Any failure returns {} — DAI playback still works, it just
@@ -126,127 +421,7 @@ index e796bf3..40151ba 100644
 +    return ctx
 +
 +
-+def _find_first_key(obj, key):
-+    """Depth-first search for the first value under `key` anywhere in a JSON tree."""
-+    if isinstance(obj, dict):
-+        if key in obj and not isinstance(obj[key], (dict, list)):
-+            return obj[key]
-+        for v in obj.values():
-+            found = _find_first_key(v, key)
-+            if found is not None:
-+                return found
-+    elif isinstance(obj, list):
-+        for v in obj:
-+            found = _find_first_key(v, key)
-+            if found is not None:
-+                return found
-+    return None
-+
-+
- def _fetch_channel_playback(
-     bearer_token: str, cookies: list[dict], client_context: str | None, ccid: str,
-+    dai: bool = False, dai_extra: dict | None = None,
- ) -> dict | None:
-     """GET /right/authorization/channel/v1 for one channel — the manifest +
-     playToken resolve. Used both by resolve() (via the scraper's live
-@@ -286,7 +381,31 @@ def _fetch_channel_playback(
-         return None
- 
-     pb = data.get('playbackData') or {}
--    fallback_url = pb.get('fallbackStreamUrl') or pb.get('streamURL')
-+    if dai:
-+        fallback_url = pb.get('streamURL') or pb.get('fallbackStreamUrl')
-+    else:
-+        fallback_url = pb.get('fallbackStreamUrl') or pb.get('streamURL')
-+    # streamURL is a Yospace ad-insertion session URL. Yospace answers it with
-+    # 503 "Content not found" unless it names a session pool; livepause is the
-+    # one DirecTV's own apps use.
-+    if fallback_url and 'yospace.com' in fallback_url and 'yospace.pool=' not in fallback_url:
-+        fallback_url += ('&' if '?' in fallback_url else '?') + 'yospace.pool=livepause'
-+    # Add the desktop web client's DAI flags (account DMA/consent, our device ids,
-+    # per-channel net, platform constants) so ad insertion targets the right market
-+    # and honors the account's real ad-personalization choice. Only values we truly
-+    # have are sent; nothing is invented.
-+    if fallback_url and dai and dai_extra and 'yospace.com' in fallback_url:
-+        from urllib.parse import quote as _q
-+        # Match on exact param keys, not a substring (a naive `'e=' in query`
-+        # would false-positive against the tail of cdncpDevice=/cdncpCtime= and
-+        # silently drop e=prod).
-+        query = fallback_url.split('?', 1)[1] if '?' in fallback_url else ''
-+        existing_keys = {pair.split('=', 1)[0] for pair in query.split('&') if pair}
-+        for k, v in dai_extra.items():
-+            if v in (None, '') or k in existing_keys:
-+                continue
-+            fallback_url += f'&{_q(str(k), safe="")}={_q(str(v), safe="")}'
-+            existing_keys.add(k)
-     play_token = (data.get('dRights') or {}).get('playToken')
-     if not fallback_url or not play_token:
-         return None
-@@ -295,6 +414,7 @@ def _fetch_channel_playback(
-         'play_token': play_token,
-         'license_content_id': _license_content_id_from_stream_url(fallback_url, ccid),
-         'cached_at': time.time(),
-+        'dai': dai,
-     }
- 
- 
-@@ -924,6 +1044,13 @@ def capture_directv_auth_cffi(
-     if verify.status_code < 200 or verify.status_code >= 300:
-         raise DirectvAuthError(f'DirecTV token verify failed HTTP {verify.status_code}')
- 
-+    # DAI ad-context: the household/profile ids the web client sends on its
-+    # ad-insertion request. hhid == u == partnerProfileId in real captures.
-+    vp = token_data.get('valuePairs') if isinstance(token_data.get('valuePairs'), dict) else {}
-+    partner_profile_id = (vp.get('partnerProfileId') or '').strip() or None
-+    profile_id = (vp.get('profileId') or '').strip() or None
-+    dai_context = _fetch_dai_account_context(session, bearer)
-+
-     _status('success', 'Captured DirecTV session.')
-     return {
-         'bearer_token': bearer,
-@@ -932,6 +1059,9 @@ def capture_directv_auth_cffi(
-         'cookies': [],
-         'captured_at': time.time(),
-         'auth_method': 'curl_cffi',
-+        'partner_profile_id': partner_profile_id,
-+        'profile_id': profile_id,
-+        'dai_context': dai_context,
-     }
- 
- 
-@@ -1219,6 +1349,27 @@ def capture_directv_auth(
-                 for c in context.cookies()
-             ]
-             captured['captured_at'] = time.time()
-+
-+            # DAI ad-context: fetch the account's DMA + GPP consent here too, so the
-+            # browser-fallback path isn't left without them (the cffi path does this
-+            # inline). Uses the captured bearer/cookies in a throwaway requests
-+            # session; best-effort (returns {} on failure). hhid/u/profid still
-+            # aren't available on this path — they come from the cffi token
-+            # exchange's valuePairs, which Playwright never sees.
-+            if captured.get('bearer_token'):
-+                _ctx_session = requests.Session()
-+                for _c in captured.get('cookies') or []:
-+                    try:
-+                        _ctx_session.cookies.set(
-+                            _c['name'], _c['value'],
-+                            domain=_c.get('domain') or None, path=_c.get('path') or '/',
-+                        )
-+                    except Exception:
-+                        continue
-+                captured['dai_context'] = _fetch_dai_account_context(
-+                    _ctx_session, captured['bearer_token'],
-+                )
-+
-             _status('success', 'Captured DirecTV session.')
-             return captured
-         finally:
-@@ -1227,6 +1378,42 @@ def capture_directv_auth(
- 
- # ── Manual admin-UI entry point ─────────────────────────────────────────────
- 
-+def _ids_from_bearer_jwt(bearer: str) -> tuple[str | None, str | None]:
++def ids_from_bearer_jwt(bearer: str) -> tuple[str | None, str | None]:
 +    """Best-effort (partnerProfileId, profileId) read from the bearer JWT's own
 +    claims, for auth paths that don't surface the token-exchange valuePairs (the
 +    Playwright fallback). No signature verification — we only read claims from a
@@ -271,7 +446,7 @@ index e796bf3..40151ba 100644
 +            pick('profileId', 'profileid', 'pid'))
 +
 +
-+def _ensure_dai_device_ids(cfg: dict) -> dict:
++def ensure_device_ids(cfg: dict) -> dict:
 +    """Mint this device's own persistent advertising/device ids once, if absent.
 +    These identify OUR playback device (they are not tied to any real ad profile);
 +    the browser generates its own the same way. Returns only the newly-added keys."""
@@ -282,175 +457,31 @@ index e796bf3..40151ba 100644
 +    return updates
 +
 +
- def run_directv_auth(
-     redis_url: str,
-     source_id: int,
-@@ -1298,6 +1485,25 @@ def run_directv_auth(
-                         cfg.pop('identity_cookie_expires_at', None)
-                     if result.get('auth_method'):
-                         cfg['auth_method'] = result['auth_method']
-+                    # DAI ad-context (all the account's OWN values; used only when
-+                    # the Use-DAI toggle is on). Store what we captured; mint our
-+                    # device's own persistent ad ids once.
-+                    partner_profile_id = result.get('partner_profile_id')
-+                    profile_id = result.get('profile_id')
-+                    # The Playwright path has no token-exchange valuePairs, so fall
-+                    # back to the same ids from the bearer JWT's own claims. Also a
-+                    # safety net for the cffi path.
-+                    if not partner_profile_id or not profile_id:
-+                        jwt_pp, jwt_pf = _ids_from_bearer_jwt(result.get('bearer_token') or '')
-+                        partner_profile_id = partner_profile_id or jwt_pp
-+                        profile_id = profile_id or jwt_pf
-+                    if partner_profile_id:
-+                        cfg['dai_partner_profile_id'] = partner_profile_id
-+                    if profile_id:
-+                        cfg['dai_profile_id'] = profile_id
-+                    for k, v in (result.get('dai_context') or {}).items():
-+                        cfg[f'dai_{k}'] = v
-+                    cfg.update(_ensure_dai_device_ids(cfg))
-                     source.config = cfg
-                     db.session.commit()
-                     persisted = True
-@@ -1382,6 +1588,13 @@ class DirectvScraper(BaseScraper):
-                         'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). '
-                         'Channels that share a number get subchannels, like 213.1.'
-                     )),
-+        ConfigField('use_dai', 'Use DirecTV ad insertion (DAI)',
-+                    field_type='toggle', default='false',
-+                    help_text=(
-+                        'On = play the stream DirecTV\'s own apps use, with DirecTV\'s '
-+                        'local ads in commercial breaks. Off = the national feed '
-+                        'without DirecTV\'s inserted ads.'
-+                    )),
-     ]
- 
-     _FAST_CHANNEL_NUMBER_RANGE = range(4000, 5000)
-@@ -1433,6 +1646,51 @@ class DirectvScraper(BaseScraper):
-         # See the 'use_provider_numbers' ConfigField and app/scrapers/directv_numbers.py.
-         return str((config or {}).get('use_provider_numbers', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
- 
-+    @classmethod
-+    def uses_dai(cls, config: dict | None) -> bool:
-+        # See the 'use_dai' ConfigField and _fetch_channel_playback().
-+        return str((config or {}).get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
++def _find_first_key(obj, key):
++    """Depth-first search for the first value under `key` anywhere in a JSON tree."""
++    if isinstance(obj, dict):
++        if key in obj and not isinstance(obj[key], (dict, list)):
++            return obj[key]
++        for v in obj.values():
++            found = _find_first_key(v, key)
++            if found is not None:
++                return found
++    elif isinstance(obj, list):
++        for v in obj:
++            found = _find_first_key(v, key)
++            if found is not None:
++                return found
++    return None
 +
-+    @staticmethod
-+    def _build_dai_query(config: dict, dai_channel_names: dict, ccid: str) -> dict:
-+        """The DAI request flags the desktop web client sends: the account's own
-+        household/profile/DMA, its real ad-personalization choice (is_lat derived
-+        from the account's GPP consent string), our device's own ad ids, the
-+        per-channel net tag, and the platform constants. Only values actually
-+        sourced from the account (or minted for our own device) are included."""
-+        q = dict(_DAI_PLATFORM_PARAMS)
-+        pid = config.get('dai_partner_profile_id')
-+        if pid:
-+            q['hhid'] = pid
-+            q['u'] = pid
-+        if config.get('dai_profile_id'):
-+            q['profid'] = config['dai_profile_id']
-+        if config.get('dai_dma_id'):
-+            q['dma_location'] = config['dai_dma_id']
-+            q['dma_billing'] = config['dai_dma_id']
-+        if config.get('dai_gpp'):
-+            q['gpp'] = config['dai_gpp']
-+            # is_lat is decoded from the US-National (GPP section 7) bit layout,
-+            # so only derive it when the account's consent string is actually
-+            # that section. For any other section, pass gpp through untouched and
-+            # omit is_lat rather than risk misreporting consent from a wrong layout.
-+            if str(config.get('dai_gpp_sid')) == '7':
-+                opt_out = _gpp_targeted_ad_opt_out(config['dai_gpp'])
-+                if opt_out is not None:
-+                    q['is_lat'] = '1' if opt_out else '0'
-+        if config.get('dai_gpp_sid'):
-+            q['gpp_sid'] = config['dai_gpp_sid']
-+        if config.get('dai_adid'):
-+            q['adid'] = config['dai_adid']
-+        if config.get('dai_fw_did'):
-+            q['_fw_did'] = config['dai_fw_did']
-+        if config.get('dai_comscore_device'):
-+            q['comscore_device'] = config['dai_comscore_device']
-+        net = (dai_channel_names or {}).get(ccid)
-+        if net:
-+            q['net'] = net
-+        return q
 +
-     # ── Auth ─────────────────────────────────────────────────────────────────
- 
-     def _token_stale(self) -> bool:
-@@ -1550,6 +1808,7 @@ class DirectvScraper(BaseScraper):
-         channels: list[ChannelData] = []
-         non_streamable = 0
-         sd_collapsed = 0
-+        dai_channel_names: dict = {}
- 
-         # Hard failures (auth, transport, malformed payload) raise immediately
-         # from _fetch_allchannels_rows() and are not retried here -- only the
-@@ -1614,6 +1873,12 @@ class DirectvScraper(BaseScraper):
-                 # community-map fallback rather than accepting every value.
-                 external_listing_id = _pick(row, 'externalListingId')
- 
-+                # The DAI "net" tag the web client sends per channel (only used
-+                # when the Use-DAI toggle is on).
-+                dai_name = _pick(row, 'daiChannelName')
-+                if dai_name:
-+                    dai_channel_names[ccid] = dai_name
++# ── Settings ─────────────────────────────────────────────────────────────────
 +
-                 channels.append(ChannelData(
-                     source_channel_id=ccid,
-                     name=name,
-@@ -1656,6 +1921,8 @@ class DirectvScraper(BaseScraper):
-                 )
-                 time.sleep(self._ELIGIBILITY_RETRY_DELAY)
- 
-+        self._update_cache('dai_channel_names', dai_channel_names)
-+
-         if non_streamable == 0 and baseline_non_streamable >= self._MIN_TRUSTED_NON_STREAMABLE:
-             raise ScrapeSkipError(
-                 f'DirecTV Stream: AllChannels returned 0 non-streamable channels after '
-@@ -1896,9 +2163,18 @@ class DirectvScraper(BaseScraper):
-         if not ccid:
-             raise RuntimeError(f'DirecTV Stream: malformed stream_url: {raw_url}')
- 
-+        dai = self.uses_dai(self.config)
-         cached = (self.cache.get('directv_playback') or {}).get(ccid)
--        if cached and (time.time() - float(cached.get('cached_at', 0))) < _PLAYBACK_CACHE_TTL:
--            return cached['fallback_url']
-+        # A URL cached under the other DAI setting (or a bare Yospace URL cached
-+        # before the pool fix) must not be served after the toggle changes.
-+        cached_url = (cached or {}).get('fallback_url') or ''
-+        cache_usable = (
-+            bool(cached)
-+            and bool(cached.get('dai')) == dai
-+            and not ('yospace.com' in cached_url and 'yospace.pool=' not in cached_url)
-+        )
-+        if cache_usable and (time.time() - float(cached.get('cached_at', 0))) < _PLAYBACK_CACHE_TTL:
-+            return cached_url
- 
-         bearer = self.config.get('bearer_token')
-         if not bearer:
-@@ -1908,8 +2184,14 @@ class DirectvScraper(BaseScraper):
-             )
- 
-         try:
-+            dai_extra = None
-+            if dai:
-+                dai_extra = self._build_dai_query(
-+                    self.config, self.cache.get('dai_channel_names') or {}, ccid,
-+                )
-             result = _fetch_channel_playback(
-                 bearer, self.config.get('cookies') or [], self.config.get('client_context'), ccid,
-+                dai=dai, dai_extra=dai_extra,
-             )
-         except DirectvAuthExpiredError as exc:
-             self._mark_auth_stale_and_reauth(f'channel/v1 expired token for ccid={ccid}')
-@@ -2020,6 +2302,7 @@ class DirectvScraper(BaseScraper):
-             try:
-                 fresh = _fetch_channel_playback(
-                     bearer, config.get('cookies') or [], config.get('client_context'), channel_id,
-+                    dai=cls.uses_dai(config),
-                 )
-             except DirectvAuthExpiredError as exc:
-                 logger.warning(
++def clear_cache_if_toggled(source, old: dict, current: dict) -> None:
++    """The toggle picks which stream URL resolve() caches (for 55 minutes), so
++    drop every cached one when it changes; the next tune fetches under the new setting."""
++    if getattr(source, 'name', None) == 'directv' and enabled(old) != enabled(current):
++        from ..config_store import persist_source_cache_updates
++        persist_source_cache_updates(source.id, {'directv_playback': {}})
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
 index 1d4e5d4..927ed4b 100644
 --- a/app/templates/admin/sources.html
