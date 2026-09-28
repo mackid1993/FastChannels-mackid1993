@@ -9,9 +9,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
 ---
  app/routes/api_sources.py        |   2 +
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 339 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 341 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 4 files changed, 359 insertions(+), 2 deletions(-)
+ 4 files changed, 361 insertions(+), 2 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -149,10 +149,10 @@ index e796bf3..1eb6939 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..fe8291a
+index 0000000..0782ae7
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,341 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -181,25 +181,27 @@ index 0000000..fe8291a
 +_LOCATION_URL = "https://api.cld.dtvce.com/right/location/area/v2/service/location"
 +_BASICINFO_URL = "https://api.cld.dtvce.com/profile/information/basicinfogo/service"
 +
-+# Client flags for the DAI request. Values come from DirecTV's own app code (its
-+# shared player bundles an ad-flag table per device type), never invented:
-+# - p, e, m, at, ut, us_privacy, attnid and the yo.* flags are the same in every
-+#   platform profile.
-+# - Device class: playback here always ends on a TV through an Android TV
-+#   device (Fire TV, Google TV/onn sticks, and DirecTV's own Osprey box are all
-+#   Android TV), so it sends the Android TV / smart-TV values: nielsen_platform
-+#   plt,OTT, nielsen_dev_group devgrp,STV (the group DirecTV uses for Android TV
-+#   and the Osprey) and metr 1071 (its TV device-class code).
-+# - _fw_nielsen_app_id is DirecTV's app-level Nielsen id, the same across its apps.
-+# Never sent: the desktop identity (d=desktop, plt,DSK, devgrp,DSK, comScore "PC"),
-+# which pulled web ad inventory with other markets' spots and band-limited audio;
-+# and any value the code doesn't show for this device class (d, comScore platform).
++# Client flags for the DAI request, matching DirecTV's own Android TV app
++# (com.att.tv, the leanback build). Its shared player code sets, for Android TV:
++# d=android_tv, nielsen_platform=plt,OTT, nielsen_dev_group=devgrp,STV (the
++# group it also uses for the Osprey), metr=1071 (its TV device-class code), and
++# from its default live params comscore_impl_type=a and yo.fr=true. p, e, m, at,
++# ut, us_privacy, attnid, _fw_nielsen_app_id and the other yo.* flags are the same
++# across DirecTV's apps. Playback here always ends on a TV through an Android TV
++# device (Fire TV, Google TV/onn sticks and the Osprey are all Android TV).
++#
++# d matters: without a device name the ad server recognizes, Yospace inserts no
++# ads at all. Never send the desktop identity (d=desktop, plt,DSK, devgrp,DSK,
++# comScore "PC"/"b"): it pulled web ad inventory with other markets' spots and
++# band-limited audio.
 +_CLIENT_PARAMS = {
++    'd': 'android_tv',
 +    'p': 'dfw', 'e': 'prod', 'm': 'live', 'at': 'NOW.RR', 'ut': 'bbtv', 'us_privacy': 'null',
 +    'attnid': 'dfw003', 'metr': '1071',
 +    'nielsen_platform': 'plt,OTT', 'nielsen_dev_group': 'devgrp,STV',
++    'comscore_impl_type': 'a',
 +    '_fw_nielsen_app_id': 'P7CFE36DB-A8D9-4801-95FE-51C29101342C',
-+    'yo.po': '32', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
++    'yo.fr': 'true', 'yo.po': '32', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
 +}
 +
 +CONFIG_FIELD = ConfigField(
