@@ -82,7 +82,9 @@ assert 'net' not in other
 # Never identify as a desktop browser: that pulled web ad inventory (other markets'
 # spots, band-limited audio) instead of the account's local TV ads.
 assert query.get('d') == 'android_tv', "d must be DirecTV's Android TV device name (no d means no inserted ads)"
-assert query.get('comscore_impl_type') == 'a' and 'comscore_platform' not in query, 'desktop comScore values sent'
+assert query.get('comscore_impl_type') == 'a' and query.get('comscore_platform') == 'android', \
+    "must send the Android TV app's comScore values, never desktop (PC / b)"
+assert 'us_privacy' not in query, 'the Android TV app omits us_privacy when it is null'
 assert query.get('nielsen_platform') == 'plt,OTT' and query.get('nielsen_dev_group') == 'devgrp,STV', \
     'must send the Android TV Nielsen values, never desktop (plt,DSK / devgrp,DSK)'
 assert query.get('m') == 'live' and query.get('yo.lp') == 'true', 'general client flags missing'

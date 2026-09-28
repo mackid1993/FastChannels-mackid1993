@@ -9,9 +9,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
 ---
  app/routes/api_sources.py        |   2 +
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 341 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 343 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 4 files changed, 361 insertions(+), 2 deletions(-)
+ 4 files changed, 363 insertions(+), 2 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -149,10 +149,10 @@ index e796bf3..1eb6939 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..0782ae7
+index 0000000..34843ef
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,343 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -185,8 +185,10 @@ index 0000000..0782ae7
 +# (com.att.tv, the leanback build). Its shared player code sets, for Android TV:
 +# d=android_tv, nielsen_platform=plt,OTT, nielsen_dev_group=devgrp,STV (the
 +# group it also uses for the Osprey), metr=1071 (its TV device-class code), and
-+# from its default live params comscore_impl_type=a and yo.fr=true. p, e, m, at,
-+# ut, us_privacy, attnid, _fw_nielsen_app_id and the other yo.* flags are the same
++# from its default live params comscore_impl_type=a and yo.fr=true. Its shared
++# parameters add comscore_platform (the OS name, lowercased: android) and leave out
++# us_privacy when it's null. p, e, m, at, ut, attnid, _fw_nielsen_app_id and the
++# other yo.* flags are the same
 +# across DirecTV's apps. Playback here always ends on a TV through an Android TV
 +# device (Fire TV, Google TV/onn sticks and the Osprey are all Android TV).
 +#
@@ -196,10 +198,10 @@ index 0000000..0782ae7
 +# band-limited audio.
 +_CLIENT_PARAMS = {
 +    'd': 'android_tv',
-+    'p': 'dfw', 'e': 'prod', 'm': 'live', 'at': 'NOW.RR', 'ut': 'bbtv', 'us_privacy': 'null',
++    'p': 'dfw', 'e': 'prod', 'm': 'live', 'at': 'NOW.RR', 'ut': 'bbtv',
 +    'attnid': 'dfw003', 'metr': '1071',
 +    'nielsen_platform': 'plt,OTT', 'nielsen_dev_group': 'devgrp,STV',
-+    'comscore_impl_type': 'a',
++    'comscore_platform': 'android', 'comscore_impl_type': 'a',
 +    '_fw_nielsen_app_id': 'P7CFE36DB-A8D9-4801-95FE-51C29101342C',
 +    'yo.fr': 'true', 'yo.po': '32', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
 +}
