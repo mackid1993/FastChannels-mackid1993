@@ -64,6 +64,8 @@ Upstream's files only get one-line hooks, and `scripts/validate.sh` checks every
 
 When resolving a conflict in upstream's files, the fix is almost always to put the hook back where upstream's new code needs it.
 
+**Why it exists:** to be ethical, so the right people get their fair share. The patch sends DirecTV and its advertisers the accurate information their own apps send, so local ads are delivered to the right market and counted, and the subscriber's privacy choice is honored. It is not a way to skip ads, fake measurement or impersonate other clients. See `CLAUDE.md` ("Why this exists").
+
 Invariants a port must keep:
 
 - **Never invent account values.** Only values sourced from the account, or minted for our own device, go in the query. Anything missing is omitted.

@@ -10,6 +10,22 @@ A patch overlay on [kineticman/FastChannels](https://github.com/kineticman/FastC
 
 Upstream declined the DAI feature (PR #65: no measurable quality/CDN difference, and he doesn't think it changes account risk), and the relay-bypass PR #66. That is why this overlay exists.
 
+## Why this exists: fairness, not features
+
+The DAI patch exists so this setup treats DirecTV and its advertisers fairly, not to get a better picture or to dodge anything. A paying subscriber should watch the way DirecTV intends, with each party getting its fair share:
+
+- **DirecTV and the networks** get their ad inventory filled and counted through their own ad-insertion system, instead of local ad slots sitting empty or showing filler.
+- **Advertisers** reach the market they paid for (the account's real DMA), with the ads delivered and counted.
+- **The subscriber's choices are respected.** Their real privacy setting (`is_lat` from their own consent string) is sent as-is.
+- **We tell the truth about ourselves.** Every value is either the account's own data or DirecTV's own published client value for what the playback device really is (Android TV). Nothing is invented, nothing pretends to be a device we aren't, and nothing is logged that shouldn't be.
+
+When changing this code, keep that goal ahead of convenience:
+- If you don't know the correct value, leave it out rather than guess.
+- Don't impersonate another client or device beyond the Android TV identity DirecTV's own app uses.
+- Don't sign in as another app.
+- Don't send fabricated ad-view or measurement data.
+- Don't do anything to skip or suppress ads.
+
 ## The DAI patch in one paragraph
 
 The opt-in "Use DirecTV ad insertion (DAI)" toggle makes DirecTV playback use `streamURL` (a Yospace server-side ad-insertion session) instead of `fallbackStreamUrl`, adds `yospace.pool=livepause` (Yospace answers 503 without it), and adds the ad flags DirecTV's own Android TV app sends. Nearly all of it lives in `app/scrapers/directv_dai.py`; upstream files get about 15 one-line hooks.
