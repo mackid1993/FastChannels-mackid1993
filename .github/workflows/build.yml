@@ -128,7 +128,7 @@ jobs:
           body=$(cat <<BODY
           Upstream \`$UPSTREAM_BRANCH\` moved to [\`${{ steps.inputs.outputs.short }}\`](https://github.com/$UPSTREAM_REPO/commit/${{ steps.inputs.outputs.sha }}) and a patch in \`patches/\` conflicts with it, even with a 3-way merge. No image was published; \`:latest\` still points at the last good build.
 
-          If the \`GEMINI_API_KEY\` secret is set, Gemini is resolving the conflict now. If its fix passes the checks, it is merged automatically and a new image is built and tested; this issue closes when that build succeeds.
+          If the \`OPENROUTER_API_KEY\` secret is set, an AI is resolving the conflict now. If its fix passes the checks, it is merged automatically and a new image is built and tested; this issue closes when that build succeeds.
 
           Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -267,11 +267,11 @@ jobs:
             git push
           fi
 
-  # Runs only when the patch conflicts. Gemini gets a read-only token, no git
-  # credentials and no other secrets, and works in a throwaway checkout. Its result
-  # must touch only the conflicted files and pass the static checks, then comes to
-  # you as a pull request. Merging it triggers the normal build (image, APK check,
-  # smoke test, boot test) before anything is published.
+  # Runs only when the patch conflicts. Aider (with an OpenRouter model) runs with a
+  # read-only token and no git credentials, and can edit only the conflicted files in
+  # a throwaway checkout. If the result passes the static checks, open-pr merges it
+  # and starts a normal build (image, APK check, smoke test, boot test), which must
+  # pass before anything is published.
   resolve:
     needs: build
     if: always() && needs.build.outputs.conflict == 'true'
@@ -279,7 +279,7 @@ jobs:
     permissions:
       contents: read
     env:
-      HAS_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
+      HAS_KEY: ${{ secrets.OPENROUTER_API_KEY != '' }}
     steps:
       - name: Check out this repo
         if: env.HAS_KEY == 'true'
@@ -300,46 +300,54 @@ jobs:
           git am --3way --keep-cr ../overlay/patches/*.patch || true
           [ -d .git/rebase-apply ] || { echo "::error::expected git am to stop at a conflict"; exit 1; }
           echo "Conflicted files:"; git diff --name-only --diff-filter=U
-          # Gemini can't read inside .git, so hand it a copy of the patch being applied.
+          # Hand the AI a copy of the patch being applied.
           cp .git/rebase-apply/patch ../conflict.patch
 
-      - name: Give Gemini the repo background
+      - name: Set up Python for Aider
         if: env.HAS_KEY == 'true'
-        # Gemini CLI loads GEMINI.md from its working directory as context.
-        run: cp overlay/AGENTS.md GEMINI.md
-
-      - name: Ask Gemini to resolve the conflict
-        if: env.HAS_KEY == 'true'
-        uses: google-github-actions/run-gemini-cli@v0.1.22
-        env:
-          # The throwaway CI checkout is the workspace Gemini is meant to edit.
-          GEMINI_CLI_TRUST_WORKSPACE: "true"
+        uses: actions/setup-python@v5
         with:
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          # Optional repo variable. Pick the model with the most free daily requests
-          # at https://aistudio.google.com/rate-limit; empty uses Gemini CLI's default.
-          gemini_model: ${{ vars.GEMINI_MODEL }}
-          prompt: |
-            Read ./overlay/AGENTS.md first: it explains this repo and the DAI patch.
+          python-version: "3.12"
 
-            The directory ./upstream is a checkout of the FastChannels repository. A
-            patch that adds an opt-in "DirecTV ad insertion (DAI)" feature no longer
-            applies cleanly: `git am --3way` stopped with conflict markers
-            (<<<<<<< ======= >>>>>>>) in the files listed by
-            `git -C upstream diff --name-only --diff-filter=U`. The patch being
-            applied is ./conflict.patch.
+      - name: Ask the AI to resolve the conflict
+        if: env.HAS_KEY == 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # Any OpenRouter model, as "openrouter/<model id>". Override with the
+          # AI_MODEL repo variable.
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+        run: |
+          pip install --quiet aider-chat
+          cd upstream
+          conflicted=$(git diff --name-only --diff-filter=U)
+          cat > ../prompt.txt <<'PROMPT'
+          The files you can edit are from the FastChannels repository. A patch that
+          adds an opt-in "DirecTV ad insertion (DAI)" feature no longer applies cleanly:
+          git am --3way stopped and left conflict markers (<<<<<<< ======= >>>>>>>) in
+          these files. The patch is in conflict.patch and the repo background, including
+          what the patch does and the invariants it must keep, is in AGENTS.md.
 
-            Resolve every conflict in those files. Rules:
-            - The result must be upstream's current code plus exactly the behavior the
-              patch adds. Read the whole patch first so you understand what it does.
-            - Keep every upstream change. If upstream renamed or restructured code the
-              patch relies on, adapt the patch's code to the new structure.
-            - Edit only the conflicted files, and only what the conflicts require.
-              Don't refactor, reformat or change anything else.
-            - Leave no conflict markers. `python3 -m compileall -q upstream/app` must
-              succeed.
-            - Only edit files. Don't run git commands that change the index or
-              history (no add, commit, am, reset, checkout or push).
+          Resolve every conflict. Rules:
+          - The result must be upstream's current code plus exactly the behavior the
+            patch adds. Read the whole patch first.
+          - Keep every upstream change. If upstream renamed or restructured code the
+            patch relies on, adapt the patch's code to the new structure.
+          - Change only what the conflicts require. Don't refactor, reformat or touch
+            anything else.
+          - Leave no conflict markers, and keep the Python valid.
+          PROMPT
+          # Aider can only edit the files named on the command line; the patch and
+          # AGENTS.md are read-only context. --no-git: CI does all git operations.
+          for attempt in 1 2; do
+            aider --model "$AI_MODEL" --edit-format diff --yes-always --no-git \
+                  --no-auto-commits --no-show-model-warnings --no-check-update \
+                  --no-analytics --no-pretty --map-tokens 0 \
+                  --read ../conflict.patch --read ../overlay/AGENTS.md \
+                  --message-file ../prompt.txt $conflicted
+            remaining=$(grep -lE '^(<<<<<<<|=======|>>>>>>>)( |$)' $conflicted || true)
+            [ -n "$remaining" ] || break
+            echo "Conflict markers are still present in: $remaining. Resolve the remaining conflicts following the same rules." > ../prompt.txt
+          done
 
       - name: Check the result and finish the merge
         if: env.HAS_KEY == 'true'
@@ -348,18 +356,12 @@ jobs:
           conflicted=$(git diff --name-only --diff-filter=U)
           [ -n "$conflicted" ] || { echo "::error::no conflicted files recorded"; exit 1; }
           if grep -nE '^(<<<<<<<|=======|>>>>>>>)( |$)' $conflicted; then
-            echo "::error::conflict markers remain after Gemini's pass"; exit 1
+            echo "::error::conflict markers remain after the AI's pass"; exit 1
           fi
-          stray=$(git status --porcelain --untracked-files=all | awk '{print $NF}' | grep -vxF -f <(printf '%s\n' $conflicted) | grep -v '^\.gemini/' || true)
-          [ -z "$stray" ] || { echo "::error::Gemini changed files outside the conflict: $stray"; exit 1; }
+          stray=$(git status --porcelain --untracked-files=all | awk '{print $NF}' | grep -vxF -f <(printf '%s\n' $conflicted) | grep -vE '^\.aider' || true)
+          [ -z "$stray" ] || { echo "::error::the AI changed files outside the conflict: $stray"; exit 1; }
           git add -- $conflicted
           GIT_EDITOR=true git am --continue
-
-      - name: Set up Python
-        if: env.HAS_KEY == 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
       - name: Static checks
         if: env.HAS_KEY == 'true'
@@ -415,11 +417,11 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
           git add -A patches
-          git commit -q -m "Port patches to upstream $SHORT (conflict resolved by Gemini)"
+          git commit -q -m "Port patches to upstream $SHORT (conflict resolved by AI)"
           git push -f origin "$branch"
           issue=$(gh issue list --state open --search 'in:title "Patches no longer apply to upstream"' --json number --jq '.[0].number')
           body=$(cat <<BODY
-          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and the patch conflicted. Gemini resolved the conflict, changing only the conflicted files, and the result passed the static checks: compile, no new ruff errors, templates parse, DAI code present.
+          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and the patch conflicted. The AI (\`${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}\` via Aider) resolved the conflict, changing only the conflicted files, and the result passed the static checks: compile, no new ruff errors, templates parse, DAI code present.
 
           This PR is merged automatically, which starts the full build: image, Player APK check, DAI smoke test and boot test. \`:latest\` only updates if all of them pass.
 

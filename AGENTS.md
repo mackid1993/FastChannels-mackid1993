@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Background for any AI agent working in this repo, including the Gemini step CI runs when a patch conflicts.
+Background for any AI agent working in this repo, including the AI step CI runs when a patch conflicts (Aider with an OpenRouter model).
 
 ## What this repo is
 
@@ -30,7 +30,7 @@ Weekly (Mondays, 9 AM Eastern), on a manual run, or when `patches/`, `scripts/` 
 6. Publish `:latest`, `:upstream-<sha>`, `:build-<key>`.
 7. Regenerate `patches/` against that upstream and commit it, so the patch context stays current.
 
-If step 2 conflicts, the `resolve` job asks Gemini to resolve the conflict. If the result passes the static checks, the `open-pr` job merges it and starts a normal build, which must pass every check before anything is published.
+If step 2 conflicts, the `resolve` job asks an AI (Aider, with the model in the `AI_MODEL` variable) to resolve the conflict. If the result passes the static checks, the `open-pr` job merges it and starts a normal build, which must pass every check before anything is published.
 
 ## The DAI patch
 

@@ -29,7 +29,7 @@ If any step fails, nothing is published and `:latest` stays on the last good bui
 
 If upstream rewrites the lines the patch changes, step 2 fails and the workflow opens an issue here with the upstream commit and instructions.
 
-It then asks Gemini (free API key in the `GEMINI_API_KEY` secret) to resolve the conflict, with `AGENTS.md` as background. Gemini runs with a read-only token and no other secrets, and may only edit the conflicted files. If its result passes the static checks, CI opens a pull request with it, merges it, and starts a normal build. That build must pass every check (image, Player APK, smoke test, boot test) before `:latest` changes, and the issue closes when it succeeds. The merged PR stays in the history if you want to see what Gemini changed.
+It then asks an AI to resolve the conflict: [Aider](https://aider.chat) with an OpenRouter model (the `OPENROUTER_API_KEY` secret; the model defaults to `openrouter/z-ai/glm-5.3-flash` and can be changed with the `AI_MODEL` repo variable), given the patch and `AGENTS.md` as background. It runs with a read-only token, can edit only the conflicted files, and gets two attempts. If its result passes the static checks, CI opens a pull request with it, merges it, and starts a normal build. That build must pass every check (image, Player APK, smoke test, boot test) before `:latest` changes, and the issue closes when it succeeds. The merged PR stays in the history if you want to see what the AI changed.
 
 To fix a conflict by hand instead:
 
