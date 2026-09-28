@@ -149,7 +149,7 @@ index e796bf3..1eb6939 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..0da73b8
+index 0000000..6b38b4a
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
 @@ -0,0 +1,350 @@
@@ -203,7 +203,7 @@ index 0000000..0da73b8
 +    'nielsen_platform': 'plt,OTT', 'nielsen_dev_group': 'devgrp,STV',
 +    'comscore_platform': 'android', 'comscore_impl_type': 'a',
 +    '_fw_nielsen_app_id': 'P7CFE36DB-A8D9-4801-95FE-51C29101342C',
-+    'yo.fr': 'true', 'yo.po': '32', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
++    'yo.fr': 'true', 'yo.av': '5',
 +    # The Android TV app's own live Yospace params (its bundled client config:
 +    # the shared YSLiveParams plus the 'atv' platform overrides). yo.cps is the
 +    # value it sends on a fresh tune (<min> = 3 minutes = 180 s). yo.vm is its

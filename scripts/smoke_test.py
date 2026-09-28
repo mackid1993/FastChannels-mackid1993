@@ -87,7 +87,9 @@ assert query.get('comscore_impl_type') == 'a' and query.get('comscore_platform')
 assert 'us_privacy' not in query, 'the Android TV app omits us_privacy when it is null'
 assert query.get('nielsen_platform') == 'plt,OTT' and query.get('nielsen_dev_group') == 'devgrp,STV', \
     'must send the Android TV Nielsen values, never desktop (plt,DSK / devgrp,DSK)'
-assert query.get('m') == 'live' and query.get('yo.lp') == 'true', 'general client flags missing'
+assert query.get('m') == 'live' and query.get('yo.fr') == 'true', 'general client flags missing'
+assert not {'yo.po', 'yo.lpa', 'yo.lp'} & set(query), \
+    "web-player-only Yospace flags must not be sent; the Android TV app doesn't send them"
 assert query.get('attnid') == 'dfw003' and query.get('p') == 'dfw', 'DirecTV app constants missing'
 assert query.get('metr') == '1071', "metr must be DirecTV's TV device-class code"
 assert query.get('yo.d.cp') == 'true' and query.get('yo.sl') == '3' and query.get('yo.cps'), \
