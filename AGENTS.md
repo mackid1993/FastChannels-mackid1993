@@ -36,14 +36,15 @@ If step 2 conflicts, the `resolve` job asks an AI (Aider, with the model in the 
 
 ## The DAI patch
 
-It adds an opt-in DirecTV source setting, **Use DirecTV ad insertion (DAI)** (`use_dai`). Off is upstream's behavior. When on, playback uses the stream DirecTV's own apps use: the Yospace ad-insertion session (`streamURL`) instead of `fallbackStreamUrl`, with the ad flags the DirecTV desktop web client sends.
+It adds an opt-in DirecTV source setting, **Use DirecTV ad insertion (DAI)** (`use_dai`). Off is upstream's behavior. When on, playback uses the stream DirecTV's own apps use: the Yospace ad-insertion session (`streamURL`) instead of `fallbackStreamUrl`, with the ad flags DirecTV's own **Android TV app** sends (`d=android_tv` and friends; see `CLAUDE.md` for where every value comes from).
 
 Nearly all of it lives in **`app/scrapers/directv_dai.py`**, a file upstream doesn't have, so it can't conflict:
 
 - `CONFIG_FIELD`, `enabled()`: the toggle.
 - `pick_stream_url()`: chooses `streamURL` when DAI is on, appends `yospace.pool=livepause`, and merges the DAI query with exact-key dedup.
 - `cached_url_usable()`: a cached URL is reused only under the same toggle setting.
-- `request_flags()` / `build_query()`: the web client's ad flags from the account's own values.
+- `_CLIENT_PARAMS`: the Android TV app's fixed flags (`d=android_tv`, Nielsen/comScore Android TV values, app constants, Yospace flags).
+- `request_flags()` / `build_query()`: those flags plus the account's own values.
 - `gpp_targeted_ad_opt_out()`: decodes the US-National GPP section (id 7).
 - `login_fields()`, `login_fields_from_cookies()`, `store_login_result()`, `fetch_account_context()`, `ids_from_bearer_jwt()`, `ensure_device_ids()`: login-time capture of DMA, consent and ids.
 - `note_channel()`: each channel's `daiChannelName`.
@@ -66,6 +67,8 @@ When resolving a conflict in upstream's files, the fix is almost always to put t
 Invariants a port must keep:
 
 - **Never invent account values.** Only values sourced from the account, or minted for our own device, go in the query. Anything missing is omitted.
+- **`d=android_tv` must be sent.** Without a device name the ad server recognizes, Yospace inserts no ads at all.
+- **Never send the desktop identity** (`d=desktop`, `plt,DSK`, `devgrp,DSK`, comScore `PC`/`b`): it pulls web ad inventory with wrong-market, band-limited ads.
 - `is_lat` is derived from the GPP string **only when `gpp_sid` is `7`**: `1` if the account opted out of targeted advertising, otherwise `0`. Other sections pass `gpp` through untouched, without `is_lat`.
 - Yospace URLs need `yospace.pool=livepause`; without it Yospace answers 503.
 - DAI params are merged with exact-key dedup: a key already in the URL is never duplicated or overridden.
