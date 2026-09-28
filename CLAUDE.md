@@ -38,11 +38,11 @@ Every value comes from DirecTV's own clients. None is guessed.
 |---|---|---|
 | Device identity | `d=android_tv`, `nielsen_platform=plt,OTT`, `nielsen_dev_group=devgrp,STV`, `metr=1071`, `comscore_platform=android`, `comscore_impl_type=a` | Android TV app (`com.att.tv` leanback APK): its shared player sets these for Android TV |
 | App constants | `p=dfw`, `e=prod`, `m=live`, `attnid=dfw003`, `_fw_nielsen_app_id=P7CFE36D…`, `at=NOW.RR`, `ut=bbtv` | Identical in the web capture, the Osprey config and the Android TV bundle |
-| Yospace flags | `yospace.pool=livepause`, `yo.po=32`, `yo.lpa=true`, `yo.lp=true`, `yo.fr=true`, `yo.av=5` | Web capture plus the Android TV app's defaults. Yospace itself writes the rest (`yo.asd`, `yo.cps`, `yo.ec`, …) into the playlist |
+| Yospace flags | `yospace.pool=livepause`, `yo.po=32`, `yo.lpa=true`, `yo.lp=true`, `yo.fr=true`, `yo.av=5`, `yo.sl=3`, `yo.d.cp=true`, `yo.cps=b.lp.d.s.180-3630.0x.s.n`, `yo.vm=<base64>` | Web capture plus the Android TV app's bundled config (`localAppConfig`: shared `YSLiveParams` deep-merged with the `atv` overrides). `yo.cps` has `<min>` = minutes since tune clamped to 3–60, so 180 on a fresh tune. `yo.vm` is the app's ad-macro map (base64 JSON with `APPBUNDLE: com.att.tv`, `INVENTORYSTATE: autoplayed`, and `${...}` macros Yospace fills), sent verbatim |
 | Account values | `hhid`/`u` (partnerProfileId), `profid`, `dma_location`/`dma_billing`, `gpp`, `gpp_sid`, `is_lat` | The signed-in account, fetched at login. `is_lat` is decoded from GPP only when `gpp_sid` is 7 |
 | Device IDs | `adid`, `_fw_did`, `comscore_device` | Random, minted once per install |
 | Channel | `net` | `daiChannelName` from DirecTV's lineup |
-| Omitted on purpose | `us_privacy` when null (the Android TV app omits it), `bZipCode` (only sent when DirecTV's `cgnatEnabled` flag is on, which it currently isn't), `ltlg`, `dvadid`, `yo.vm` (Osprey app-bundle macro) | — |
+| Omitted on purpose | `us_privacy` when null (the Android TV app omits it), `bZipCode` (only sent when DirecTV's `cgnatEnabled` flag is on, which it currently isn't), `ltlg`, `dvadid`, `yo.aal` (Osprey only) | — |
 
 ### Hard-won facts
 

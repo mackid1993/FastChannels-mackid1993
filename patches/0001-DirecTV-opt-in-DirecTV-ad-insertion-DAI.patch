@@ -9,9 +9,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
 ---
  app/routes/api_sources.py        |   2 +
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 343 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 350 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 4 files changed, 363 insertions(+), 2 deletions(-)
+ 4 files changed, 370 insertions(+), 2 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -149,10 +149,10 @@ index e796bf3..1eb6939 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..34843ef
+index 0000000..0da73b8
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,350 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -204,6 +204,13 @@ index 0000000..34843ef
 +    'comscore_platform': 'android', 'comscore_impl_type': 'a',
 +    '_fw_nielsen_app_id': 'P7CFE36DB-A8D9-4801-95FE-51C29101342C',
 +    'yo.fr': 'true', 'yo.po': '32', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
++    # The Android TV app's own live Yospace params (its bundled client config:
++    # the shared YSLiveParams plus the 'atv' platform overrides). yo.cps is the
++    # value it sends on a fresh tune (<min> = 3 minutes = 180 s). yo.vm is its
++    # ad-macro map, base64 JSON declaring APPBUNDLE com.att.tv; Yospace fills
++    # the ${...} macros server-side.
++    'yo.sl': '3', 'yo.d.cp': 'true', 'yo.cps': 'b.lp.d.s.180-3630.0x.s.n',
++    'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
 +}
 +
 +CONFIG_FIELD = ConfigField(
