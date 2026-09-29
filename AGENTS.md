@@ -42,11 +42,13 @@ Nearly all of it lives in **`app/scrapers/directv_dai.py`**, a file upstream doe
 
 - `CONFIG_FIELD`, `enabled()`: the toggle.
 - `pick_stream_url()`: chooses `streamURL` when DAI is on, appends `yospace.pool=livepause`, and merges the DAI query with exact-key dedup.
-- `cached_url_usable()`: a cached URL is reused only under the same toggle setting.
+- `cached_url_usable()`: a cached URL is reused only under the same toggle setting and, with DAI on, only for the same playback device (its `_fw_did` is in the URL).
 - `_CLIENT_PARAMS`: the Android TV app's fixed flags (`d=android_tv`, Nielsen/comScore Android TV values, app constants, Yospace flags).
-- `request_flags()` / `build_query()`: those flags plus the account's own values.
+- `request_flags()` / `build_query()`: those flags plus the account's own values (DMA, GPP, `bZipCode`) and the requesting device's ad id and `is_lat`.
+- `_client_device()` / `_read_device()`: match the request IP to a bridge device and read its Android ID and Fire OS `limit_ad_tracking` over adb, cached an hour.
+- `_account_zip()`: the billing ZIP for accounts that logged in before `dai_zip` existed.
 - `gpp_targeted_ad_opt_out()`: decodes the US-National GPP section (id 7).
-- `login_fields()`, `login_fields_from_cookies()`, `store_login_result()`, `fetch_account_context()`, `ids_from_bearer_jwt()`, `ensure_device_ids()`: login-time capture of DMA, consent and ids.
+- `login_fields()`, `login_fields_from_cookies()`, `store_login_result()`, `fetch_account_context()`, `ids_from_bearer_jwt()`: login-time capture of DMA, ZIP, consent and household/profile ids.
 - `note_channel()`: each channel's `daiChannelName`.
 - `clear_cache_if_toggled()`: drops cached stream URLs when the toggle changes.
 
@@ -68,10 +70,10 @@ When resolving a conflict in upstream's files, the fix is almost always to put t
 
 Invariants a port must keep:
 
-- **Never invent account values.** Only values sourced from the account, or minted for our own device, go in the query. Anything missing is omitted.
+- **Never invent values.** Only the account's own values and the playback device's own ids go in the query. Never mint random ids or make up an advertising id; anything missing is omitted.
 - **`d=android_tv` must be sent.** Without a device name the ad server recognizes, Yospace inserts no ads at all.
 - **Never send the desktop identity** (`d=desktop`, `plt,DSK`, `devgrp,DSK`, comScore `PC`/`b`): it pulls web ad inventory with wrong-market, band-limited ads.
-- `is_lat` is derived from the GPP string **only when `gpp_sid` is `7`**: `1` if the account opted out of targeted advertising, otherwise `0`. Other sections pass `gpp` through untouched, without `is_lat`.
+- **`is_lat` and `_fw_did` come from the playback device** (bridge device matched by request IP): `is_lat=0` with `_fw_did=android_id:<Android ID>`, or the opted-out form (`is_lat=1`, `_fw_did=google_advertising_id:optout`, `adid=optout`) when Fire OS reports `limit_ad_tracking=1`. `is_lat=0` is what gets local ads. Only when the requester isn't a bridge device is `is_lat` derived from GPP, and **only when `gpp_sid` is `7`**.
 - Yospace URLs need `yospace.pool=livepause`; without it Yospace answers 503.
 - DAI params are merged with exact-key dedup: a key already in the URL is never duplicated or overridden.
 - Changing the toggle must clear the cached playback URLs.

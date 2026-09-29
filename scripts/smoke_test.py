@@ -64,13 +64,12 @@ assert dai.gpp_targeted_ad_opt_out('') is None
 config = {
     'use_dai': 'true',
     'dai_partner_profile_id': 'hh-1', 'dai_profile_id': 'prof-1', 'dai_dma_id': '999',
-    'dai_gpp': us_national_gpp(1), 'dai_gpp_sid': '7',
-    'dai_adid': 'ad-1', 'dai_fw_did': 'fw-1', 'dai_comscore_device': 'cs-1',
+    'dai_gpp': us_national_gpp(1), 'dai_gpp_sid': '7', 'dai_zip': '10001',
 }
 query = dai.build_query(config, {'123': 'testnet'}, '123')
 expected = {'hhid': 'hh-1', 'u': 'hh-1', 'profid': 'prof-1', 'dma_location': '999',
-            'dma_billing': '999', 'is_lat': '1', 'gpp_sid': '7', 'adid': 'ad-1',
-            '_fw_did': 'fw-1', 'comscore_device': 'cs-1', 'net': 'testnet'}
+            'dma_billing': '999', 'is_lat': '1', 'gpp_sid': '7', 'bZipCode': '10001',
+            '_fw_did': 'google_advertising_id:optout', 'adid': 'optout', 'net': 'testnet'}
 for key, value in expected.items():
     assert query.get(key) == value, f'{key}: expected {value!r}, got {query.get(key)!r}'
 
@@ -92,10 +91,19 @@ assert query.get('yo.lpa') == 'true' and query.get('yo.lp') == 'true', 'live-pau
 assert 'yo.po' not in query, "the web player's yo.po must not be sent"
 assert query.get('attnid') == 'dfw003' and query.get('p') == 'dfw', 'DirecTV app constants missing'
 assert query.get('metr') == '1071', "metr must be DirecTV's TV device-class code"
-assert query.get('yo.d.cp') == 'true' and query.get('yo.sl') == '3' and query.get('yo.cps'), \
-    "the Android TV app's live Yospace params are missing"
-assert 'com.att.tv' in base64.b64decode(query.get('yo.vm', '')).decode(), \
-    "yo.vm must carry the Android TV app's ad-macro map (APPBUNDLE com.att.tv)"
+assert 'comscore_device' not in query, 'no minted comScore device id'
+
+# A bridge device's own Android ID and ad-tracking setting take over from the
+# account consent: DirecTV's android_id fallback with is_lat=0 is what gets local ads.
+real_client_device = dai._client_device
+dai._client_device = lambda: {'is_lat': '0', '_fw_did': 'android_id:abcdef0123456789'}
+dev = dai.build_query(config, {}, '123')
+assert dev['is_lat'] == '0' and dev['_fw_did'] == 'android_id:abcdef0123456789' and 'adid' not in dev, dev
+dev_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8?yo.up=u'}, True, dev)
+assert dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True)
+dai._client_device = lambda: {'is_lat': '0', '_fw_did': 'android_id:ffffffffffffffff'}
+assert not dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True), 'another device reused a session'
+dai._client_device = real_client_device
 
 # Values that weren't sourced from the account are omitted, never invented.
 bare = dai.build_query({}, {}, '123')
@@ -130,8 +138,7 @@ assert dai.ids_from_bearer_jwt('not-a-jwt') == (None, None)
 cfg = {}
 dai.store_login_result(cfg, {'bearer_token': f'h.{claims}.s', 'dai_context': {'dma_id': '501'}})
 assert cfg['dai_partner_profile_id'] == 'pp-9' and cfg['dai_dma_id'] == '501'
-assert {'dai_adid', 'dai_fw_did', 'dai_comscore_device'} <= set(cfg)
-assert dai.ensure_device_ids(cfg) == {}, 'device ids re-minted'
+assert not {'dai_adid', 'dai_fw_did', 'dai_comscore_device'} & set(cfg), 'random device ids minted'
 
 names = {}
 dai.note_channel(names, {'daiChannelName': ' cnn '}, '1')

@@ -9,9 +9,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
 ---
  app/routes/api_sources.py        |   2 +
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 352 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 438 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 4 files changed, 372 insertions(+), 2 deletions(-)
+ 4 files changed, 458 insertions(+), 2 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -149,10 +149,10 @@ index e796bf3..1eb6939 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..eeba96a
+index 0000000..0e01df4
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,438 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -169,7 +169,8 @@ index 0000000..eeba96a
 +import base64
 +import json
 +import logging
-+import uuid
++import subprocess
++import time
 +from urllib.parse import quote
 +
 +import requests
@@ -206,13 +207,6 @@ index 0000000..eeba96a
 +    # yo.lpa/yo.lp: live-pause mode, which the yospace.pool=livepause session
 +    # needs (the Osprey sends yo.lpa; without them no ads were inserted).
 +    'yo.fr': 'true', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
-+    # The Android TV app's own live Yospace params (its bundled client config:
-+    # the shared YSLiveParams plus the 'atv' platform overrides). yo.cps is the
-+    # value it sends on a fresh tune (<min> = 3 minutes = 180 s). yo.vm is its
-+    # ad-macro map, base64 JSON declaring APPBUNDLE com.att.tv; Yospace fills
-+    # the ${...} macros server-side.
-+    'yo.sl': '3', 'yo.d.cp': 'true', 'yo.cps': 'b.lp.d.s.180-3630.0x.s.n',
-+    'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
 +}
 +
 +CONFIG_FIELD = ConfigField(
@@ -264,11 +258,21 @@ index 0000000..eeba96a
 +
 +def cached_url_usable(cached: dict | None, dai: bool) -> bool:
 +    """A URL cached under the other DAI setting (or a bare Yospace URL cached
-+    before the pool fix) must not be served after the toggle changes."""
++    before the pool fix) must not be served after the toggle changes. With DAI
++    on, a cached ad session also belongs to one playback device (its device id
++    is in the URL), so another device gets its own."""
 +    if not cached:
 +        return False
 +    url = cached.get('fallback_url') or ''
-+    return bool(cached.get('dai')) == dai and not ('yospace.com' in url and 'yospace.pool=' not in url)
++    if bool(cached.get('dai')) != dai or ('yospace.com' in url and 'yospace.pool=' not in url):
++        return False
++    if dai and 'yospace.com' in url:
++        device = _client_device()
++        fw_did = device.get('_fw_did') if device else None
++        if fw_did:
++            return quote(fw_did, safe='') in url
++        return 'android_id%3A' not in url
++    return True
 +
 +
 +def request_flags(config: dict, channel_names: dict | None, ccid: str) -> dict | None:
@@ -296,26 +300,115 @@ index 0000000..eeba96a
 +        q['dma_billing'] = config['dai_dma_id']
 +    if config.get('dai_gpp'):
 +        q['gpp'] = config['dai_gpp']
-+        # is_lat is decoded from the US-National (GPP section 7) bit layout,
-+        # so only derive it when the account's consent string is actually
-+        # that section. For any other section, pass gpp through untouched and
-+        # omit is_lat rather than risk misreporting consent from a wrong layout.
-+        if str(config.get('dai_gpp_sid')) == '7':
++    if config.get('dai_gpp_sid'):
++        q['gpp_sid'] = config['dai_gpp_sid']
++    zip_code = config.get('dai_zip') or _account_zip(config)
++    if zip_code:
++        q['bZipCode'] = zip_code
++
++    # The ad id and is_lat come from the playback device, the way DirecTV's TV
++    # apps set them (the Osprey reads is_lat from the device's own ad-tracking
++    # setting, not the account's web consent). The id is DirecTV's own fallback,
++    # android_id:<Android ID>, which every Android TV device exposes over adb.
++    # Without is_lat=0 the ad server sends national spots only (no local or
++    # political ads). A device that limits ad tracking gets the apps' opted-out form.
++    device = _client_device()
++    if device:
++        q.update(device)
++    else:
++        # Not a bridge device (e.g. Channels playing the URL itself): fall back to
++        # the account's consent, decoded from its US-National GPP section only.
++        if str(config.get('dai_gpp_sid')) == '7' and config.get('dai_gpp'):
 +            opt_out = gpp_targeted_ad_opt_out(config['dai_gpp'])
 +            if opt_out is not None:
 +                q['is_lat'] = '1' if opt_out else '0'
-+    if config.get('dai_gpp_sid'):
-+        q['gpp_sid'] = config['dai_gpp_sid']
-+    if config.get('dai_adid'):
-+        q['adid'] = config['dai_adid']
-+    if config.get('dai_fw_did'):
-+        q['_fw_did'] = config['dai_fw_did']
-+    if config.get('dai_comscore_device'):
-+        q['comscore_device'] = config['dai_comscore_device']
++                if opt_out:
++                    q['_fw_did'] = 'google_advertising_id:optout'
++                    q['adid'] = 'optout'
 +    net = (dai_channel_names or {}).get(ccid)
 +    if net:
 +        q['net'] = net
 +    return q
++
++
++_DEVICE_CACHE: dict[str, tuple[float, dict]] = {}
++_DEVICE_TTL = 3600
++
++
++def _client_device() -> dict:
++    """Ad-id flags for the bridge device making the current request, read once an
++    hour over adb. {} when the request isn't from a known bridge device, when adb
++    can't read it, or outside a request."""
++    try:
++        from flask import has_request_context, request
++        if not has_request_context():
++            return {}
++        ip = (request.remote_addr or '').strip()
++    except Exception:
++        return {}
++    if not ip:
++        return {}
++    now = time.time()
++    hit = _DEVICE_CACHE.get(ip)
++    if hit and now - hit[0] < _DEVICE_TTL:
++        return hit[1]
++    flags = _read_device(ip)
++    _DEVICE_CACHE[ip] = (now, flags)
++    return flags
++
++
++def _read_device(ip: str) -> dict:
++    try:
++        from .. import bridge_devices
++        address = next((d['address'] for d in bridge_devices.known_devices()[0]
++                        if d.get('host') == ip or d.get('address', '').split(':')[0] == ip), None)
++    except Exception as exc:
++        logger.debug('[directv-dai] bridge device lookup failed: %s', exc)
++        return {}
++    if not address:
++        return {}
++
++    def setting(key: str) -> str:
++        try:
++            r = subprocess.run(['adb', '-s', address, 'shell', 'settings', 'get', 'secure', key],
++                               capture_output=True, text=True, timeout=8)
++            return (r.stdout or '').strip()
++        except Exception:
++            return ''
++
++    try:
++        subprocess.run(['adb', 'connect', address], capture_output=True, timeout=8)
++    except Exception:
++        return {}
++    android_id = setting('android_id')
++    if not android_id or android_id == 'null' or len(android_id) < 8:
++        return {}
++    # Fire OS keeps limit_ad_tracking as a system setting; Google TV keeps it in
++    # Play services, which adb can't read ('null'), so there it counts as not limited.
++    if setting('limit_ad_tracking') == '1':
++        return {'is_lat': '1', '_fw_did': 'google_advertising_id:optout', 'adid': 'optout'}
++    return {'is_lat': '0', '_fw_did': f'android_id:{android_id}'}
++
++
++_ZIP_CACHE: dict[str, str] = {}
++
++
++def _account_zip(config: dict) -> str | None:
++    """The account's billing ZIP (for bZipCode) when login didn't store one yet,
++    fetched once per process with the stored sign-in."""
++    bearer = config.get('bearer_token')
++    if not bearer:
++        return None
++    if bearer in _ZIP_CACHE:
++        return _ZIP_CACHE[bearer] or None
++    session = requests.Session()
++    for c in config.get('cookies') or []:
++        try:
++            session.cookies.set(c['name'], c['value'], domain=c.get('domain') or None, path=c.get('path') or '/')
++        except Exception:
++            continue
++    _ZIP_CACHE[bearer] = fetch_account_context(session, bearer).get('zip') or ''
++    return _ZIP_CACHE[bearer] or None
 +
 +
 +def gpp_targeted_ad_opt_out(gpp: str) -> bool | None:
@@ -390,7 +483,7 @@ index 0000000..eeba96a
 +
 +def store_login_result(cfg: dict, result: dict) -> None:
 +    """Persist the account's own DAI values from a login result into the source
-+    config (used only when the toggle is on), and mint this device's own ad ids once."""
++    config (used only when the toggle is on)."""
 +    partner_profile_id = result.get('partner_profile_id')
 +    profile_id = result.get('profile_id')
 +    # The Playwright path has no token-exchange valuePairs, so fall back to the
@@ -405,7 +498,6 @@ index 0000000..eeba96a
 +        cfg['dai_profile_id'] = profile_id
 +    for k, v in (result.get('dai_context') or {}).items():
 +        cfg[f'dai_{k}'] = v
-+    cfg.update(ensure_device_ids(cfg))
 +
 +
 +def fetch_account_context(session, bearer: str) -> dict:
@@ -423,9 +515,14 @@ index 0000000..eeba96a
 +    try:
 +        r = session.get(_LOCATION_URL, params={'includeTVOD': 'false'}, headers=hdrs, timeout=15)
 +        if r.ok:
-+            dma = _find_first_key(r.json(), 'dmaId')
++            data = r.json()
++            dma = _find_first_key(data, 'dmaId')
 +            if dma:
 +                ctx['dma_id'] = str(dma)
++            billing = data.get('billingDmas') if isinstance(data, dict) else None
++            zip_code = _find_first_key(billing, 'zipcode') or _find_first_key(data, 'zipcode')
++            if zip_code:
++                ctx['zip'] = str(zip_code)
 +    except Exception as exc:
 +        logger.debug('[directv-dai] location lookup failed: %s', exc)
 +    try:
@@ -467,17 +564,6 @@ index 0000000..eeba96a
 +
 +    return (pick('partnerProfileId', 'partnerprofileid', 'ppid'),
 +            pick('profileId', 'profileid', 'pid'))
-+
-+
-+def ensure_device_ids(cfg: dict) -> dict:
-+    """Mint this device's own persistent advertising/device ids once, if absent.
-+    These identify OUR playback device (they are not tied to any real ad profile);
-+    the browser generates its own the same way. Returns only the newly-added keys."""
-+    updates = {}
-+    for key in ('dai_adid', 'dai_fw_did', 'dai_comscore_device'):
-+        if not cfg.get(key):
-+            updates[key] = str(uuid.uuid4())
-+    return updates
 +
 +
 +def _find_first_key(obj, key):
