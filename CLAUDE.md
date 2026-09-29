@@ -76,7 +76,8 @@ Every value comes from DirecTV's own clients. None is guessed.
 
 - **The video bytes are identical** for DAI and non-DAI, whether direct or through the FastChannels relay, and on every CDN host (Fastly `-ms`, Akamai `-os`, CloudFront `-sponsored…cf.dtvcdn.com`, Cloudflare `-os.live.cflare`). SHA-256 matched every time.
 - **CDN speed is about the same:** 31–35 Mbps and ~190–235 ms time to first byte from the LAN. DAI streams usually ride the `sponsored` route. The top 1080p rung needs 6.5 Mbps.
-- **The main difference is the path:**
+- **Since 2026-09-28 DAI takes the relay path too** (`yospace.com` is on the relay allowlist). Before that, DAI bypassed the relay, which was the only code difference between DAI and non-DAI delivery.
+- **The main difference was the path:**
   - with DAI, the stick fetches straight from the CDN, because Yospace hosts aren't on the relay allowlist;
   - without DAI, the bridge hands the stick `browser.m3u8`, and every playlist and segment goes through FastChannels' `browser-asset` relay.
   - The user saw non-DAI-through-the-relay as softer; direct non-DAI looked as good as DAI. This isn't proven numerically.

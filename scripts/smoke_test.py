@@ -54,6 +54,11 @@ assert callable(getattr(bridge_devices, 'known_devices', None)), 'bridge_devices
 assert 'address' in inspect.getsource(bridge_devices.known_devices) and 'host' in inspect.getsource(bridge_devices.known_devices), \
     'bridge_devices.known_devices no longer returns address/host entries'
 
+# DAI streams take the same FastChannels relay path as every other DirecTV stream.
+from app.routes import directv_proxy  # noqa: E402
+assert directv_proxy._directv_browser_cdn_allowed('csm-e-dtv-livecomplex-eb.tls1.yospace.com'), \
+    'Yospace playlists bypass the FastChannels relay'
+
 # The toggle is wired into the DirecTV source settings.
 keys = {field.key for field in directv.DirectvScraper.config_schema}
 assert 'use_dai' in keys, 'use_dai toggle missing from the DirecTV config schema'

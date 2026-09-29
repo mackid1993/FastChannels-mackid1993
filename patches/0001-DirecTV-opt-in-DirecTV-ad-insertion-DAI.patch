@@ -8,10 +8,11 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |   2 +
+ app/routes/directv_proxy.py      |   1 +
  app/scrapers/directv.py          |  18 +-
  app/scrapers/directv_dai.py      | 438 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 4 files changed, 458 insertions(+), 2 deletions(-)
+ 5 files changed, 459 insertions(+), 2 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -27,6 +28,18 @@ index f2e5d42..336d79b 100644
      full_scrape_queued = False
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
+diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
+index e7680df..cc330fe 100644
+--- a/app/routes/directv_proxy.py
++++ b/app/routes/directv_proxy.py
+@@ -265,6 +265,7 @@ _DIRECTV_BROWSER_CDN_SUFFIXES = (
+     'directv.fastly-edge.com',
+     'live.cf.dtvcdn.com',
+     'live.cflare.dtvcdn.com',
++    'yospace.com',  # DAI: Yospace ad-session playlists take the same relay path as every other DirecTV stream
+ )
+ 
+ 
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
 index e796bf3..1eb6939 100644
 --- a/app/scrapers/directv.py
