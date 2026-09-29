@@ -10,9 +10,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/routes/api_sources.py        |   2 +
  app/routes/directv_proxy.py      |   1 +
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 438 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 441 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 459 insertions(+), 2 deletions(-)
+ 5 files changed, 462 insertions(+), 2 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -162,10 +162,10 @@ index e796bf3..1eb6939 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..0e01df4
+index 0000000..e4e1a80
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,438 @@
+@@ -0,0 +1,441 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -264,7 +264,10 @@ index 0000000..0e01df4
 +        for k, v in dai_extra.items():
 +            if v in (None, '') or k in existing_keys:
 +                continue
-+            url += f'&{quote(str(k), safe="")}={quote(str(v), safe="")}'
++            # Leave ':' and ',' literal, as DirecTV's clients send them
++            # (_fw_did=android_id:<id>, devgrp,STV). Percent-encoded, the ad
++            # server doesn't recognize the device id and serves untargeted spots.
++            url += f'&{quote(str(k), safe="")}={quote(str(v), safe=",:~")}'
 +            existing_keys.add(k)
 +    return url
 +
@@ -283,8 +286,8 @@ index 0000000..0e01df4
 +        device = _client_device()
 +        fw_did = device.get('_fw_did') if device else None
 +        if fw_did:
-+            return quote(fw_did, safe='') in url
-+        return 'android_id%3A' not in url
++            return f'_fw_did={quote(fw_did, safe=",:~")}' in url
++        return '_fw_did=android_id:' not in url
 +    return True
 +
 +

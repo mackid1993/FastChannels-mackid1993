@@ -134,6 +134,9 @@ assert url.startswith(yo + '&yospace.pool=livepause'), url
 assert '&e=prod' in url, 'e=prod dropped by a substring match against cdncpDevice='
 assert url.count('yo.up=') == 1, 'an existing param was duplicated'
 assert '&hhid=a%20b' in url and '&x=' not in url
+url2 = dai.pick_stream_url(pb, True, {'_fw_did': 'android_id:abc', 'nielsen_dev_group': 'devgrp,STV'})
+assert '&_fw_did=android_id:abc' in url2 and '&nielsen_dev_group=devgrp,STV' in url2, \
+    "':' and ',' must stay literal like DirecTV's clients send them"
 assert dai.pick_stream_url({'fallbackStreamUrl': plain}, True, {'e': 'prod'}) == plain
 
 # Cached URLs are reused only under the same toggle setting.
