@@ -47,6 +47,12 @@ for hook in ('directv_dai.cached_url_usable(', 'directv_dai.request_flags(', 'da
 save_src = inspect.getsource(api_sources.save_source_config)
 assert 'directv_dai.clear_cache_if_toggled(' in save_src, 'save_source_config lost the cache-clear hook'
 assert 'directv_dai.store_login_result(' in inspect.getsource(directv.run_directv_auth)
+# The device ad id reads upstream's bridge-device list; if it's renamed or reshaped the
+# patch would silently fall back to national-only ads, so fail the build instead.
+from app import bridge_devices  # noqa: E402
+assert callable(getattr(bridge_devices, 'known_devices', None)), 'bridge_devices.known_devices is gone'
+assert 'address' in inspect.getsource(bridge_devices.known_devices) and 'host' in inspect.getsource(bridge_devices.known_devices), \
+    'bridge_devices.known_devices no longer returns address/host entries'
 
 # The toggle is wired into the DirecTV source settings.
 keys = {field.key for field in directv.DirectvScraper.config_schema}
