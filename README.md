@@ -4,7 +4,9 @@
 
 - **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the account's own targeting values (DMA, billing ZIP, consent, household and profile IDs) and each bridge device's Android ID, ad-tracking setting and comScore device name. That's how it gets local and political ads for the account's market. Requests look like DirecTV's Android TV app's: its `channel/v2` authorization request and its player User-Agent, built from each device's own model, board and Android version. Fire TV, Google TV and Shield are all handled the same way, and no device sends an advertising ID.
 
-- **Signs in as DirecTV's Android TV app:** instead of the web-browser client upstream uses, the DirecTV source authenticates end to end as DirecTV's own Android TV app (`UNIFIED_Android_TV_02`) via its device-code grant. You approve a code once in a browser at directv.com/tvsigninv2 — the admin page shows a clickable link — exactly like signing in a real Android TV box; after that it refreshes its token on its own and never asks again. The bearer, DRM activation/license and the Yospace ad session are all Android TV, not a web browser.
+- **Full-range inserted-ad audio:** many of DirecTV's inserted ads are muffled ("AM radio") in their Dolby (AC-3) encode while the same ad's AAC encode is full range. With DAI on, the relay swaps each inserted ad to its AAC version so breaks sound clear. Swapped ads play in stereo; live programming is untouched. (The muffle is in DirecTV's own files — upstream and the Osprey have it too — so this is the only lever.)
+
+- **Signs in as DirecTV's Android TV app:** instead of the web-browser client upstream uses, the DirecTV source authenticates end to end as DirecTV's own Android TV app (`UNIFIED_Android_TV_02`) via its device-code grant. There's no username or password to enter: you click Authenticate and approve a code once in a browser at directv.com/tvsigninv2 (the admin page shows a clickable link) — exactly like signing in a real Android TV box — and after that it refreshes its token on its own and never asks again. A Log out button clears the session. The bearer, DRM activation/license and the Yospace ad session are all Android TV, not a web browser.
 
 ```
 docker pull ghcr.io/mackid1993/fastchannels-mackid1993:latest
@@ -27,7 +29,7 @@ This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` 
 
 The other six days, a drift check applies the patch to upstream's latest code, runs the static checks and refreshes the patch, without building an image. A conflict is caught the day it appears.
 
-The DAI code lives in its own file, `app/scrapers/directv_dai.py`, which upstream doesn't have and so can't conflict with. Upstream's files only get a handful of one-line hooks (listed with re-apply instructions in `AGENTS.md`), which keeps conflicts rare and trivial to fix.
+The overlay's code lives in its own files — `app/scrapers/directv_dai.py` (ad insertion), `app/scrapers/dtv_android.py` (the Android TV sign-in, self-contained enough to use without DAI), and `app/scrapers/dtv_aac_ads.py` (the inserted-ad audio swap) — which upstream doesn't have and so can't conflict with. Upstream's files only get a handful of one-line hooks (listed with re-apply instructions in `AGENTS.md`), which keeps conflicts rare and trivial to fix.
 
 If any step fails, nothing is published, `:latest` stays on the last good build, and a "Build failed" issue pings you. Until it's resolved, the daily run does a full build instead of a drift check, so a one-off failure (a registry hiccup, say) fixes itself the next day.
 
