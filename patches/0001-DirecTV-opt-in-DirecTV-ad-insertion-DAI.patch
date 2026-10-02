@@ -18,10 +18,10 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  create mode 100644 app/scrapers/dtv_android.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
-index f2e5d42..336d79b 100644
+index 8e46cf7..16661d4 100644
 --- a/app/routes/api_sources.py
 +++ b/app/routes/api_sources.py
-@@ -685,6 +685,8 @@ def save_source_config(source_id):
+@@ -710,6 +710,8 @@ def save_source_config(source_id):
      db.session.commit()
      if pbs_deleted:
          _invalidate_and_refresh_xml()
@@ -1245,10 +1245,10 @@ index 0000000..035cd0e
 +    from .directv import DirectvAuthError
 +    return DirectvAuthError(msg)
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index f4183ea..aaeb9fa 100644
+index b818ab0..cc5bf7a 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
-@@ -3163,6 +3163,8 @@
+@@ -3189,6 +3189,8 @@
              'On = leave out free, ad-supported channels (DirecTV Stream numbers these 4000-4999).')}
            ${toggleHtml('use_provider_numbers', 'Use DirecTV channel numbers',
              'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). Channels that share a number get subchannels, like 213.1.')}
@@ -1257,7 +1257,7 @@ index f4183ea..aaeb9fa 100644
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
-@@ -3210,6 +3212,16 @@
+@@ -3236,6 +3238,16 @@
        directvPollStatus(sourceId);
      }
  
@@ -1274,7 +1274,7 @@ index f4183ea..aaeb9fa 100644
      function directvPollStatus(sourceId) {
        if (_directvPollTimer) clearInterval(_directvPollTimer);
        _directvPollTimer = setInterval(() => _directvCheckStatus(sourceId), 2000);
-@@ -3230,7 +3242,7 @@
+@@ -3256,7 +3268,7 @@
        const statusMap = {
          idle: null,
          starting: '<span style="color:var(--text-muted)">Starting browser...</span>',
