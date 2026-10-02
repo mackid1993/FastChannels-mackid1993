@@ -6,7 +6,7 @@ Use American spelling everywhere.
 
 ## What this repo is
 
-A patch overlay on [kineticman/FastChannels](https://github.com/kineticman/FastChannels) `development`. CI applies `patches/` to upstream, validates, builds, smoke-tests and boot-tests the image, and publishes `ghcr.io/mackid1993/fastchannels-mackid1993:latest` (public; pulls need no login). Weekly full build (Mondays 9 AM Eastern), daily drift check, AI conflict resolution with Aider on OpenRouter (`OPENROUTER_API_KEY` secret; model pinned to DeepSeek V4.1 Flash, `openrouter/deepseek/deepseek-v4.1-flash`, in the `AI_MODEL` variable and the workflow default). The patch refreshes its own context after every successful run, so upstream drift rarely turns into a conflict.
+A patch overlay on [kineticman/FastChannels](https://github.com/kineticman/FastChannels) `main` (his release branch, so every build is released code). CI applies `patches/` to upstream, validates, builds, smoke-tests and boot-tests the image, and publishes `ghcr.io/mackid1993/fastchannels-mackid1993:latest` (public; pulls need no login). Weekly full build (Mondays 9 AM Eastern), daily drift check, AI conflict resolution with Aider on OpenRouter (`OPENROUTER_API_KEY` secret; model pinned to DeepSeek V4.1 Flash, `openrouter/deepseek/deepseek-v4.1-flash`, in the `AI_MODEL` variable and the workflow default). The patch refreshes its own context after every successful run, so upstream drift rarely turns into a conflict.
 
 Upstream declined the DAI feature (PR #65: no measurable quality/CDN difference, and he doesn't think it changes account risk), and the relay-bypass PR #66. That is why this overlay exists.
 
@@ -25,6 +25,10 @@ When changing this code, keep that goal ahead of convenience:
 - Don't sign in as another app.
 - Don't send fabricated ad-view or measurement data.
 - Don't do anything to skip or suppress ads.
+
+## Surround sound toggle
+
+"Surround sound (Dolby 5.1)", on by default. Off strips the AC-3/E-AC-3 renditions from the master playlist FastChannels hands bridge sticks (`browser.m3u8`), so the stick plays DirecTV's stereo HE-AAC track (`mp4a.40.5`, 96 kbps). That's exactly what an Osprey plays with Dolby off: verified, it decodes with `c2.android.aac.decoder` at 48 kHz stereo. It skips Dolby's turn-down to reference level and the 5.1-to-stereo fold-down (stereo is ~4–6 dB louder), and avoids the 7 kHz AC-3 ad renditions. It works with DAI on or off, but not when Channels plays the DirecTV URL itself.
 
 ## The DAI patch in one paragraph
 

@@ -1,6 +1,6 @@
 name: Build patched image
 
-# Once a week: take kineticman/FastChannels' development branch as it is right
+# Once a week: take kineticman/FastChannels' main branch (his releases) as it is right
 # now, apply the patches in patches/, validate, build, smoke-test and boot-test the
 # image, then publish that tested image to GHCR. Nothing is published unless every
 # check passes. Run it by hand (Actions > Build patched image > Run workflow) for a
@@ -54,7 +54,7 @@ permissions:
 
 env:
   UPSTREAM_REPO: ${{ inputs.upstream_repo || 'kineticman/FastChannels' }}
-  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'development' }}
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
   # A test run (against another repo/branch) builds and checks but never publishes,
   # refreshes the patches, or files issues.
   TEST_RUN: ${{ (inputs.upstream_repo != '' || inputs.upstream_branch != '') && 'true' || 'false' }}
@@ -198,7 +198,7 @@ jobs:
           tags: fastchannels:ci
           labels: |
             org.opencontainers.image.title=FastChannels (mackid1993)
-            org.opencontainers.image.description=kineticman/FastChannels development plus the DirecTV DAI patch
+            org.opencontainers.image.description=kineticman/FastChannels main (releases) plus the DirecTV DAI patch
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ steps.inputs.outputs.sha }}
             fastchannels.player-apk=${{ steps.inputs.outputs.apk_tag }}

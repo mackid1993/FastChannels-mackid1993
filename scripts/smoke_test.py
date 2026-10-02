@@ -62,6 +62,22 @@ assert directv_proxy._directv_browser_cdn_allowed('csm-e-dtv-livecomplex-eb.tls1
 # The toggle is wired into the DirecTV source settings.
 keys = {field.key for field in directv.DirectvScraper.config_schema}
 assert 'use_dai' in keys, 'use_dai toggle missing from the DirecTV config schema'
+assert 'surround_audio' in keys, 'surround_audio toggle missing from the DirecTV config schema'
+
+# Surround off strips the Dolby renditions from the master; on (the default) leaves it alone.
+master = ('#EXTM3U\n'
+          '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="AC3-384kbps",NAME="English",URI="ac3.m3u8"\n'
+          '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="HEAAC-96kbps",NAME="English",URI="aac.m3u8"\n'
+          '#EXT-X-STREAM-INF:BANDWIDTH=6485600,CODECS="avc1.64002a,mp4a.40.5",AUDIO="HEAAC-96kbps"\nv.m3u8\n'
+          '#EXT-X-STREAM-INF:BANDWIDTH=6802400,CODECS="avc1.64002a,ac-3",AUDIO="AC3-384kbps"\nv.m3u8\n')
+stereo = dai.strip_surround(master, {'surround_audio': 'false'})
+assert 'ac-3' not in stereo and 'AC3-384kbps' not in stereo and stereo.count('#EXT-X-STREAM-INF') == 1, stereo
+assert 'aac.m3u8' in stereo and stereo.rstrip().endswith('v.m3u8')
+assert dai.strip_surround(master, {}) == master, 'surround must default to on'
+dolby_only = master.replace('mp4a.40.5', 'ac-3')
+assert dai.strip_surround(dolby_only, {'surround_audio': 'false'}) == dolby_only, 'stripped every variant'
+assert 'directv_dai.strip_surround(' in inspect.getsource(directv_proxy.directv_browser_manifest), \
+    'the bridge manifest no longer applies the surround setting'
 assert dai.enabled({'use_dai': 'true'}) is True
 assert dai.enabled({'use_dai': False}) is False
 assert dai.enabled(None) is False

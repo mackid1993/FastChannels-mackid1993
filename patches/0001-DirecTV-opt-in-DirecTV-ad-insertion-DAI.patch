@@ -8,18 +8,18 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |   2 +
- app/routes/directv_proxy.py      |   1 +
+ app/routes/directv_proxy.py      |   5 +-
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 441 +++++++++++++++++++++++++++++++
- app/templates/admin/sources.html |   2 +
- 5 files changed, 462 insertions(+), 2 deletions(-)
+ app/scrapers/directv_dai.py      | 492 +++++++++++++++++++++++++++++++
+ app/templates/admin/sources.html |   3 +
+ 5 files changed, 516 insertions(+), 4 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
-index 8e46cf7..16661d4 100644
+index f2e5d42..336d79b 100644
 --- a/app/routes/api_sources.py
 +++ b/app/routes/api_sources.py
-@@ -710,6 +710,8 @@ def save_source_config(source_id):
+@@ -685,6 +685,8 @@ def save_source_config(source_id):
      db.session.commit()
      if pbs_deleted:
          _invalidate_and_refresh_xml()
@@ -29,9 +29,18 @@ index 8e46cf7..16661d4 100644
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..cc330fe 100644
+index e7680df..283b89d 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
+@@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
+ 
+ from app.config_store import persist_source_cache_updates, persist_source_config_updates
+ from ..models import AppSettings, Channel, Source
+-from ..scrapers import registry
++from ..scrapers import directv_dai, registry
+ 
+ logger = logging.getLogger(__name__)
+ directv_proxy_bp = Blueprint('directv_proxy', __name__)
 @@ -265,6 +265,7 @@ _DIRECTV_BROWSER_CDN_SUFFIXES = (
      'directv.fastly-edge.com',
      'live.cf.dtvcdn.com',
@@ -40,8 +49,17 @@ index e7680df..cc330fe 100644
  )
  
  
+@@ -347,7 +348,7 @@ def directv_browser_manifest(channel_id: str):
+     if r.status_code >= 400:
+         return Response(r.content, status=r.status_code, content_type=r.headers.get('Content-Type') or 'text/plain')
+     return Response(
+-        _rewrite_directv_browser_playlist(r.text, r.url),
++        _rewrite_directv_browser_playlist(directv_dai.strip_surround(r.text, channel.source.config), r.url),
+         status=200,
+         mimetype='application/vnd.apple.mpegurl',
+         headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
-index e796bf3..1eb6939 100644
+index e796bf3..86a5067 100644
 --- a/app/scrapers/directv.py
 +++ b/app/scrapers/directv.py
 @@ -84,6 +84,7 @@ except ImportError:
@@ -105,7 +123,7 @@ index e796bf3..1eb6939 100644
                          'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). '
                          'Channels that share a number get subchannels, like 213.1.'
                      )),
-+        directv_dai.CONFIG_FIELD,
++        *directv_dai.CONFIG_FIELDS,
      ]
  
      _FAST_CHANNEL_NUMBER_RANGE = range(4000, 5000)
@@ -162,10 +180,10 @@ index e796bf3..1eb6939 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..e4e1a80
+index 0000000..0b9c77a
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,492 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -182,6 +200,7 @@ index 0000000..e4e1a80
 +import base64
 +import json
 +import logging
++import re
 +import subprocess
 +import time
 +from urllib.parse import quote
@@ -232,6 +251,56 @@ index 0000000..e4e1a80
 +    ),
 +)
 +
++
++SURROUND_FIELD = ConfigField(
++    'surround_audio', 'Surround sound (Dolby 5.1)',
++    field_type='toggle', default='true',
++    help_text=(
++        'On = DirecTV\'s 5.1 Dolby Digital audio. Off = its stereo audio, what '
++        'DirecTV\'s own boxes play with Dolby turned off. Applies to FastChannels '
++        'Player bridge devices.'
++    ),
++)
++
++CONFIG_FIELDS = (CONFIG_FIELD, SURROUND_FIELD)
++
++
++def strip_surround(master: str, config: dict | None) -> str:
++    """With surround off, remove the Dolby (AC-3/E-AC-3) renditions from an HLS
++    master playlist so the player can only pick the stereo track. Any playlist it
++    can't safely filter (a media playlist, or one with no non-Dolby variant) is
++    returned unchanged."""
++    value = str((config or {}).get('surround_audio', 'true')).strip().lower()
++    if value in {'1', 'true', 'yes', 'on', ''} or '#EXT-X-STREAM-INF' not in (master or ''):
++        return master
++    lines = master.splitlines()
++
++    def attr(line: str, name: str) -> str:
++        m = re.search(rf'{name}="([^"]*)"', line)
++        return m.group(1) if m else ''
++
++    def dolby(line: str) -> bool:
++        codecs = attr(line, 'CODECS').lower()
++        return 'ac-3' in codecs or 'ec-3' in codecs
++
++    infs = [ln for ln in lines if ln.startswith('#EXT-X-STREAM-INF')]
++    kept = [ln for ln in infs if not dolby(ln)]
++    if not kept:
++        return master
++    groups = {attr(ln, 'AUDIO') for ln in kept} - {''}
++    out, drop_uri = [], False
++    for ln in lines:
++        if drop_uri and ln.strip() and not ln.startswith('#'):
++            drop_uri = False
++            continue
++        if ln.startswith('#EXT-X-STREAM-INF') and dolby(ln):
++            drop_uri = True
++            continue
++        if (groups and ln.startswith('#EXT-X-MEDIA') and 'TYPE=AUDIO' in ln
++                and attr(ln, 'GROUP-ID') not in groups):
++            continue
++        out.append(ln)
++    return '\n'.join(out) + ('\n' if master.endswith('\n') else '')
 +
 +def enabled(config: dict | None) -> bool:
 +    return str((config or {}).get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
@@ -608,15 +677,16 @@ index 0000000..e4e1a80
 +        from ..config_store import persist_source_cache_updates
 +        persist_source_cache_updates(source.id, {'directv_playback': {}})
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index b818ab0..caeb1bd 100644
+index f4183ea..4a11627 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
-@@ -3189,6 +3189,8 @@
+@@ -3163,6 +3163,9 @@
              'On = leave out free, ad-supported channels (DirecTV Stream numbers these 4000-4999).')}
            ${toggleHtml('use_provider_numbers', 'Use DirecTV channel numbers',
              'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). Channels that share a number get subchannels, like 213.1.')}
 +          ${toggleHtml('use_dai', 'Use DirecTV ad insertion (DAI)',
 +            'On = play the stream DirecTV\'s own apps use, with DirecTV\'s local ads in commercial breaks. Off = the national feed without DirecTV\'s inserted ads.')}
++          ${toggleHtml('surround_audio', 'Surround sound (Dolby 5.1)', 'Off = stereo audio, like DirecTV\'s boxes with Dolby off.')}
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>

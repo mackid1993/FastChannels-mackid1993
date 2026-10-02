@@ -4,7 +4,7 @@ Background for any AI agent working in this repo, including the AI step CI runs 
 
 ## What this repo is
 
-A patch overlay, not a fork. It builds [kineticman/FastChannels](https://github.com/kineticman/FastChannels) (branch `development`) plus the patches in `patches/`, and publishes the result to `ghcr.io/mackid1993/fastchannels-mackid1993`. Upstream's code never lives here; CI clones it fresh for every build.
+A patch overlay, not a fork. It builds [kineticman/FastChannels](https://github.com/kineticman/FastChannels) (branch `main`, where his releases come from) plus the patches in `patches/`, and publishes the result to `ghcr.io/mackid1993/fastchannels-mackid1993`. Upstream's code never lives here; CI clones it fresh for every build.
 
 ```
 patches/            the changes applied on top of upstream, as `git format-patch` files
@@ -22,7 +22,7 @@ scripts/
 
 Weekly (Mondays, 9 AM Eastern), on a manual run, or when `patches/`, `scripts/` or the workflow change:
 
-1. Read upstream `development`'s newest commit and the newest Player APK release. Skip if that exact combination with these patches was already built.
+1. Read upstream `main`'s newest commit and the newest Player APK release. Skip if that exact combination with these patches was already built.
 2. `git am --3way` the patches onto a fresh upstream checkout.
 3. Static checks: compile, no new ruff error-class findings, templates parse, the DAI module and every hook are present.
 4. Build the image (bundles the latest Player APK from kineticman's releases) and confirm the APK is inside.
@@ -40,7 +40,7 @@ It adds an opt-in DirecTV source setting, **Use DirecTV ad insertion (DAI)** (`u
 
 Nearly all of it lives in **`app/scrapers/directv_dai.py`**, a file upstream doesn't have, so it can't conflict:
 
-- `CONFIG_FIELD`, `enabled()`: the toggle.
+- `CONFIG_FIELD`, `enabled()`: the DAI toggle. `SURROUND_FIELD`, `CONFIG_FIELDS`, `strip_surround()`: the Surround sound toggle; off removes the AC-3/E-AC-3 renditions from the bridge's master playlist so the stick plays DirecTV's stereo track.
 - `pick_stream_url()`: chooses `streamURL` when DAI is on, appends `yospace.pool=livepause`, and merges the DAI query with exact-key dedup.
 - `cached_url_usable()`: a cached URL is reused only under the same toggle setting and, with DAI on, only for the same playback device (its `_fw_did` is in the URL).
 - `_CLIENT_PARAMS`: the Android TV app's fixed flags (`d=android_tv`, Nielsen/comScore Android TV values, app constants, Yospace flags).
@@ -62,7 +62,7 @@ Upstream's files only get one-line hooks, and `scripts/validate.sh` checks every
   - The scrape collects `dai_channel_names` and caches it.
   - `resolve()` uses `cached_url_usable()` and passes `request_flags()`; the license path passes `dai=`.
 - `app/routes/api_sources.py`: calls `clear_cache_if_toggled()` after saving a source's config.
-- `app/routes/directv_proxy.py`: `'yospace.com'` in `_DIRECTV_BROWSER_CDN_SUFFIXES`, so DAI playlists and segments go through the same `browser-asset` relay as non-DAI streams.
+- `app/routes/directv_proxy.py`: imports `directv_dai`, runs the bridge master through `directv_dai.strip_surround()` (the Surround sound toggle), and has `'yospace.com'` in `_DIRECTV_BROWSER_CDN_SUFFIXES`, so DAI playlists and segments go through the same `browser-asset` relay as non-DAI streams.
 - `app/templates/admin/sources.html`: the toggle in `renderDirectvConfig`.
 
 When resolving a conflict in upstream's files, the fix is almost always to put the hook back where upstream's new code needs it.
