@@ -8,11 +8,11 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |   2 +
- app/routes/directv_proxy.py      |   7 +-
+ app/routes/directv_proxy.py      |  10 +-
  app/scrapers/directv.py          |  16 +-
- app/scrapers/directv_dai.py      | 615 +++++++++++++++++++++++++++++++
- app/templates/admin/sources.html |   2 +
- 5 files changed, 636 insertions(+), 6 deletions(-)
+ app/scrapers/directv_dai.py      | 659 +++++++++++++++++++++++++++++++
+ app/templates/admin/sources.html |   4 +
+ 5 files changed, 684 insertions(+), 7 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -29,7 +29,7 @@ index f2e5d42..336d79b 100644
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..dae0703 100644
+index e7680df..f40126c 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -58,7 +58,17 @@ index e7680df..dae0703 100644
      except Exception as exc:
          logger.warning('[directv-browser] manifest fetch failed for channel=%s: %s', channel_id, exc)
          return _unavailable_response()
-@@ -363,7 +364,7 @@ def directv_browser_asset():
+@@ -347,7 +348,8 @@ def directv_browser_manifest(channel_id: str):
+     if r.status_code >= 400:
+         return Response(r.content, status=r.status_code, content_type=r.headers.get('Content-Type') or 'text/plain')
+     return Response(
+-        _rewrite_directv_browser_playlist(r.text, r.url),
++        _rewrite_directv_browser_playlist(
++            directv_dai.stereo_downmix_master(r.text, channel.source.config), r.url),
+         status=200,
+         mimetype='application/vnd.apple.mpegurl',
+         headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
+@@ -363,7 +365,7 @@ def directv_browser_asset():
      if target.scheme != 'https' or not _directv_browser_cdn_allowed(target.hostname or ''):
          abort(400)
      range_header = request.headers.get('Range')
@@ -180,10 +190,10 @@ index e796bf3..b7e039a 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..77618b0
+index 0000000..99f99df
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,659 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -267,13 +277,29 @@ index 0000000..77618b0
 +    ),
 +)
 +
++SURROUND_FIELD = ConfigField(
++    'keep_surround', 'Keep 5.1 surround audio',
++    field_type='toggle', default='false',
++    help_text=(
++        'Off (default) = tell the player DirecTV\'s audio is stereo so a bridge '
++        'stick that decodes to a stereo-only encoder (no Dolby passthrough) plays '
++        'full-range sound instead of a muffled in-decoder downmix. On = keep the '
++        '5.1 track as DirecTV sends it, for an output that passes AC-3 through to '
++        'an AV receiver.'
++    ),
++)
 +
-+CONFIG_FIELDS = (CONFIG_FIELD,)
++
++CONFIG_FIELDS = (CONFIG_FIELD, SURROUND_FIELD)
 +
 +
 +
 +def enabled(config: dict | None) -> bool:
 +    return str((config or {}).get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
++
++
++def keep_surround(config: dict | None) -> bool:
++    return str((config or {}).get('keep_surround', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
 +
 +
 +# ── Stream URL ───────────────────────────────────────────────────────────────
@@ -343,6 +369,34 @@ index 0000000..77618b0
 +            url += f'&{quote(str(k), safe="")}={quote(str(v), safe=",:~")}'
 +            existing_keys.add(k)
 +    return url
++
++
++# ── Audio: full-range stereo on a bridge (PCM) output ─────────────────────────
++
++# A bridge stick (Fire TV, Google TV or Android TV) decodes DirecTV's AC-3 to PCM for
++# a stereo-only encoder with no Dolby passthrough. On Android 11 the stick's media3
++# sets the AC-3 decoder's channel-count from the master's CHANNELS attribute, and with
++# CHANNELS="6" the platform decoder does its own band-limited 5.1->2.0 downmix
++# (~7-11 kHz, "muffled"). Declaring the AC-3 rendition CHANNELS="2" in the master we
++# proxy makes media3 ask the decoder for stereo, so it applies AC-3's own full-range
++# Lo/Ro downmix instead. The 384 kbps AC-3 segments are untouched — only the declared
++# channel count changes — so there is no transcode and no quality loss. Only the
++# master carries #EXT-X-MEDIA audio renditions; media playlists pass through unchanged.
++_AC3_MEDIA_RE = re.compile(
++    r'(#EXT-X-MEDIA:[^\r\n]*?TYPE=AUDIO[^\r\n]*?GROUP-ID="AC3[^"]*"[^\r\n]*)', re.IGNORECASE)
++_CHANNELS_RE = re.compile(r'CHANNELS="\d+"', re.IGNORECASE)
++
++
++def stereo_downmix_master(master: str, config: dict | None) -> str:
++    """Declare DirecTV's AC-3 audio rendition as 2-channel in the HLS master so the
++    bridge player's AC-3 decoder outputs AC-3's own full-range stereo downmix instead
++    of the platform's band-limited in-decoder 5.1->2.0 downmix. No-op when keep_surround is
++    set, or the text has no AC-3 audio rendition (a media playlist or a non-DirecTV
++    master)."""
++    text = master or ''
++    if keep_surround(config) or 'TYPE=AUDIO' not in text or 'AC3' not in text:
++        return master
++    return _AC3_MEDIA_RE.sub(lambda m: _CHANNELS_RE.sub('CHANNELS="2"', m.group(1)), text)
 +
 +
 +def cached_url_usable(cached: dict | None, dai: bool) -> bool:
@@ -800,15 +854,17 @@ index 0000000..77618b0
 +        from ..config_store import persist_source_cache_updates
 +        persist_source_cache_updates(source.id, {'directv_playback': {}})
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index f4183ea..42bab94 100644
+index f4183ea..f5cf901 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
-@@ -3163,6 +3163,8 @@
+@@ -3163,6 +3163,10 @@
              'On = leave out free, ad-supported channels (DirecTV Stream numbers these 4000-4999).')}
            ${toggleHtml('use_provider_numbers', 'Use DirecTV channel numbers',
              'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). Channels that share a number get subchannels, like 213.1.')}
 +          ${toggleHtml('use_dai', 'Use DirecTV ad insertion (DAI)',
 +            'On = play the stream DirecTV\'s own apps use, with DirecTV\'s local ads in commercial breaks. Off = the national feed without DirecTV\'s inserted ads.')}
++          ${toggleHtml('keep_surround', 'Keep 5.1 surround audio',
++            'Off (default) = tell the player the audio is stereo so a bridge stick with a stereo-only encoder plays full-range sound instead of a muffled downmix. On = keep the 5.1 track for an output that passes AC-3 through to an AV receiver.')}
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
