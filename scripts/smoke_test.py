@@ -135,28 +135,27 @@ assert query.get('attnid') == 'dfw003' and query.get('p') == 'dfw', 'DirecTV app
 assert query.get('metr') == '1071', "metr must be DirecTV's TV device-class code"
 assert 'comscore_device' not in query, 'comscore_device only comes from a real bridge device'
 
-# A bridge device's own values take over from the account consent, exactly as the
-# Android TV app builds them (device_ad_flags). Fire TV: its Settings.Secure
-# advertising_id as google_advertising_id:<id> + adid=<id>; limited tracking: optout.
+# A bridge device's own values take over from the account consent, the same way on
+# every device: android_id:<Android ID> + is_lat=0 (no platform advertising id on any
+# device), comscore_device as the app builds it; limited tracking gets the optout form.
 fire = {'manufacturer': 'Amazon', 'model': 'AFTKRT', 'board': 'karat', 'release': '11',
-        'limit_ad_tracking': '0', 'advertising_id': '12345678-aaaa-bbbb-cccc-1234567890ab',
-        'android_id': 'abcdef0123456789'}
+        'limit_ad_tracking': '0', 'android_id': 'abcdef0123456789'}
 assert dai.device_ad_flags(fire) == {'comscore_device': 'Android_Amazon_AFTKRT', 'is_lat': '0',
-    '_fw_did': 'google_advertising_id:12345678-aaaa-bbbb-cccc-1234567890ab',
-    'adid': '12345678-aaaa-bbbb-cccc-1234567890ab'}
+    '_fw_did': 'android_id:abcdef0123456789'}
 assert dai.device_ad_flags({**fire, 'limit_ad_tracking': '1'})['_fw_did'] == 'google_advertising_id:optout'
 shield = {'manufacturer': 'NVIDIA', 'model': 'SHIELD Android TV', 'android_id': 'abcdef0123456789'}
 assert dai.device_ad_flags(shield) == {'comscore_device': 'Android_NVIDIA_SHIELDAndroidTV', 'is_lat': '0',
     '_fw_did': 'android_id:abcdef0123456789'}
 assert dai.device_ad_flags({}) == {}
+assert 'advertising_id' not in dict(dai._DEVICE_PROPS), 'no device reads a platform advertising id'
 real_client_device = dai._client_device
 dai._client_device = lambda: fire
 dev = dai.build_query(config, {}, '123')
-assert dev['is_lat'] == '0' and dev['adid'] == fire['advertising_id'] and dev['comscore_device'] == 'Android_Amazon_AFTKRT', dev
+assert dev['is_lat'] == '0' and 'adid' not in dev and dev['comscore_device'] == 'Android_Amazon_AFTKRT', dev
 assert dai.player_user_agent() == 'APP_PROJECT_NAME/5.0.136.2002113867 (Android 11; AFTKRT; karat)  PureRN/0.79.5'
 dev_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8?yo.up=u'}, dev)
 assert dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True)
-dai._client_device = lambda: {**fire, 'advertising_id': 'ffffffff-ffff-ffff-ffff-ffffffffffff'}
+dai._client_device = lambda: {**fire, 'android_id': 'ffffffffffffffff'}
 assert not dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True), 'another device reused a session'
 dai._client_device = real_client_device
 

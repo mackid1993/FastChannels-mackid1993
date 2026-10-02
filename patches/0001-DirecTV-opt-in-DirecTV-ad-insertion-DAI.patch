@@ -1,4 +1,4 @@
-From 01fd21ebb11a9f2c14a9df9b254a574e117133d5 Mon Sep 17 00:00:00 2001
+From e7294474ea2811b846bee8a3c08e354c80c3727f Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
 Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
@@ -10,9 +10,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/routes/api_sources.py        |   2 +
  app/routes/directv_proxy.py      |   7 +-
  app/scrapers/directv.py          |  16 +-
- app/scrapers/directv_dai.py      | 533 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 529 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 554 insertions(+), 6 deletions(-)
+ 5 files changed, 550 insertions(+), 6 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -180,10 +180,10 @@ index e796bf3..b7e039a 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..49b14e2
+index 0000000..30d1ecf
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,533 @@
+@@ -0,0 +1,529 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -411,11 +411,10 @@ index 0000000..49b14e2
 +_DEVICE_TTL = 3600
 +
 +# One adb read per bridge device per hour; every device-derived value below
-+# (ad id, is_lat, comscore_device, User-Agent) comes from these properties.
++# (Android ID, is_lat, comscore_device, User-Agent) comes from these properties.
 +_DEVICE_PROPS = (
 +    ('android_id', 'settings get secure android_id'),
 +    ('limit_ad_tracking', 'settings get secure limit_ad_tracking'),
-+    ('advertising_id', 'settings get secure advertising_id'),
 +    ('release', 'getprop ro.build.version.release'),
 +    ('model', 'getprop ro.product.model'),
 +    ('board', 'getprop ro.product.board'),
@@ -463,26 +462,23 @@ index 0000000..49b14e2
 +
 +
 +def device_ad_flags(props: dict) -> dict:
-+    """The device ad flags DirecTV's Android TV app sends (universalYospaceParameters
-+    and its android_tv branch, app bundle 5.0.136):
++    """The device ad flags, the same way on every Android TV device (Fire TV,
++    Google TV, Shield):
 +    - comscore_device = <systemName>_<Build.MANUFACTURER>_<Build.MODEL>, whitespace
-+      removed; systemName is "Android".
-+    - The ad id: on Fire TV the app reads Settings.Secure advertising_id when
-+      limit_ad_tracking is 0 (DeviceInformation.getAdvertisingId). It then sends
-+      _fw_did=google_advertising_id:<id> and adid=<id> with is_lat=0. With ad tracking
-+      limited it sends google_advertising_id:optout, adid=optout, is_lat=1.
-+    - Google TV / Shield: the app reads the Google advertising id from Play
-+      services, which adb can't. android_id:<Android ID> stands in, with is_lat=0
-+      (is_lat=0 is what gets local and political ads)."""
++      removed, as the Android TV app builds it (universalYospaceParameters);
++      systemName is "Android".
++    - _fw_did=android_id:<Android ID> with is_lat=0. DirecTV's own prefix for an
++      Android device id; every Android TV device exposes the Android ID over adb.
++      (The app sends the platform advertising id instead, which a Google TV/Shield
++      only exposes through Play services; to treat every device alike, no device
++      uses its advertising id.) is_lat=0 is what gets local and political ads.
++    - A device that limits ad tracking (Fire OS limit_ad_tracking=1) gets the
++      app's opted-out form: google_advertising_id:optout, adid=optout, is_lat=1."""
 +    if not props:
 +        return {}
 +    flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{props.get('manufacturer', '')}_{props.get('model', '')}")}
-+    fire_tv = props.get('manufacturer') == 'Amazon' or props.get('model', '').startswith('AFT')
-+    ad_id = props.get('advertising_id', '')
 +    if props.get('limit_ad_tracking') == '1':
 +        flags.update({'is_lat': '1', '_fw_did': 'google_advertising_id:optout', 'adid': 'optout'})
-+    elif fire_tv and len(ad_id) >= 8:
-+        flags.update({'is_lat': '0', '_fw_did': f'google_advertising_id:{ad_id}', 'adid': ad_id})
 +    elif len(props.get('android_id', '')) >= 8:
 +        flags.update({'is_lat': '0', '_fw_did': f"android_id:{props['android_id']}"})
 +    return flags
