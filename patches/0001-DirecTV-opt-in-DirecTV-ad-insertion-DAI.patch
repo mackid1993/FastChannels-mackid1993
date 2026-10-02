@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 633297ec4c74c448ffffb8acb0fdea01005bddba Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
 Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
@@ -8,11 +8,11 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |   2 +
- app/routes/directv_proxy.py      |   7 +-
+ app/routes/directv_proxy.py      |   9 +-
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 516 +++++++++++++++++++++++++++++++
- app/templates/admin/sources.html |   3 +
- 5 files changed, 541 insertions(+), 5 deletions(-)
+ app/scrapers/directv_dai.py      | 475 +++++++++++++++++++++++++++++++
+ app/templates/admin/sources.html |   2 +
+ 5 files changed, 500 insertions(+), 6 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -29,7 +29,7 @@ index f2e5d42..336d79b 100644
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..2013e50 100644
+index e7680df..986f7cc 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -49,15 +49,24 @@ index e7680df..2013e50 100644
  )
  
  
-@@ -347,7 +348,7 @@ def directv_browser_manifest(channel_id: str):
-     if r.status_code >= 400:
-         return Response(r.content, status=r.status_code, content_type=r.headers.get('Content-Type') or 'text/plain')
-     return Response(
--        _rewrite_directv_browser_playlist(r.text, r.url),
-+        _rewrite_directv_browser_playlist(directv_dai.strip_surround(r.text, channel.source.config), r.url),
-         status=200,
-         mimetype='application/vnd.apple.mpegurl',
-         headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
+@@ -320,7 +321,7 @@ def directv_browser_manifest(channel_id: str):
+     scraper = scraper_cls(channel.source.config or {})
+     try:
+         resolved_url = scraper.resolve(channel.stream_url)
+-        r = _requests.get(resolved_url, timeout=12)
++        r = _requests.get(resolved_url, headers={'User-Agent': directv_dai.PLAYER_USER_AGENT}, timeout=12)
+     except Exception as exc:
+         logger.warning('[directv-browser] manifest fetch failed for channel=%s: %s', channel_id, exc)
+         return _unavailable_response()
+@@ -363,7 +364,7 @@ def directv_browser_asset():
+     if target.scheme != 'https' or not _directv_browser_cdn_allowed(target.hostname or ''):
+         abort(400)
+     range_header = request.headers.get('Range')
+-    headers = {'User-Agent': _BROWSER_UA}
++    headers = {'User-Agent': directv_dai.PLAYER_USER_AGENT}
+     if range_header:
+         headers['Range'] = range_header
+     try:
 @@ -375,7 +376,7 @@ def directv_browser_asset():
      content_type = r.headers.get('Content-Type') or 'application/octet-stream'
      if 'mpegurl' in content_type.lower() or raw_url.lower().split('?', 1)[0].endswith(('.m3u8', '.m3u')):
@@ -189,10 +198,10 @@ index e796bf3..86a5067 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..898d764
+index 0000000..bd0626b
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,475 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -267,55 +276,14 @@ index 0000000..898d764
 +)
 +
 +
-+SURROUND_FIELD = ConfigField(
-+    'surround_audio', 'Surround sound (Dolby 5.1)',
-+    field_type='toggle', default='true',
-+    help_text=(
-+        'On = DirecTV\'s 5.1 Dolby Digital audio. Off = its stereo audio, what '
-+        'DirecTV\'s own boxes play with Dolby turned off. Applies to FastChannels '
-+        'Player bridge devices.'
-+    ),
-+)
++CONFIG_FIELDS = (CONFIG_FIELD,)
 +
-+CONFIG_FIELDS = (CONFIG_FIELD, SURROUND_FIELD)
-+
-+
-+def strip_surround(master: str, config: dict | None) -> str:
-+    """With surround off, remove the Dolby (AC-3/E-AC-3) renditions from an HLS
-+    master playlist so the player can only pick the stereo track. Any playlist it
-+    can't safely filter (a media playlist, or one with no non-Dolby variant) is
-+    returned unchanged."""
-+    value = str((config or {}).get('surround_audio', 'true')).strip().lower()
-+    if value in {'1', 'true', 'yes', 'on', ''} or '#EXT-X-STREAM-INF' not in (master or ''):
-+        return master
-+    lines = master.splitlines()
-+
-+    def attr(line: str, name: str) -> str:
-+        m = re.search(rf'{name}="([^"]*)"', line)
-+        return m.group(1) if m else ''
-+
-+    def dolby(line: str) -> bool:
-+        codecs = attr(line, 'CODECS').lower()
-+        return 'ac-3' in codecs or 'ec-3' in codecs
-+
-+    infs = [ln for ln in lines if ln.startswith('#EXT-X-STREAM-INF')]
-+    kept = [ln for ln in infs if not dolby(ln)]
-+    if not kept:
-+        return master
-+    groups = {attr(ln, 'AUDIO') for ln in kept} - {''}
-+    out, drop_uri = [], False
-+    for ln in lines:
-+        if drop_uri and ln.strip() and not ln.startswith('#'):
-+            drop_uri = False
-+            continue
-+        if ln.startswith('#EXT-X-STREAM-INF') and dolby(ln):
-+            drop_uri = True
-+            continue
-+        if (groups and ln.startswith('#EXT-X-MEDIA') and 'TYPE=AUDIO' in ln
-+                and attr(ln, 'GROUP-ID') not in groups):
-+            continue
-+        out.append(ln)
-+    return '\n'.join(out) + ('\n' if master.endswith('\n') else '')
++# The User-Agent DirecTV's Android TV app gives its player (ExoPlayerWrapper in
++# com.clientapp.customplayer). The FastChannels Player bridge plays DirecTV
++# through the server relay, so this, not the stick's own User-Agent, is what
++# Yospace and DirecTV's CDNs see on the master, every playlist poll and every
++# segment.
++PLAYER_USER_AGENT = 'Custom-Exoplayer'
 +
 +
 +def keep_drm_session(playlist: str) -> str:
@@ -710,16 +678,18 @@ index 0000000..898d764
 +        from ..config_store import persist_source_cache_updates
 +        persist_source_cache_updates(source.id, {'directv_playback': {}})
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index f4183ea..4a11627 100644
+index f4183ea..42bab94 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
-@@ -3163,6 +3163,9 @@
+@@ -3163,6 +3163,8 @@
              'On = leave out free, ad-supported channels (DirecTV Stream numbers these 4000-4999).')}
            ${toggleHtml('use_provider_numbers', 'Use DirecTV channel numbers',
              'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). Channels that share a number get subchannels, like 213.1.')}
 +          ${toggleHtml('use_dai', 'Use DirecTV ad insertion (DAI)',
 +            'On = play the stream DirecTV\'s own apps use, with DirecTV\'s local ads in commercial breaks. Off = the national feed without DirecTV\'s inserted ads.')}
-+          ${toggleHtml('surround_audio', 'Surround sound (Dolby 5.1)', 'Off = stereo audio, like DirecTV\'s boxes with Dolby off.')}
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
+-- 
+2.50.1 (Apple Git-155)
+

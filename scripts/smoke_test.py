@@ -62,20 +62,8 @@ assert directv_proxy._directv_browser_cdn_allowed('csm-e-dtv-livecomplex-eb.tls1
 # The toggle is wired into the DirecTV source settings.
 keys = {field.key for field in directv.DirectvScraper.config_schema}
 assert 'use_dai' in keys, 'use_dai toggle missing from the DirecTV config schema'
-assert 'surround_audio' in keys, 'surround_audio toggle missing from the DirecTV config schema'
+assert 'surround_audio' not in keys, 'the removed Surround sound toggle is back'
 
-# Surround off strips the Dolby renditions from the master; on (the default) leaves it alone.
-master = ('#EXTM3U\n'
-          '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="AC3-384kbps",NAME="English",URI="ac3.m3u8"\n'
-          '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="HEAAC-96kbps",NAME="English",URI="aac.m3u8"\n'
-          '#EXT-X-STREAM-INF:BANDWIDTH=6485600,CODECS="avc1.64002a,mp4a.40.5",AUDIO="HEAAC-96kbps"\nv.m3u8\n'
-          '#EXT-X-STREAM-INF:BANDWIDTH=6802400,CODECS="avc1.64002a,ac-3",AUDIO="AC3-384kbps"\nv.m3u8\n')
-stereo = dai.strip_surround(master, {'surround_audio': 'false'})
-assert 'ac-3' not in stereo and 'AC3-384kbps' not in stereo and stereo.count('#EXT-X-STREAM-INF') == 1, stereo
-assert 'aac.m3u8' in stereo and stereo.rstrip().endswith('v.m3u8')
-assert dai.strip_surround(master, {}) == master, 'surround must default to on'
-dolby_only = master.replace('mp4a.40.5', 'ac-3')
-assert dai.strip_surround(dolby_only, {'surround_audio': 'false'}) == dolby_only, 'stripped every variant'
 # Inserted ads keep the channel's DRM key in force (no decoder teardown at ad boundaries).
 wv = '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="data:x",KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"'
 media = (f'#EXTM3U\n{wv}\n#EXTINF:2,\nc1.m4a\n#EXT-X-DISCONTINUITY\n#EXT-X-KEY:METHOD=NONE\n'
@@ -86,8 +74,10 @@ plain = '#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:2,\na.ts\n'
 assert dai.keep_drm_session(plain) == plain, 'touched a playlist without a Widevine key'
 assert 'directv_dai.keep_drm_session(' in inspect.getsource(directv_proxy.directv_browser_asset), \
     'the relay no longer keeps the DRM session through inserted ads'
-assert 'directv_dai.strip_surround(' in inspect.getsource(directv_proxy.directv_browser_manifest), \
-    'the bridge manifest no longer applies the surround setting'
+# The relay identifies itself to Yospace and DirecTV's CDNs as DirecTV's Android TV player.
+assert dai.PLAYER_USER_AGENT == 'Custom-Exoplayer'
+for fn in (directv_proxy.directv_browser_manifest, directv_proxy.directv_browser_asset):
+    assert 'directv_dai.PLAYER_USER_AGENT' in inspect.getsource(fn), f'{fn.__name__} no longer sends the DirecTV player User-Agent'
 assert dai.enabled({'use_dai': 'true'}) is True
 assert dai.enabled({'use_dai': False}) is False
 assert dai.enabled(None) is False

@@ -26,9 +26,11 @@ When changing this code, keep that goal ahead of convenience:
 - Don't send fabricated ad-view or measurement data.
 - Don't do anything to skip or suppress ads.
 
-## Surround sound toggle
+## DirecTV player User-Agent on the relay
 
-"Surround sound (Dolby 5.1)", on by default. Off strips the AC-3/E-AC-3 renditions from the master playlist FastChannels hands bridge sticks (`browser.m3u8`), so the stick plays DirecTV's stereo HE-AAC track (`mp4a.40.5`, 96 kbps). That's exactly what an Osprey plays with Dolby off: verified, it decodes with `c2.android.aac.decoder` at 48 kHz stereo. It skips Dolby's turn-down to reference level and the 5.1-to-stereo fold-down (stereo is ~4–6 dB louder), and avoids the 7 kHz AC-3 ad renditions. It works with DAI on or off, but not when Channels plays the DirecTV URL itself.
+The bridge plays DirecTV through `browser.m3u8` and the `browser-asset` relay, so the server makes every request Yospace and DirecTV's CDNs see. It used to send python-requests' UA on the master (the request that opens the Yospace session) and a Windows desktop Chrome UA on every playlist poll and segment. It now sends `Custom-Exoplayer`, the User-Agent DirecTV's Android TV app sets on its player (`com.clientapp.customplayer.ExoPlayerWrapper`), matching the `d=android_tv` identity. Verified 2026-10-01: master, media playlists, init and segments all return 200 with it. Whether it changes which ad files are served is untested. When Cronet is enabled the app's engine uses a runtime UA from native code (`CronetHttpService.getUserAgent`), which isn't readable statically.
+
+The Surround sound toggle was removed 2026-10-01 at the user's request (dead weight); bridge sticks always get DirecTV's full master, AC-3 included.
 
 ## One DRM session through inserted ads (mirrors the Android TV app)
 

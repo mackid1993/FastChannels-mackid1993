@@ -40,7 +40,8 @@ It adds an opt-in DirecTV source setting, **Use DirecTV ad insertion (DAI)** (`u
 
 Nearly all of it lives in **`app/scrapers/directv_dai.py`**, a file upstream doesn't have, so it can't conflict:
 
-- `CONFIG_FIELD`, `enabled()`: the DAI toggle. `SURROUND_FIELD`, `CONFIG_FIELDS`, `strip_surround()`: the Surround sound toggle; off removes the AC-3/E-AC-3 renditions from the bridge's master playlist so the stick plays DirecTV's stereo track.
+- `CONFIG_FIELD`, `CONFIG_FIELDS`, `enabled()`: the DAI toggle.
+- `PLAYER_USER_AGENT`: `Custom-Exoplayer`, the User-Agent DirecTV's Android TV app gives its player (`ExoPlayerWrapper`). The relay sends it on the master fetch and every relayed playlist and segment.
 - `pick_stream_url()`: chooses `streamURL` when DAI is on, appends `yospace.pool=livepause`, and merges the DAI query with exact-key dedup.
 - `cached_url_usable()`: a cached URL is reused only under the same toggle setting and, with DAI on, only for the same playback device (its `_fw_did` is in the URL).
 - `_CLIENT_PARAMS`: the Android TV app's fixed flags (`d=android_tv`, Nielsen/comScore Android TV values, app constants, Yospace flags).
@@ -62,7 +63,7 @@ Upstream's files only get one-line hooks, and `scripts/validate.sh` checks every
   - The scrape collects `dai_channel_names` and caches it.
   - `resolve()` uses `cached_url_usable()` and passes `request_flags()`; the license path passes `dai=`.
 - `app/routes/api_sources.py`: calls `clear_cache_if_toggled()` after saving a source's config.
-- `app/routes/directv_proxy.py`: imports `directv_dai`, runs the bridge master through `directv_dai.strip_surround()` (the Surround sound toggle), runs relayed media playlists through `directv_dai.keep_drm_session()` (keeps the Widevine key in force through inserted ads, like the Android TV app's `setUseDrmSessionsForClearContent`), and has `'yospace.com'` in `_DIRECTV_BROWSER_CDN_SUFFIXES`, so DAI playlists and segments go through the same `browser-asset` relay as non-DAI streams.
+- `app/routes/directv_proxy.py`: imports `directv_dai`, sends `directv_dai.PLAYER_USER_AGENT` on the bridge master fetch and the `browser-asset` relay (instead of python-requests' and a Windows Chrome UA), runs relayed media playlists through `directv_dai.keep_drm_session()` (keeps the Widevine key in force through inserted ads, like the Android TV app's `setUseDrmSessionsForClearContent`), and has `'yospace.com'` in `_DIRECTV_BROWSER_CDN_SUFFIXES`, so DAI playlists and segments go through the same `browser-asset` relay as non-DAI streams.
 - `app/templates/admin/sources.html`: the toggle in `renderDirectvConfig`.
 
 When resolving a conflict in upstream's files, the fix is almost always to put the hook back where upstream's new code needs it.

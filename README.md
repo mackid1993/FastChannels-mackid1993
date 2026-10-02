@@ -1,9 +1,8 @@
 # FastChannels-mackid1993
 
-[kineticman/FastChannels](https://github.com/kineticman/FastChannels) (`main`, the branch his releases come from) with two DirecTV additions, kept up to date automatically:
+[kineticman/FastChannels](https://github.com/kineticman/FastChannels) (`main`, the branch his releases come from) with a DirecTV addition, kept up to date automatically:
 
-- **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the account's own targeting values (DMA, billing ZIP, household and profile IDs) and each bridge device's Android ID and ad-tracking setting. That's how it gets the same local ads an Osprey gets.
-- **Surround sound (Dolby 5.1):** on by default. Off gives FastChannels Player bridge devices DirecTV's stereo track instead of the 5.1 Dolby one, as an Osprey plays with Dolby turned off: no downmix, louder, and none of the band-limited AC-3 ad audio.
+- **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the account's own targeting values (DMA, billing ZIP, household and profile IDs) and each bridge device's Android ID and ad-tracking setting. That's how it gets the same local ads an Osprey gets. The server relay identifies itself to Yospace and DirecTV's CDNs as DirecTV's Android TV player (`User-Agent: Custom-Exoplayer`), not as a desktop browser.
 
 ```
 docker pull ghcr.io/mackid1993/fastchannels-mackid1993:latest
@@ -26,7 +25,7 @@ This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` 
 
 The other six days, a drift check applies the patch to upstream's latest code, runs the static checks and refreshes the patch, without building an image. A conflict is caught the day it appears.
 
-The DAI and surround code lives in its own file, `app/scrapers/directv_dai.py`, which upstream doesn't have and so can't conflict with. Upstream's files only get about two dozen one-line hooks, which keeps conflicts rare and trivial to fix.
+The DAI code lives in its own file, `app/scrapers/directv_dai.py`, which upstream doesn't have and so can't conflict with. Upstream's files only get about two dozen one-line hooks, which keeps conflicts rare and trivial to fix.
 
 If any step fails, nothing is published, `:latest` stays on the last good build, and a "Build failed" issue pings you. Until it's resolved, the daily run does a full build instead of a drift check, so a one-off failure (a registry hiccup, say) fixes itself the next day.
 
