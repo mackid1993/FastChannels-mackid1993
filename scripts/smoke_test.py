@@ -76,6 +76,14 @@ assert 'aac.m3u8' in stereo and stereo.rstrip().endswith('v.m3u8')
 assert dai.strip_surround(master, {}) == master, 'surround must default to on'
 dolby_only = master.replace('mp4a.40.5', 'ac-3')
 assert dai.strip_surround(dolby_only, {'surround_audio': 'false'}) == dolby_only, 'stripped every variant'
+ad = 'https://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/u-6600-c-384-1-'
+media = ('#EXTM3U\n#EXTINF:2.0,\nhttps://dfwlive.example/Content/seg1.m4a\n#EXT-X-DISCONTINUITY\n'
+         f'#EXT-X-MAP:URI="{ad}i.mp4"\n#EXTINF:2.0,\n{ad}0.mp4\n')
+swapped = dai.stereo_ads(media)
+assert 'c-384' not in swapped and swapped.count('u-6600-a-96-1-') == 2 and 'seg1.m4a' in swapped, swapped
+assert dai.stereo_ads(master) == master, 'stereo_ads touched a master playlist'
+assert 'directv_dai.stereo_ads(' in inspect.getsource(directv_proxy.directv_browser_asset), \
+    'the relay no longer swaps inserted ads to their stereo audio'
 assert 'directv_dai.strip_surround(' in inspect.getsource(directv_proxy.directv_browser_manifest), \
     'the bridge manifest no longer applies the surround setting'
 assert dai.enabled({'use_dai': 'true'}) is True

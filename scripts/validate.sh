@@ -78,6 +78,7 @@ check $d "directv_dai.request_flags("
     || { echo "::error file=$d::missing DAI hook: dai=directv_dai.enabled(...) in resolve() and the license path"; missing=1; }
 check app/routes/api_sources.py "directv_dai.clear_cache_if_toggled("
 check app/routes/directv_proxy.py "directv_dai.strip_surround("
+check app/routes/directv_proxy.py "directv_dai.stereo_ads("
 check app/templates/admin/sources.html "toggleHtml('surround_audio'"
 check app/routes/directv_proxy.py "'yospace.com',  # DAI"
 check app/templates/admin/sources.html "toggleHtml('use_dai'"

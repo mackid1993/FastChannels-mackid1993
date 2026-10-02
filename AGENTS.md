@@ -62,7 +62,7 @@ Upstream's files only get one-line hooks, and `scripts/validate.sh` checks every
   - The scrape collects `dai_channel_names` and caches it.
   - `resolve()` uses `cached_url_usable()` and passes `request_flags()`; the license path passes `dai=`.
 - `app/routes/api_sources.py`: calls `clear_cache_if_toggled()` after saving a source's config.
-- `app/routes/directv_proxy.py`: imports `directv_dai`, runs the bridge master through `directv_dai.strip_surround()` (the Surround sound toggle), and has `'yospace.com'` in `_DIRECTV_BROWSER_CDN_SUFFIXES`, so DAI playlists and segments go through the same `browser-asset` relay as non-DAI streams.
+- `app/routes/directv_proxy.py`: imports `directv_dai`, runs the bridge master through `directv_dai.strip_surround()` (the Surround sound toggle), runs relayed media playlists through `directv_dai.stereo_ads()` (inserted ads play their stereo AAC rendition), and has `'yospace.com'` in `_DIRECTV_BROWSER_CDN_SUFFIXES`, so DAI playlists and segments go through the same `browser-asset` relay as non-DAI streams.
 - `app/templates/admin/sources.html`: the toggle in `renderDirectvConfig`.
 
 When resolving a conflict in upstream's files, the fix is almost always to put the hook back where upstream's new code needs it.
