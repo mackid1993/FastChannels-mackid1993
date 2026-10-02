@@ -71,12 +71,15 @@ check $d "directv_dai.store_login_result("
 check $d "directv_dai.CONFIG_FIELD"
 check $d "directv_dai.note_channel("
 check $d "directv_dai.cached_url_usable("
-check $d "directv_dai.android_auth_request("
+# The Android TV client logic (channel/v2 request, app User-Agent, device reading) lives
+# in dtv_android so the Android login is portable; DAI depends on it, not the reverse.
+check $d "dtv_android.android_auth_request("
 # Two callers pass dai=: resolve() and the license path.
 [ "$(grep -cE -- 'dai=directv_dai\.request_flags\(' $d)" -ge 2 ] \
     || { echo "::error file=$d::missing DAI hook: dai=directv_dai.request_flags(...) in resolve() and the license path"; missing=1; }
 check app/routes/api_sources.py "directv_dai.clear_cache_if_toggled("
-check app/routes/directv_proxy.py "directv_dai.player_headers()"
+check app/routes/directv_proxy.py "dtv_android.player_headers()"
+check app/routes/directv_proxy.py "dtv_aac_ads.swap_muffled_ads("
 check app/routes/directv_proxy.py "'yospace.com',  # DAI"
 check app/templates/admin/sources.html "toggleHtml('use_dai'"
 [ "$missing" -eq 0 ]
