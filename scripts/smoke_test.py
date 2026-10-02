@@ -116,6 +116,10 @@ assert query.get('nielsen_platform') == 'plt,OTT' and query.get('nielsen_dev_gro
 assert query.get('m') == 'live' and query.get('yo.fr') == 'true', 'general client flags missing'
 assert query.get('yo.lpa') == 'true' and query.get('yo.lp') == 'true', 'live-pause flags missing (no ads without them)'
 assert 'yo.po' not in query, "the web player's yo.po must not be sent"
+assert query.get('yo.sl') == '3' and query.get('yo.d.cp') == 'true' and query.get('yo.cps'), \
+    "the Android TV app's live Yospace params are missing"
+assert 'com.att.tv' in base64.b64decode(query.get('yo.vm', '')).decode(), \
+    "yo.vm must carry the Android TV app's ad-macro map (APPBUNDLE com.att.tv)"
 assert query.get('attnid') == 'dfw003' and query.get('p') == 'dfw', 'DirecTV app constants missing'
 assert query.get('metr') == '1071', "metr must be DirecTV's TV device-class code"
 assert 'comscore_device' not in query, 'no minted comScore device id'
