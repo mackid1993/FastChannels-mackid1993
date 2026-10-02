@@ -352,7 +352,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           # Any OpenRouter model, as "openrouter/<model id>". Override with the
           # AI_MODEL repo variable.
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/qwen/qwen3.8-27b' }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3' }}
         run: |
           # Pinned: a new Aider release can change or drop flags this step relies on.
           pip install --quiet aider-chat==0.86.2
@@ -492,7 +492,7 @@ jobs:
           git push -f origin "$branch"
           issue=$(gh issue list --state open --limit 100 --json number,title --jq ".[] | select(.title == \"$CONFLICT_TITLE\") | .number" | head -1)
           cat > body.md <<BODY
-          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and the patch conflicted. The AI (\`${{ vars.AI_MODEL || 'openrouter/qwen/qwen3.8-27b' }}\` via Aider) resolved the conflict, changing only the conflicted files. The result passed the static checks and a full image build, Player APK check, DAI smoke test and boot test.
+          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and the patch conflicted. The AI (\`${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3' }}\` via Aider) resolved the conflict, changing only the conflicted files. The result passed the static checks and a full image build, Player APK check, DAI smoke test and boot test.
 
           This PR is merged automatically, which starts the publishing build. \`:latest\` only updates if that build passes too.
 

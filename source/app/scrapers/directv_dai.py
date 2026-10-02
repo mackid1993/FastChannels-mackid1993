@@ -523,6 +523,14 @@ def store_login_result(cfg: dict, result: dict) -> None:
     # registered device instead of granting a new one each time.
     if result.get('dtv_android_device_id'):
         cfg['dtv_android_device_id'] = result['dtv_android_device_id']
+    # The access token's expiry, so we refresh just before it lapses (dtv_android.
+    # token_stale) rather than on a fixed clock. Cleared when a login can't parse one,
+    # so a stale expiry never pins the staleness check.
+    if 'token_expires_at' in result:
+        if result.get('token_expires_at'):
+            cfg['dtv_android_expires_at'] = result['token_expires_at']
+        else:
+            cfg.pop('dtv_android_expires_at', None)
 
 
 def fetch_account_context(session, bearer: str) -> dict:

@@ -9,11 +9,11 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
 ---
  app/routes/api_sources.py        |   2 +
  app/routes/directv_proxy.py      |   7 +-
- app/scrapers/directv.py          |  27 +-
- app/scrapers/directv_dai.py      | 618 +++++++++++++++++++++++++++++++
- app/scrapers/dtv_android.py      | 250 +++++++++++++
- app/templates/admin/sources.html |   2 +
- 6 files changed, 894 insertions(+), 12 deletions(-)
+ app/scrapers/directv.py          |  59 ++-
+ app/scrapers/directv_dai.py      | 626 +++++++++++++++++++++++++++++++
+ app/scrapers/dtv_android.py      | 360 ++++++++++++++++++
+ app/templates/admin/sources.html |  14 +-
+ 6 files changed, 1048 insertions(+), 20 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_android.py
 
@@ -70,7 +70,7 @@ index e7680df..dae0703 100644
          headers['Range'] = range_header
      try:
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
-index e796bf3..a64d6e3 100644
+index e796bf3..35c7276 100644
 --- a/app/scrapers/directv.py
 +++ b/app/scrapers/directv.py
 @@ -84,6 +84,8 @@ except ImportError:
@@ -157,7 +157,20 @@ index e796bf3..a64d6e3 100644
      ]
  
      _FAST_CHANNEL_NUMBER_RANGE = range(4000, 5000)
-@@ -1613,6 +1621,7 @@ class DirectvScraper(BaseScraper):
+@@ -1436,8 +1444,10 @@ class DirectvScraper(BaseScraper):
+     # ── Auth ─────────────────────────────────────────────────────────────────
+ 
+     def _token_stale(self) -> bool:
+-        captured_at = self.config.get('token_captured_at') or 0
+-        return (not self.config.get('bearer_token')) or (time.time() - float(captured_at)) > _TOKEN_TTL
++        # No fixed-timer refresh: the Android TV grant token is long-lived and rides
++        # until a tune's authorization is actually rejected, which resolve() recovers
++        # inline. Stale here only means "no session yet". See dtv_android.token_stale.
++        return dtv_android.token_stale(self.config)
+ 
+     def pre_run_setup(self) -> None:
+         if not self._token_stale():
+@@ -1613,6 +1623,7 @@ class DirectvScraper(BaseScraper):
                  # also contain internal channel IDs; retain resolver validation and
                  # community-map fallback rather than accepting every value.
                  external_listing_id = _pick(row, 'externalListingId')
@@ -165,7 +178,7 @@ index e796bf3..a64d6e3 100644
  
                  channels.append(ChannelData(
                      source_channel_id=ccid,
-@@ -1897,7 +1906,7 @@ class DirectvScraper(BaseScraper):
+@@ -1897,7 +1908,7 @@ class DirectvScraper(BaseScraper):
              raise RuntimeError(f'DirecTV Stream: malformed stream_url: {raw_url}')
  
          cached = (self.cache.get('directv_playback') or {}).get(ccid)
@@ -174,15 +187,43 @@ index e796bf3..a64d6e3 100644
              return cached['fallback_url']
  
          bearer = self.config.get('bearer_token')
-@@ -1910,6 +1919,7 @@ class DirectvScraper(BaseScraper):
+@@ -1910,13 +1921,30 @@ class DirectvScraper(BaseScraper):
          try:
              result = _fetch_channel_playback(
                  bearer, self.config.get('cookies') or [], self.config.get('client_context'), ccid,
 +                dai=directv_dai.request_flags(self.config, self.cache.get('dai_channel_names'), ccid),
              )
          except DirectvAuthExpiredError as exc:
-             self._mark_auth_stale_and_reauth(f'channel/v1 expired token for ccid={ccid}')
-@@ -1952,11 +1962,9 @@ class DirectvScraper(BaseScraper):
+-            self._mark_auth_stale_and_reauth(f'channel/v1 expired token for ccid={ccid}')
+-            raise RuntimeError(
+-                f'DirecTV Stream: session expired while resolving channel {ccid}; '
+-                'refreshing authentication in the background'
+-            ) from exc
++            # Token expired at tune time: refresh inline and retry once so the tune
++            # succeeds instead of failing, the way a real Android TV client recovers.
++            # This only fires on an actual expiry (never on a cache hit or a normal
++            # flip); if the refresh token itself is dead it falls back to the existing
++            # background re-auth, so this is never worse than before.
++            result = None
++            if dtv_android.refresh_in_place(self):
++                try:
++                    result = _fetch_channel_playback(
++                        self.config.get('bearer_token'), self.config.get('cookies') or [],
++                        self.config.get('client_context'), ccid,
++                        dai=directv_dai.request_flags(self.config, self.cache.get('dai_channel_names'), ccid),
++                    )
++                except DirectvAuthExpiredError:
++                    result = None
++            if not result:
++                self._mark_auth_stale_and_reauth(f'channel/v1 expired token for ccid={ccid}')
++                raise RuntimeError(
++                    f'DirecTV Stream: session expired while resolving channel {ccid}; '
++                    'refreshing authentication in the background'
++                ) from exc
+         if not result:
+             raise RuntimeError(f'DirecTV Stream: could not resolve playback for channel {ccid}')
+ 
+@@ -1952,11 +1980,9 @@ class DirectvScraper(BaseScraper):
  
      @classmethod
      def license_request_headers(cls, config: dict) -> dict:
@@ -197,7 +238,7 @@ index e796bf3..a64d6e3 100644
  
      @classmethod
      def prepare_activation_request(cls, challenge: bytes, config: dict) -> tuple[bytes, dict]:
-@@ -2020,6 +2028,7 @@ class DirectvScraper(BaseScraper):
+@@ -2020,6 +2046,7 @@ class DirectvScraper(BaseScraper):
              try:
                  fresh = _fetch_channel_playback(
                      bearer, config.get('cookies') or [], config.get('client_context'), channel_id,
@@ -207,10 +248,10 @@ index e796bf3..a64d6e3 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..68d4d76
+index 0000000..a8bf510
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,626 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -736,6 +777,14 @@ index 0000000..68d4d76
 +    # registered device instead of granting a new one each time.
 +    if result.get('dtv_android_device_id'):
 +        cfg['dtv_android_device_id'] = result['dtv_android_device_id']
++    # The access token's expiry, so we refresh just before it lapses (dtv_android.
++    # token_stale) rather than on a fixed clock. Cleared when a login can't parse one,
++    # so a stale expiry never pins the staleness check.
++    if 'token_expires_at' in result:
++        if result.get('token_expires_at'):
++            cfg['dtv_android_expires_at'] = result['token_expires_at']
++        else:
++            cfg.pop('dtv_android_expires_at', None)
 +
 +
 +def fetch_account_context(session, bearer: str) -> dict:
@@ -831,10 +880,10 @@ index 0000000..68d4d76
 +        persist_source_cache_updates(source.id, {'directv_playback': {}})
 diff --git a/app/scrapers/dtv_android.py b/app/scrapers/dtv_android.py
 new file mode 100644
-index 0000000..df23522
+index 0000000..035cd0e
 --- /dev/null
 +++ b/app/scrapers/dtv_android.py
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,360 @@
 +"""Android TV client for DirecTV.
 +
 +Signs the DirecTV session in as DirecTV's own Android TV app (OAuth client
@@ -878,11 +927,14 @@ index 0000000..df23522
 +_DEVICECODE_URL = f'{_GRANT_BASE}/v2/devicecode'
 +_TOKENS_URL = f'{_GRANT_BASE}/tokens'
 +# A real Android TV client signs in once and then refreshes its token — it never
-+# re-logs-in. After the first device-code grant we keep the refresh token + the
-+# device id and refresh here instead of re-granting. Exact refresh body wasn't
-+# recoverable from the bundle; this mirrors the token-exchange convention
-+# (authn-refreshgo/v3). If a live refresh 4xx's, adjust from its response.
-+_REFRESH_URL = 'https://api.cld.dtvce.com/authn-refreshgo/v3/tokens'
++# re-logs-in. After the first device-code grant we keep the refresh token + the device
++# id and refresh here instead of re-granting. Verified live and against a web HAR
++# capture: POST authn-refreshgo/v3/refresh?clientID=<id> with a form body of clientMake,
++# clientModel and refresh_token (snake_case). clientMake/clientModel are client
++# descriptors the endpoint accepts as-is; the Android TV identity is clientID.
++_REFRESH_URL = 'https://api.cld.dtvce.com/authn-refreshgo/v3/refresh'
++_CLIENT_MAKE = 'Google'
++_CLIENT_MODEL = 'Chrome'
 +
 +# The user approves the device code themselves in a browser at directv.com/tvsigninv2
 +# (the grant's approval step is the web page's, not an API we can call), so the poll
@@ -890,6 +942,13 @@ index 0000000..df23522
 +# we poll just under that, with the code shown in the admin status the whole time.
 +_POLL_DEADLINE = 540
 +_POLL_MIN_INTERVAL = 5
++
++# If the token response ever gives us an expiry, refresh a little before it (the way the
++# app does, via RefreshTokenBeforeExpirationMinutes). DirecTV's response carries no
++# expiry and the token is opaque, so in practice we don't refresh on a timer at all — the
++# token rides until a real request is rejected (401), which the reactive re-auth path
++# turns into a refresh. The 401 is the check; there is no blind auto-refresh.
++_REFRESH_BUFFER = 600
 +
 +
 +def _app_headers() -> dict:
@@ -908,6 +967,62 @@ index 0000000..df23522
 +    app User-Agent, no stream.directv.com Origin/Referer. Replaces the web
 +    license_request_headers so the DRM device isn't a browser."""
 +    return _app_headers()
++
++
++def _num(v):
++    try:
++        return float(v)
++    except (TypeError, ValueError):
++        return None
++
++
++_MAX_TOKEN_LIFE = 30 * 86400  # sanity bound: an access-token expiry beyond this is a
++#                               misread field, not a real expiry — ignore it and fall back.
++
++
++def token_expires_at(token_data: dict | None) -> float | None:
++    """Absolute epoch (seconds) when the access token expires, read from the grant/
++    refresh response so we can refresh just in time like the app does. The response
++    field name wasn't recoverable from the (opaque-token) bundle, so accept the usual
++    shapes — an absolute expiry or a duration — at the top level or in valuePairs, in
++    seconds or milliseconds, but only within a sane window so an unrelated numeric field
++    can't be mistaken for an expiry. Returns None when none is present or plausible
++    (caller then falls back to the fixed window)."""
++    td = token_data or {}
++    vp = td.get('valuePairs') if isinstance(td.get('valuePairs'), dict) else {}
++    now = time.time()
++    for src in (td, vp):
++        for k in ('exp', 'expireTime', 'expirationTime', 'expiresAt', 'expiry', 'accessTokenExpiration'):
++            v = _num(src.get(k))
++            if v is None:
++                continue
++            v = v / 1000 if v > 1e12 else v
++            if now < v < now + _MAX_TOKEN_LIFE:
++                return v
++    for src in (td, vp):
++        for k in ('expiresIn', 'expires_in', 'validFor', 'ttl', 'expiresInSeconds'):
++            v = _num(src.get(k))
++            if v is None or v <= 0:
++                continue
++            v = v / 1000 if v > 1e7 else v
++            if v < _MAX_TOKEN_LIFE:
++                return now + v
++    return None
++
++
++def token_stale(config: dict | None) -> bool:
++    """Whether the stored session needs attention before a scrape. Stale only when there
++    is no bearer at all — we do NOT refresh on a timer. The grant token is long-lived, so
++    it rides until a tune's authorization actually rejects it, which resolve() recovers
++    from inline (refresh + retry) so the tune still succeeds. If a real expiry ever shows
++    up in the token response, refresh just before it."""
++    config = config or {}
++    if not config.get('bearer_token'):
++        return True
++    exp = _num(config.get('dtv_android_expires_at'))
++    if exp:
++        return time.time() > (exp - _REFRESH_BUFFER)
++    return False
 +
 +
 +def _device_class_id() -> str:
@@ -938,7 +1053,10 @@ index 0000000..df23522
 +    except Exception:
 +        interval = _POLL_MIN_INTERVAL
 +    return {'device_code': device_code, 'user_code': user_code, 'interval': interval,
-+            'display_url': (data.get('displayURL') or 'directv.com/tvsigninv2').strip()}
++            'display_url': (data.get('displayURL') or 'directv.com/tvsigninv2').strip(),
++            # Full approval URL with the code embedded — clicking it lands on the
++            # tvsigninv2 page pre-filled, so the user just confirms.
++            'url': (data.get('url') or '').strip()}
 +
 +
 +def poll_tokens(session: requests.Session, device_code: str, interval: int) -> dict:
@@ -974,9 +1092,14 @@ index 0000000..df23522
 +    session = requests.Session()
 +    device_class_id = _device_class_id()
 +    dc = start_device_code(session, device_class_id)
-+    _status('running', f"In a browser, go to {dc['display_url']} and enter code "
-+                       f"{dc['user_code']} (signed in to your DirecTV account), then approve this device.")
++    link = dc['url'] or dc['display_url']
++    _status('running', f"To finish Android TV sign-in, open {link} in a browser signed in to "
++                       f"your DirecTV account and approve this device — code {dc['user_code']}.")
 +    token_data = poll_tokens(session, dc['device_code'], dc['interval'])
++    # Log field names only (never values) so the token's real expiry field is visible in
++    # the logs and token_expires_at can be confirmed/extended without hammering DTV.
++    logger.info('[dtv-android] grant token fields: top=%s vp=%s',
++                sorted(token_data.keys()), sorted((token_data.get('valuePairs') or {}).keys()))
 +
 +    bearer = (token_data.get('access_token') or token_data.get('accessToken') or '').strip()
 +    if not bearer:
@@ -996,6 +1119,7 @@ index 0000000..df23522
 +        'captured_at': time.time(),
 +        'auth_method': 'dtv_android',
 +        'dtv_android_device_id': device_class_id,
++        'token_expires_at': token_expires_at(token_data),
 +        **directv_dai.login_fields(account, bearer, token_data),
 +    }
 +
@@ -1007,17 +1131,18 @@ index 0000000..df23522
 +    from . import directv  # lazy
 +
 +    s = requests.Session()
-+    r = s.post(_REFRESH_URL, data=[
-+        ('clientID', _CLIENT_ID),
-+        ('refreshToken', refresh_token),
-+        ('deviceClassID', device_class_id),
-+        ('reqParams', 'DEVICEID'),
-+        ('reqParams', 'AUTHGROUPS'),
-+    ], headers={**_app_headers(), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'}, timeout=30)
++    # Verified shape: clientID in the query string; clientMake, clientModel and
++    # refresh_token (snake_case) in the form body.
++    r = s.post(_REFRESH_URL, params={'clientID': _CLIENT_ID},
++               data=[('clientMake', _CLIENT_MAKE), ('clientModel', _CLIENT_MODEL),
++                     ('refresh_token', refresh_token)],
++               headers={**_app_headers(), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'}, timeout=30)
 +    if r.status_code < 200 or r.status_code >= 300:
 +        logger.warning('[dtv-android] refresh HTTP %s: %s', r.status_code, (r.text or '')[:300])
 +        raise _auth_error(f'token refresh failed HTTP {r.status_code}')
 +    token_data = r.json() if r.content else {}
++    logger.info('[dtv-android] refresh token fields: top=%s vp=%s',
++                sorted(token_data.keys()), sorted((token_data.get('valuePairs') or {}).keys()))
 +    bearer = (token_data.get('access_token') or token_data.get('accessToken') or '').strip()
 +    if not bearer:
 +        raise _auth_error('token refresh returned no access token')
@@ -1037,8 +1162,42 @@ index 0000000..df23522
 +        'captured_at': time.time(),
 +        'auth_method': 'dtv_android',
 +        'dtv_android_device_id': device_class_id,
++        'token_expires_at': token_expires_at(token_data),
 +        **directv_dai.login_fields(account, bearer, token_data),
 +    }
++
++
++def refresh_in_place(scraper) -> bool:
++    """Refresh the Android TV session right now and write the new tokens onto the
++    scraper's config so the in-flight request (a tune) can retry and succeed. Used by
++    resolve() when a channel authorization is rejected for an expired token, so the tune
++    doesn't fail. Returns True on success, False to let the caller fall back to the
++    normal background re-auth. Any error is swallowed into False — never worse than the
++    existing behavior."""
++    cfg = scraper.config or {}
++    rt = (cfg.get('refresh_token') or '').strip()
++    did = (cfg.get('dtv_android_device_id') or '').strip()
++    if not rt or not did or cfg.get('auth_method') != 'dtv_android':
++        return False
++    try:
++        result = refresh_session(rt, did)
++    except Exception as exc:
++        logger.warning('[dtv-android] inline refresh failed: %s', exc)
++        return False
++    updates = {
++        'bearer_token': result['bearer_token'],
++        'refresh_token': result.get('refresh_token') or rt,
++        'token_captured_at': result['captured_at'],
++    }
++    if result.get('activation_token'):
++        updates['activation_token'] = result['activation_token']
++    if result.get('token_expires_at'):
++        updates['dtv_android_expires_at'] = result['token_expires_at']
++    for k, v in updates.items():
++        scraper.config[k] = v          # in-memory, so the retry uses the new bearer
++        scraper._update_config(k, v)    # queued for the play route to persist
++    logger.info('[dtv-android] refreshed session inline for a tune (bearer rotated)')
++    return True
 +
 +
 +def _load_source_config(source_id: int, app=None) -> dict:
@@ -1086,7 +1245,7 @@ index 0000000..df23522
 +    from .directv import DirectvAuthError
 +    return DirectvAuthError(msg)
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index f4183ea..42bab94 100644
+index f4183ea..aaeb9fa 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
 @@ -3163,6 +3163,8 @@
@@ -1098,3 +1257,29 @@ index f4183ea..42bab94 100644
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
+@@ -3210,6 +3212,16 @@
+       directvPollStatus(sourceId);
+     }
+ 
++    // Turn the tvsigninv2 URL in the auth status into a clickable link (the text is
++    // escaped first, then the known-safe URL is wrapped in an anchor).
++    function _directvLinkify(text) {
++      const esc = escapeHtml(String(text || ''));
++      return esc.replace(/(https?:\/\/[^\s<]+|\bdirectv\.com\/tvsigninv2[^\s<]*)/i, (m) => {
++        const href = /^https?:\/\//i.test(m) ? m : 'https://' + m;
++        return `<a href="${href}" target="_blank" rel="noopener" style="text-decoration:underline">${m}</a>`;
++      });
++    }
++
+     function directvPollStatus(sourceId) {
+       if (_directvPollTimer) clearInterval(_directvPollTimer);
+       _directvPollTimer = setInterval(() => _directvCheckStatus(sourceId), 2000);
+@@ -3230,7 +3242,7 @@
+       const statusMap = {
+         idle: null,
+         starting: '<span style="color:var(--text-muted)">Starting browser...</span>',
+-        running: `<span style="color:var(--text-muted)">${escapeHtml(detail || 'Running...')}</span>`,
++        running: `<span style="color:var(--text-muted)">${_directvLinkify(detail || 'Running...')}</span>`,
+         success: '<span style="color:var(--success-soft)">&#10003; Session captured.</span>',
+         failed: `<span style="color:var(--danger)">${escapeHtml(detail || 'Login failed.')}</span>`,
+       };

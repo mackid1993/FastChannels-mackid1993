@@ -74,6 +74,21 @@ assert 'dtv_android.sign_in(' in inspect.getsource(directv.run_directv_auth), \
 assert 'dtv_android.license_headers(' in inspect.getsource(directv.DirectvScraper.license_request_headers), \
     'DRM license headers are no longer the Android TV headers (app UA, no stream.directv.com Origin/Referer)'
 
+# Token lifecycle logic (pure, no network): never refresh on a timer — "stale" means
+# only "no bearer"; a known expiry refreshes just before it; a tune recovers inline.
+import time as _t  # noqa: E402
+assert dtv_android.token_stale({}) is True, 'no bearer must be stale'
+assert dtv_android.token_stale({'bearer_token': 'x'}) is False, 'a bearer with no tracked expiry must not be timer-stale'
+assert dtv_android.token_stale({'bearer_token': 'x', 'dtv_android_expires_at': _t.time() + 3600}) is False, 'valid future expiry is not stale'
+assert dtv_android.token_stale({'bearer_token': 'x', 'dtv_android_expires_at': _t.time() - 10}) is True, 'past expiry is stale'
+assert dtv_android.token_expires_at({'expiresIn': 3600}) is not None, 'a duration expiry should parse'
+assert dtv_android.token_expires_at({'exp': _t.time() + 3600}) is not None, 'an absolute expiry should parse'
+assert dtv_android.token_expires_at({'expirationTime': 9.9e14}) is None, 'an absurd value must be rejected, not trusted as an expiry'
+assert dtv_android.token_expires_at({}) is None, 'no expiry field -> None (ride until a real 401)'
+assert callable(getattr(dtv_android, 'refresh_in_place', None)), 'the inline tune-time refresh (refresh_in_place) is missing'
+assert 'dtv_android.refresh_in_place(' in inspect.getsource(directv.DirectvScraper.resolve), \
+    'resolve() no longer refreshes inline + retries on an expired token, so a tune can fail instead of recovering'
+
 # The relay sends the DirecTV app's own User-Agent, built from the bridge device's
 # build properties (never the bare Custom-Exoplayer fallback, which stopped ad insertion).
 assert not hasattr(dai, 'PLAYER_USER_AGENT'), 'the fixed Custom-Exoplayer User-Agent is back'
