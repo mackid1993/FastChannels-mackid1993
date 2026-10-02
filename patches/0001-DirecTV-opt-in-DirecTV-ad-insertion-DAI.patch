@@ -8,12 +8,14 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |   2 +
- app/routes/directv_proxy.py      |  10 +-
- app/scrapers/directv.py          |  16 +-
- app/scrapers/directv_dai.py      | 659 +++++++++++++++++++++++++++++++
- app/templates/admin/sources.html |   4 +
- 5 files changed, 684 insertions(+), 7 deletions(-)
+ app/routes/directv_proxy.py      |   7 +-
+ app/scrapers/directv.py          |  27 +-
+ app/scrapers/directv_dai.py      | 618 +++++++++++++++++++++++++++++++
+ app/scrapers/dtv_android.py      | 282 ++++++++++++++
+ app/templates/admin/sources.html |   2 +
+ 6 files changed, 926 insertions(+), 12 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
+ create mode 100644 app/scrapers/dtv_android.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
 index f2e5d42..336d79b 100644
@@ -29,7 +31,7 @@ index f2e5d42..336d79b 100644
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..f40126c 100644
+index e7680df..dae0703 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -58,17 +60,7 @@ index e7680df..f40126c 100644
      except Exception as exc:
          logger.warning('[directv-browser] manifest fetch failed for channel=%s: %s', channel_id, exc)
          return _unavailable_response()
-@@ -347,7 +348,8 @@ def directv_browser_manifest(channel_id: str):
-     if r.status_code >= 400:
-         return Response(r.content, status=r.status_code, content_type=r.headers.get('Content-Type') or 'text/plain')
-     return Response(
--        _rewrite_directv_browser_playlist(r.text, r.url),
-+        _rewrite_directv_browser_playlist(
-+            directv_dai.stereo_downmix_master(r.text, channel.source.config), r.url),
-         status=200,
-         mimetype='application/vnd.apple.mpegurl',
-         headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
-@@ -363,7 +365,7 @@ def directv_browser_asset():
+@@ -363,7 +364,7 @@ def directv_browser_asset():
      if target.scheme != 'https' or not _directv_browser_cdn_allowed(target.hostname or ''):
          abort(400)
      range_header = request.headers.get('Range')
@@ -78,18 +70,19 @@ index e7680df..f40126c 100644
          headers['Range'] = range_header
      try:
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
-index e796bf3..b7e039a 100644
+index e796bf3..a64d6e3 100644
 --- a/app/scrapers/directv.py
 +++ b/app/scrapers/directv.py
-@@ -84,6 +84,7 @@ except ImportError:
+@@ -84,6 +84,8 @@ except ImportError:
      _CFFI_IMPERSONATE = None
  
  from .directv_numbers import assign_provider_numbers
 +from . import directv_dai
++from . import dtv_android
  from .base import (
      BaseScraper, ChannelData, ConfigField, ProgramData, ScrapeSkipError,
      infer_language_from_metadata,
-@@ -227,6 +228,7 @@ def _license_content_id_from_stream_url(stream_url: str, fallback: str) -> str:
+@@ -227,6 +229,7 @@ def _license_content_id_from_stream_url(stream_url: str, fallback: str) -> str:
  
  def _fetch_channel_playback(
      bearer_token: str, cookies: list[dict], client_context: str | None, ccid: str,
@@ -97,7 +90,7 @@ index e796bf3..b7e039a 100644
  ) -> dict | None:
      """GET /right/authorization/channel/v1 for one channel — the manifest +
      playToken resolve. Used both by resolve() (via the scraper's live
-@@ -262,7 +264,7 @@ def _fetch_channel_playback(
+@@ -262,7 +265,7 @@ def _fetch_channel_playback(
          params['clientContext'] = client_context
  
      try:
@@ -106,7 +99,7 @@ index e796bf3..b7e039a 100644
      except requests.RequestException as exc:
          logger.warning('[directv] channel/v1 request failed for ccid=%s: %s', ccid, exc)
          return None
-@@ -286,7 +288,7 @@ def _fetch_channel_playback(
+@@ -286,7 +289,7 @@ def _fetch_channel_playback(
          return None
  
      pb = data.get('playbackData') or {}
@@ -115,7 +108,7 @@ index e796bf3..b7e039a 100644
      play_token = (data.get('dRights') or {}).get('playToken')
      if not fallback_url or not play_token:
          return None
-@@ -295,6 +297,7 @@ def _fetch_channel_playback(
+@@ -295,6 +298,7 @@ def _fetch_channel_playback(
          'play_token': play_token,
          'license_content_id': _license_content_id_from_stream_url(fallback_url, ccid),
          'cached_at': time.time(),
@@ -123,7 +116,7 @@ index e796bf3..b7e039a 100644
      }
  
  
-@@ -932,6 +935,7 @@ def capture_directv_auth_cffi(
+@@ -932,6 +936,7 @@ def capture_directv_auth_cffi(
          'cookies': [],
          'captured_at': time.time(),
          'auth_method': 'curl_cffi',
@@ -131,7 +124,7 @@ index e796bf3..b7e039a 100644
      }
  
  
-@@ -1219,6 +1223,7 @@ def capture_directv_auth(
+@@ -1219,6 +1224,7 @@ def capture_directv_auth(
                  for c in context.cookies()
              ]
              captured['captured_at'] = time.time()
@@ -139,7 +132,16 @@ index e796bf3..b7e039a 100644
              _status('success', 'Captured DirecTV session.')
              return captured
          finally:
-@@ -1298,6 +1303,7 @@ def run_directv_auth(
+@@ -1253,7 +1259,7 @@ def run_directv_auth(
+ 
+     try:
+         try:
+-            result = capture_directv_auth_fast(username, password, on_status=_on_status)
++            result = dtv_android.sign_in(source_id, username, password, app=app, on_status=_on_status)
+         except Exception as exc:
+             logger.warning('[directv-auth] capture failed for source_id=%s: %s', source_id, exc)
+             _write_status(r, source_id, 'failed', str(exc))
+@@ -1298,6 +1304,7 @@ def run_directv_auth(
                          cfg.pop('identity_cookie_expires_at', None)
                      if result.get('auth_method'):
                          cfg['auth_method'] = result['auth_method']
@@ -147,7 +149,7 @@ index e796bf3..b7e039a 100644
                      source.config = cfg
                      db.session.commit()
                      persisted = True
-@@ -1382,6 +1388,7 @@ class DirectvScraper(BaseScraper):
+@@ -1382,6 +1389,7 @@ class DirectvScraper(BaseScraper):
                          'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). '
                          'Channels that share a number get subchannels, like 213.1.'
                      )),
@@ -155,7 +157,7 @@ index e796bf3..b7e039a 100644
      ]
  
      _FAST_CHANNEL_NUMBER_RANGE = range(4000, 5000)
-@@ -1613,6 +1620,7 @@ class DirectvScraper(BaseScraper):
+@@ -1613,6 +1621,7 @@ class DirectvScraper(BaseScraper):
                  # also contain internal channel IDs; retain resolver validation and
                  # community-map fallback rather than accepting every value.
                  external_listing_id = _pick(row, 'externalListingId')
@@ -163,7 +165,7 @@ index e796bf3..b7e039a 100644
  
                  channels.append(ChannelData(
                      source_channel_id=ccid,
-@@ -1897,7 +1905,7 @@ class DirectvScraper(BaseScraper):
+@@ -1897,7 +1906,7 @@ class DirectvScraper(BaseScraper):
              raise RuntimeError(f'DirecTV Stream: malformed stream_url: {raw_url}')
  
          cached = (self.cache.get('directv_playback') or {}).get(ccid)
@@ -172,7 +174,7 @@ index e796bf3..b7e039a 100644
              return cached['fallback_url']
  
          bearer = self.config.get('bearer_token')
-@@ -1910,6 +1918,7 @@ class DirectvScraper(BaseScraper):
+@@ -1910,6 +1919,7 @@ class DirectvScraper(BaseScraper):
          try:
              result = _fetch_channel_playback(
                  bearer, self.config.get('cookies') or [], self.config.get('client_context'), ccid,
@@ -180,7 +182,22 @@ index e796bf3..b7e039a 100644
              )
          except DirectvAuthExpiredError as exc:
              self._mark_auth_stale_and_reauth(f'channel/v1 expired token for ccid={ccid}')
-@@ -2020,6 +2029,7 @@ class DirectvScraper(BaseScraper):
+@@ -1952,11 +1962,9 @@ class DirectvScraper(BaseScraper):
+ 
+     @classmethod
+     def license_request_headers(cls, config: dict) -> dict:
+-        return {
+-            'Origin': 'https://stream.directv.com',
+-            'Referer': 'https://stream.directv.com/',
+-            'User-Agent': _UA,
+-        }
++        # Android TV session: the app User-Agent, no stream.directv.com Origin/Referer,
++        # so the DRM device isn't a web browser. See dtv_android.license_headers.
++        return dtv_android.license_headers(config)
+ 
+     @classmethod
+     def prepare_activation_request(cls, challenge: bytes, config: dict) -> tuple[bytes, dict]:
+@@ -2020,6 +2028,7 @@ class DirectvScraper(BaseScraper):
              try:
                  fresh = _fetch_channel_playback(
                      bearer, config.get('cookies') or [], config.get('client_context'), channel_id,
@@ -190,10 +207,10 @@ index e796bf3..b7e039a 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..99f99df
+index 0000000..68d4d76
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,659 @@
+@@ -0,0 +1,618 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -277,29 +294,12 @@ index 0000000..99f99df
 +    ),
 +)
 +
-+SURROUND_FIELD = ConfigField(
-+    'keep_surround', 'Keep 5.1 surround audio',
-+    field_type='toggle', default='false',
-+    help_text=(
-+        'Off (default) = tell the player DirecTV\'s audio is stereo so a bridge '
-+        'stick that decodes to a stereo-only encoder (no Dolby passthrough) plays '
-+        'full-range sound instead of a muffled in-decoder downmix. On = keep the '
-+        '5.1 track as DirecTV sends it, for an output that passes AC-3 through to '
-+        'an AV receiver.'
-+    ),
-+)
-+
-+
-+CONFIG_FIELDS = (CONFIG_FIELD, SURROUND_FIELD)
++CONFIG_FIELDS = (CONFIG_FIELD,)
 +
 +
 +
 +def enabled(config: dict | None) -> bool:
 +    return str((config or {}).get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
-+
-+
-+def keep_surround(config: dict | None) -> bool:
-+    return str((config or {}).get('keep_surround', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
 +
 +
 +# ── Stream URL ───────────────────────────────────────────────────────────────
@@ -369,34 +369,6 @@ index 0000000..99f99df
 +            url += f'&{quote(str(k), safe="")}={quote(str(v), safe=",:~")}'
 +            existing_keys.add(k)
 +    return url
-+
-+
-+# ── Audio: full-range stereo on a bridge (PCM) output ─────────────────────────
-+
-+# A bridge stick (Fire TV, Google TV or Android TV) decodes DirecTV's AC-3 to PCM for
-+# a stereo-only encoder with no Dolby passthrough. On Android 11 the stick's media3
-+# sets the AC-3 decoder's channel-count from the master's CHANNELS attribute, and with
-+# CHANNELS="6" the platform decoder does its own band-limited 5.1->2.0 downmix
-+# (~7-11 kHz, "muffled"). Declaring the AC-3 rendition CHANNELS="2" in the master we
-+# proxy makes media3 ask the decoder for stereo, so it applies AC-3's own full-range
-+# Lo/Ro downmix instead. The 384 kbps AC-3 segments are untouched — only the declared
-+# channel count changes — so there is no transcode and no quality loss. Only the
-+# master carries #EXT-X-MEDIA audio renditions; media playlists pass through unchanged.
-+_AC3_MEDIA_RE = re.compile(
-+    r'(#EXT-X-MEDIA:[^\r\n]*?TYPE=AUDIO[^\r\n]*?GROUP-ID="AC3[^"]*"[^\r\n]*)', re.IGNORECASE)
-+_CHANNELS_RE = re.compile(r'CHANNELS="\d+"', re.IGNORECASE)
-+
-+
-+def stereo_downmix_master(master: str, config: dict | None) -> str:
-+    """Declare DirecTV's AC-3 audio rendition as 2-channel in the HLS master so the
-+    bridge player's AC-3 decoder outputs AC-3's own full-range stereo downmix instead
-+    of the platform's band-limited in-decoder 5.1->2.0 downmix. No-op when keep_surround is
-+    set, or the text has no AC-3 audio rendition (a media playlist or a non-DirecTV
-+    master)."""
-+    text = master or ''
-+    if keep_surround(config) or 'TYPE=AUDIO' not in text or 'AC3' not in text:
-+        return master
-+    return _AC3_MEDIA_RE.sub(lambda m: _CHANNELS_RE.sub('CHANNELS="2"', m.group(1)), text)
 +
 +
 +def cached_url_usable(cached: dict | None, dai: bool) -> bool:
@@ -760,6 +732,10 @@ index 0000000..99f99df
 +        cfg['dai_profile_id'] = profile_id
 +    for k, v in (result.get('dai_context') or {}).items():
 +        cfg[f'dai_{k}'] = v
++    # The Android TV sign-in's stable device id, so later refreshes reuse the same
++    # registered device instead of granting a new one each time.
++    if result.get('dtv_android_device_id'):
++        cfg['dtv_android_device_id'] = result['dtv_android_device_id']
 +
 +
 +def fetch_account_context(session, bearer: str) -> dict:
@@ -853,18 +829,304 @@ index 0000000..99f99df
 +    if getattr(source, 'name', None) == 'directv' and enabled(old) != enabled(current):
 +        from ..config_store import persist_source_cache_updates
 +        persist_source_cache_updates(source.id, {'directv_playback': {}})
+diff --git a/app/scrapers/dtv_android.py b/app/scrapers/dtv_android.py
+new file mode 100644
+index 0000000..a035810
+--- /dev/null
++++ b/app/scrapers/dtv_android.py
+@@ -0,0 +1,282 @@
++"""Android TV client for DirecTV.
++
++Signs the DirecTV session in as DirecTV's own Android TV app (OAuth client
++``UNIFIED_Android_TV_02``) via its device-code grant, instead of the web browser the
++upstream scraper authenticates as (``UNIFIED_DTV_WEB``). The resulting bearer is an
++Android TV token, so channel/v2 authorization, DRM activation and license all run as
++the app — matching what the bridge device (a Fire TV / Google TV / Android TV stick)
++actually is, rather than a web browser wearing an Android-TV hat on one request.
++
++No manual step: the Android TV app's device-code grant normally shows a code the user
++types at directv.com/tvsigninv2 while signed in. We automate that in-server — run the
++existing web sign-in once to get an authenticated account bearer, use it to approve the
++Android TV user code (``account/device/grant/usercode/validate``), then poll the grant's
++token endpoint for the Android TV access/refresh/activation tokens. The web sign-in is
++only a one-time approver per grant; it is never the playback identity.
++
++Protocol verified from the Android TV app bundle (its QR/device-code config):
++  start:   POST https://api.cld.dtvce.com/account/device/grant/v2/devicecode
++  approve: POST https://api.cld.dtvce.com/account/device/grant/usercode/validate
++  poll:    GET  https://api.cld.dtvce.com/account/device/grant/tokens
++
++The DRM bodies (activate/license) and channel/v2 are already identical to the app, so
++only the bearer (and the license headers, see ``license_headers``) change. The result
++dict mirrors the web login's so run_directv_auth / store_login_result persist it
++unchanged.
++"""
++from __future__ import annotations
++
++import logging
++import time
++import uuid
++
++import requests
++
++from . import directv_dai
++
++logger = logging.getLogger(__name__)
++
++_CLIENT_ID = 'UNIFIED_Android_TV_02'
++_GRANT_BASE = 'https://api.cld.dtvce.com/account/device/grant'
++_DEVICECODE_URL = f'{_GRANT_BASE}/v2/devicecode'
++_VALIDATE_URL = f'{_GRANT_BASE}/usercode/validate'
++_TOKENS_URL = f'{_GRANT_BASE}/tokens'
++# A real Android TV client signs in once and then refreshes its token — it never
++# re-logs-in. After the first device-code grant we keep the refresh token + the
++# device id and refresh here instead of re-granting. Exact refresh body wasn't
++# recoverable from the bundle; this mirrors the token-exchange convention
++# (authn-refreshgo/v3). If a live refresh 4xx's, adjust from its response.
++_REFRESH_URL = 'https://api.cld.dtvce.com/authn-refreshgo/v3/tokens'
++
++# How long to wait for the in-server approval + token poll before giving up. The
++# approval is immediate (we approve with our own bearer), so this only bounds a stuck
++# grant. Kept under the admin UI's status TTL (600 s) so a failure still surfaces.
++_POLL_DEADLINE = 120
++_POLL_MIN_INTERVAL = 3
++
++
++def _app_headers() -> dict:
++    """Android TV request headers: the app's own User-Agent, no browser
++    Origin/Referer. player_user_agent() builds it from a bridge device's build
++    properties; outside a device request it may be empty, which is fine here."""
++    headers = {'Accept': 'application/json, text/plain, */*'}
++    ua = directv_dai.player_user_agent()
++    if ua:
++        headers['User-Agent'] = ua
++    return headers
++
++
++def license_headers(config: dict | None = None) -> dict:
++    """Headers for the DRM activate/license requests on an Android TV session: the
++    app User-Agent, no stream.directv.com Origin/Referer. Replaces the web
++    license_request_headers so the DRM device isn't a browser."""
++    return _app_headers()
++
++
++def _device_class_id() -> str:
++    # One grant per sign-in; a fresh id registers this playback device. (Token
++    # refresh is not wired, so each re-auth is a fresh grant — see module note.)
++    return str(uuid.uuid4())
++
++
++def start_device_code(session: requests.Session, device_class_id: str) -> dict:
++    """Begin the Android TV device-code grant. Returns deviceCode, userCode,
++    registrationToken and pollingInterval."""
++    # creationFlow is sent by the app but its literal wasn't recoverable from the
++    # bundle; the endpoint accepts the grant without it. Add it here if a live call
++    # rejects the request for a missing creationFlow.
++    body = {'clientId': _CLIENT_ID, 'deviceClassID': device_class_id}
++    r = session.post(_DEVICECODE_URL, json=body, headers=_app_headers(), timeout=20)
++    if r.status_code < 200 or r.status_code >= 300:
++        logger.warning('[dtv-android] devicecode HTTP %s: %s', r.status_code, (r.text or '')[:300])
++        raise _auth_error(f'device-code start failed HTTP {r.status_code}')
++    data = r.json() if r.content else {}
++    device_code = (data.get('deviceCode') or '').strip()
++    user_code = (data.get('userCode') or '').strip()
++    reg_token = (data.get('registrationToken') or '').strip()
++    if not device_code or not user_code or not reg_token:
++        logger.warning('[dtv-android] devicecode response missing fields: %s', sorted(data.keys()))
++        raise _auth_error('device-code start response missing deviceCode/userCode/registrationToken')
++    try:
++        interval = max(_POLL_MIN_INTERVAL, int(float(data.get('pollingInterval') or _POLL_MIN_INTERVAL)))
++    except Exception:
++        interval = _POLL_MIN_INTERVAL
++    return {'device_code': device_code, 'user_code': user_code,
++            'registration_token': reg_token, 'interval': interval,
++            'display_url': (data.get('displayURL') or '').strip()}
++
++
++def approve_user_code(web_bearer: str, user_code: str) -> None:
++    """Approve the pending Android TV user code under the signed-in account, using
++    the web account bearer — the same thing directv.com/tvsigninv2 does when a human
++    enters the code. Done server-side so there is no manual step."""
++    if not web_bearer:
++        raise _auth_error('no account bearer to approve the Android TV device code')
++    headers = {**_app_headers(), 'Content-Type': 'application/json',
++               'Authorization': f'Bearer {web_bearer}'}
++    r = requests.post(_VALIDATE_URL, json={'userCode': user_code}, headers=headers, timeout=20)
++    if r.status_code < 200 or r.status_code >= 300:
++        logger.warning('[dtv-android] usercode/validate HTTP %s: %s', r.status_code, (r.text or '')[:300])
++        raise _auth_error(f'device-code approval failed HTTP {r.status_code}')
++
++
++def poll_tokens(session: requests.Session, device_code: str, registration_token: str,
++                interval: int) -> dict:
++    """Poll the grant's token endpoint until the approved grant yields tokens.
++    Returns the raw token_data (access_token, refresh_token, valuePairs)."""
++    deadline = time.time() + _POLL_DEADLINE
++    params = {'clientID': _CLIENT_ID, 'deviceCode': device_code,
++              'registrationToken': registration_token}
++    last = ''
++    while time.time() < deadline:
++        r = session.get(_TOKENS_URL, params=params, headers=_app_headers(), timeout=20)
++        data = r.json() if r.content else {}
++        if data.get('access_token') or data.get('accessToken'):
++            return data
++        status = str(((data.get('responseStatus') or {}).get('status')) or '').lower()
++        last = f'HTTP {r.status_code} status={status or "pending"}'
++        time.sleep(interval)
++    raise _auth_error(f'device-code token poll timed out ({last})')
++
++
++def capture_android_auth(username: str, password: str, *, on_status=None) -> dict:
++    """Sign in as the Android TV app and return a login result dict in the same shape
++    as the web login (so run_directv_auth / store_login_result persist it unchanged).
++
++    Reuses the existing web sign-in once to get an account bearer for the in-server
++    device-code approval, then swaps in the Android TV tokens for playback."""
++    from . import directv  # lazy: directv imports this module
++
++    def _status(state: str, detail: str = '') -> None:
++        if on_status:
++            try:
++                on_status(state, detail)
++            except Exception:
++                pass
++
++    # One account sign-in for the approver bearer only (never the playback identity).
++    # capture_directv_auth_fast keeps the curl_cffi → Playwright fallback, so WAF
++    # changes on the lightweight path don't lose auth entirely.
++    _status('running', 'Signing in to DirecTV…')
++    web = directv.capture_directv_auth_fast(username, password, on_status=on_status)
++    web_bearer = (web.get('bearer_token') or '').strip()
++
++    _status('running', 'Registering Android TV device…')
++    session = requests.Session()
++    device_class_id = _device_class_id()
++    dc = start_device_code(session, device_class_id)
++
++    _status('running', 'Approving Android TV device…')
++    approve_user_code(web_bearer, dc['user_code'])
++
++    _status('running', 'Activating Android TV session…')
++    token_data = poll_tokens(session, dc['device_code'], dc['registration_token'], dc['interval'])
++
++    bearer = (token_data.get('access_token') or token_data.get('accessToken') or '').strip()
++    refresh = (token_data.get('refresh_token') or token_data.get('refreshToken') or '').strip()
++    activation = directv._normalize_activation_token(
++        ((token_data.get('valuePairs') or {}).get('activationToken') or '').strip()
++    )
++    if not bearer:
++        raise _auth_error('Android TV grant returned no access token')
++
++    account = requests.Session()
++    account.headers.update(_app_headers())
++    _status('success', 'Captured DirecTV Android TV session.')
++    return {
++        'bearer_token': bearer,
++        'refresh_token': refresh,
++        'activation_token': activation,
++        'cookies': [],
++        'captured_at': time.time(),
++        'auth_method': 'dtv_android',
++        'dtv_android_device_id': device_class_id,
++        **directv_dai.login_fields(account, bearer, token_data),
++    }
++
++
++def refresh_session(refresh_token: str, device_class_id: str, *, on_status=None) -> dict:
++    """Refresh an Android TV session's bearer with its stored refresh token — no web
++    sign-in, no device code, no re-approval (a real ATV client never re-logs-in). Keeps
++    the same device id so the grant stays one registered device."""
++    from . import directv  # lazy
++
++    s = requests.Session()
++    r = s.post(_REFRESH_URL, data=[
++        ('clientID', _CLIENT_ID),
++        ('refreshToken', refresh_token),
++        ('deviceClassID', device_class_id),
++        ('reqParams', 'DEVICEID'),
++        ('reqParams', 'AUTHGROUPS'),
++    ], headers={**_app_headers(), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'}, timeout=30)
++    if r.status_code < 200 or r.status_code >= 300:
++        logger.warning('[dtv-android] refresh HTTP %s: %s', r.status_code, (r.text or '')[:300])
++        raise _auth_error(f'token refresh failed HTTP {r.status_code}')
++    token_data = r.json() if r.content else {}
++    bearer = (token_data.get('access_token') or token_data.get('accessToken') or '').strip()
++    if not bearer:
++        raise _auth_error('token refresh returned no access token')
++    new_refresh = (token_data.get('refresh_token') or token_data.get('refreshToken') or refresh_token).strip()
++    # activationToken may be absent on refresh; run_directv_auth keeps the stored one
++    # when this is empty, so the DRM identity survives a refresh.
++    activation = directv._normalize_activation_token(
++        ((token_data.get('valuePairs') or {}).get('activationToken') or '').strip()
++    )
++    account = requests.Session()
++    account.headers.update(_app_headers())
++    return {
++        'bearer_token': bearer,
++        'refresh_token': new_refresh,
++        'activation_token': activation,
++        'cookies': [],
++        'captured_at': time.time(),
++        'auth_method': 'dtv_android',
++        'dtv_android_device_id': device_class_id,
++        **directv_dai.login_fields(account, bearer, token_data),
++    }
++
++
++def _load_source_config(source_id: int, app=None) -> dict:
++    """Read the DirecTV source config (refresh token + device id) to decide refresh vs
++    a fresh grant. Read-only; mirrors run_directv_auth's app handling so it works both
++    on the admin thread (app passed) and the RQ worker (app is None)."""
++    def _query() -> dict:
++        from ..models import Source
++        src = Source.query.get(source_id)
++        return dict((src.config if src else None) or {})
++    try:
++        from flask import has_app_context
++        if has_app_context():
++            return _query()
++    except Exception:
++        pass
++    if app is None:
++        from app import create_app
++        app = create_app()
++    with app.app_context():
++        return _query()
++
++
++def sign_in(source_id: int, username: str, password: str, *, app=None, on_status=None) -> dict:
++    """Entry point for run_directv_auth. Refreshes an existing Android TV session when
++    one is stored (the normal case — ATV clients don't re-log-in); otherwise runs the
++    one-time device-code grant. A failed refresh falls back to a fresh grant so a
++    revoked/expired refresh token still recovers."""
++    cfg = _load_source_config(source_id, app)
++    refresh = (cfg.get('refresh_token') or '').strip()
++    device_id = (cfg.get('dtv_android_device_id') or '').strip()
++    if refresh and device_id and cfg.get('auth_method') == 'dtv_android':
++        try:
++            if on_status:
++                on_status('running', 'Refreshing Android TV session…')
++            return refresh_session(refresh, device_id, on_status=on_status)
++        except Exception as exc:
++            logger.warning('[dtv-android] refresh failed (%s); re-granting via device code', exc)
++    return capture_android_auth(username, password, on_status=on_status)
++
++
++def _auth_error(msg: str) -> Exception:
++    """Raise the scraper's own auth error type so run_directv_auth reports it like any
++    other sign-in failure. Imported lazily to avoid a circular import at module load."""
++    from .directv import DirectvAuthError
++    return DirectvAuthError(msg)
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index f4183ea..f5cf901 100644
+index f4183ea..42bab94 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
-@@ -3163,6 +3163,10 @@
+@@ -3163,6 +3163,8 @@
              'On = leave out free, ad-supported channels (DirecTV Stream numbers these 4000-4999).')}
            ${toggleHtml('use_provider_numbers', 'Use DirecTV channel numbers',
              'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). Channels that share a number get subchannels, like 213.1.')}
 +          ${toggleHtml('use_dai', 'Use DirecTV ad insertion (DAI)',
 +            'On = play the stream DirecTV\'s own apps use, with DirecTV\'s local ads in commercial breaks. Off = the national feed without DirecTV\'s inserted ads.')}
-+          ${toggleHtml('keep_surround', 'Keep 5.1 surround audio',
-+            'Off (default) = tell the player the audio is stereo so a bridge stick with a stereo-only encoder plays full-range sound instead of a muffled downmix. On = keep the 5.1 track for an output that passes AC-3 through to an AV receiver.')}
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>

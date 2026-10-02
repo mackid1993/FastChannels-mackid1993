@@ -59,32 +59,20 @@ from app.routes import directv_proxy  # noqa: E402
 assert directv_proxy._directv_browser_cdn_allowed('csm-e-dtv-livecomplex-eb.tls1.yospace.com'), \
     'Yospace playlists bypass the FastChannels relay'
 
-# The toggles are wired into the DirecTV source settings.
+# The toggle is wired into the DirecTV source settings.
 keys = {field.key for field in directv.DirectvScraper.config_schema}
 assert 'use_dai' in keys, 'use_dai toggle missing from the DirecTV config schema'
-assert 'keep_surround' in keys, 'keep_surround toggle missing from the DirecTV config schema'
 assert 'surround_audio' not in keys, 'the removed Surround sound toggle is back'
 
-# The master we proxy declares DirecTV's AC-3 rendition as stereo so a bridge stick's
-# AC-3 decoder emits a full-range stereo downmix (not the muffled in-decoder one); the
-# keep_surround toggle leaves the 5.1 declaration for AC-3 passthrough outputs. Only the
-# AC-3 audio rendition's CHANNELS changes — segments, codec, STREAM-INF and other
-# renditions are untouched.
-assert 'directv_dai.stereo_downmix_master(' in inspect.getsource(directv_proxy.directv_browser_manifest), \
-    'the master no longer gets the stereo-downmix declaration'
-_master = (
-    '#EXTM3U\n'
-    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="AC3-384kbps",NAME="English",CHANNELS="6",URI="a.m3u8"\n'
-    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="HEAAC-96kbps",NAME="English",CHANNELS="2",URI="b.m3u8"\n'
-    '#EXT-X-STREAM-INF:BANDWIDTH=6500000,CODECS="avc1.640028,ac-3",AUDIO="AC3-384kbps"\nv.m3u8\n'
-)
-_fixed = dai.stereo_downmix_master(_master, {})
-assert 'GROUP-ID="AC3-384kbps",NAME="English",CHANNELS="2"' in _fixed, 'AC-3 rendition not declared stereo'
-assert 'GROUP-ID="HEAAC-96kbps",NAME="English",CHANNELS="2"' in _fixed, 'the HE-AAC rendition was altered'
-assert 'CODECS="avc1.640028,ac-3"' in _fixed, 'the STREAM-INF/codec list was altered'
-assert dai.stereo_downmix_master(_master, {'keep_surround': 'true'}) == _master, 'keep_surround did not keep 5.1'
-assert dai.stereo_downmix_master('#EXTM3U\n#EXTINF:6,\nseg.mp4\n', {}) == '#EXTM3U\n#EXTINF:6,\nseg.mp4\n', \
-    'a media playlist (no audio rendition) was altered'
+# DirecTV signs in end-to-end as its own Android TV app (device-code grant,
+# refresh thereafter), not as the web browser client — so the bearer, DRM and ad
+# session are all Android TV. The web login runs only as the one-time grant approver.
+from app.scrapers import dtv_android  # noqa: E402
+assert dtv_android._CLIENT_ID == 'UNIFIED_Android_TV_02', 'Android TV OAuth client id changed'
+assert 'dtv_android.sign_in(' in inspect.getsource(directv.run_directv_auth), \
+    'run_directv_auth no longer routes auth through the Android TV sign-in (refresh-or-grant)'
+assert 'dtv_android.license_headers(' in inspect.getsource(directv.DirectvScraper.license_request_headers), \
+    'DRM license headers are no longer the Android TV headers (app UA, no stream.directv.com Origin/Referer)'
 
 # The relay sends the DirecTV app's own User-Agent, built from the bridge device's
 # build properties (never the bare Custom-Exoplayer fallback, which stopped ad insertion).
