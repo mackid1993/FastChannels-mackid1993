@@ -2,7 +2,7 @@
 
 [kineticman/FastChannels](https://github.com/kineticman/FastChannels) (`main`, the branch his releases come from) with a DirecTV addition, kept up to date automatically:
 
-- **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the account's own targeting values (DMA, billing ZIP, household and profile IDs) and each bridge device's Android ID and ad-tracking setting. That's how it gets the same local ads an Osprey gets. Bridge devices also send the DirecTV Android TV app's own User-Agent, built from each device's model, board and Android version (Fire TV, Google TV and Shield alike).
+- **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the account's own targeting values (DMA, billing ZIP, consent, household and profile IDs) and each bridge device's Android ID, ad-tracking setting and comScore device name. That's how it gets local and political ads for the account's market. Requests look like DirecTV's Android TV app's: its `channel/v2` authorization request and its player User-Agent, built from each device's own model, board and Android version. Fire TV, Google TV and Shield are all handled the same way, and no device sends an advertising ID.
 
 ```
 docker pull ghcr.io/mackid1993/fastchannels-mackid1993:latest
@@ -25,7 +25,7 @@ This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` 
 
 The other six days, a drift check applies the patch to upstream's latest code, runs the static checks and refreshes the patch, without building an image. A conflict is caught the day it appears.
 
-The DAI code lives in its own file, `app/scrapers/directv_dai.py`, which upstream doesn't have and so can't conflict with. Upstream's files only get about two dozen one-line hooks, which keeps conflicts rare and trivial to fix.
+The DAI code lives in its own file, `app/scrapers/directv_dai.py`, which upstream doesn't have and so can't conflict with. Upstream's files only get 18 one-line hooks (listed with re-apply instructions in `AGENTS.md`), which keeps conflicts rare and trivial to fix.
 
 If any step fails, nothing is published, `:latest` stays on the last good build, and a "Build failed" issue pings you. Until it's resolved, the daily run does a full build instead of a drift check, so a one-off failure (a registry hiccup, say) fixes itself the next day.
 
