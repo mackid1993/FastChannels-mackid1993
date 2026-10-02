@@ -6,7 +6,7 @@ Use American spelling everywhere.
 
 ## What this repo is
 
-A patch overlay on [kineticman/FastChannels](https://github.com/kineticman/FastChannels) `development`. CI applies `patches/` to upstream, validates, builds, smoke-tests and boot-tests the image, and publishes `ghcr.io/mackid1993/fastchannels-mackid1993:latest` (public; pulls need no login). Weekly full build (Mondays 9 AM Eastern), daily drift check, AI conflict resolution with Aider on OpenRouter (`OPENROUTER_API_KEY` secret, `AI_MODEL` variable). The patch refreshes its own context after every successful run, so upstream drift rarely turns into a conflict.
+A patch overlay on [kineticman/FastChannels](https://github.com/kineticman/FastChannels) `development`. CI applies `patches/` to upstream, validates, builds, smoke-tests and boot-tests the image, and publishes `ghcr.io/mackid1993/fastchannels-mackid1993:latest` (public; pulls need no login). Weekly full build (Mondays 9 AM Eastern), daily drift check, AI conflict resolution with Aider on OpenRouter (`OPENROUTER_API_KEY` secret; model pinned to DeepSeek V4.1 Flash, `openrouter/deepseek/deepseek-v4.1-flash`, in the `AI_MODEL` variable and the workflow default). The patch refreshes its own context after every successful run, so upstream drift rarely turns into a conflict.
 
 Upstream declined the DAI feature (PR #65: no measurable quality/CDN difference, and he doesn't think it changes account risk), and the relay-bypass PR #66. That is why this overlay exists.
 
