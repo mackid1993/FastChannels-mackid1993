@@ -74,9 +74,14 @@ plain = '#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:2,\na.ts\n'
 assert dai.keep_drm_session(plain) == plain, 'touched a playlist without a Widevine key'
 assert 'directv_dai.keep_drm_session(' in inspect.getsource(directv_proxy.directv_browser_asset), \
     'the relay no longer keeps the DRM session through inserted ads'
-# The relay must not send a made-up player User-Agent: Custom-Exoplayer stopped
-# Yospace from inserting any ads (side-by-side test, 2026-10-01).
-assert not hasattr(dai, 'PLAYER_USER_AGENT'), 'a fixed player User-Agent is back on the relay'
+# The relay sends the DirecTV app's own User-Agent, built from the bridge device's
+# build properties (never the bare Custom-Exoplayer fallback, which stopped ad insertion).
+assert not hasattr(dai, 'PLAYER_USER_AGENT'), 'the fixed Custom-Exoplayer User-Agent is back'
+assert dai._APP_USER_AGENT.format(release='11', model='AFTKRT', board='karat') == \
+    'APP_PROJECT_NAME/5.0.136.2002113867 (Android 11; AFTKRT; karat)  PureRN/0.79.5'
+assert dai.player_user_agent() is None, 'outside a request there is no device to build a User-Agent for'
+for fn in (directv_proxy.directv_browser_manifest, directv_proxy.directv_browser_asset):
+    assert 'directv_dai.player_user_agent()' in inspect.getsource(fn), f'{fn.__name__} no longer sends the device User-Agent'
 assert dai.enabled({'use_dai': 'true'}) is True
 assert dai.enabled({'use_dai': False}) is False
 assert dai.enabled(None) is False

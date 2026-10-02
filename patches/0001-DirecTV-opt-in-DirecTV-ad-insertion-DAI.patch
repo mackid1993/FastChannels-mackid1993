@@ -1,4 +1,4 @@
-From 6833dce7fbe5502a6c07aeda9daca5d3555cbc27 Mon Sep 17 00:00:00 2001
+From 6955c62e24cc861a0d91e753468c11a92d59a4b0 Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
 Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
@@ -8,11 +8,11 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |   2 +
- app/routes/directv_proxy.py      |   5 +-
+ app/routes/directv_proxy.py      |  10 +-
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 469 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 512 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 492 insertions(+), 4 deletions(-)
+ 5 files changed, 538 insertions(+), 6 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -29,7 +29,7 @@ index f2e5d42..336d79b 100644
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..02a43ea 100644
+index e7680df..41f1463 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -49,7 +49,26 @@ index e7680df..02a43ea 100644
  )
  
  
-@@ -375,7 +376,7 @@ def directv_browser_asset():
+@@ -320,7 +321,8 @@ def directv_browser_manifest(channel_id: str):
+     scraper = scraper_cls(channel.source.config or {})
+     try:
+         resolved_url = scraper.resolve(channel.stream_url)
+-        r = _requests.get(resolved_url, timeout=12)
++        device_ua = directv_dai.player_user_agent()
++        r = _requests.get(resolved_url, headers={'User-Agent': device_ua} if device_ua else None, timeout=12)
+     except Exception as exc:
+         logger.warning('[directv-browser] manifest fetch failed for channel=%s: %s', channel_id, exc)
+         return _unavailable_response()
+@@ -363,7 +365,7 @@ def directv_browser_asset():
+     if target.scheme != 'https' or not _directv_browser_cdn_allowed(target.hostname or ''):
+         abort(400)
+     range_header = request.headers.get('Range')
+-    headers = {'User-Agent': _BROWSER_UA}
++    headers = {'User-Agent': directv_dai.player_user_agent() or _BROWSER_UA}
+     if range_header:
+         headers['Range'] = range_header
+     try:
+@@ -375,7 +377,7 @@ def directv_browser_asset():
      content_type = r.headers.get('Content-Type') or 'application/octet-stream'
      if 'mpegurl' in content_type.lower() or raw_url.lower().split('?', 1)[0].endswith(('.m3u8', '.m3u')):
          return Response(
@@ -180,10 +199,10 @@ index e796bf3..86a5067 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..a50a7bd
+index 0000000..b598578
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,512 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -451,6 +470,49 @@ index 0000000..a50a7bd
 +    return {'is_lat': '0', '_fw_did': f'android_id:{android_id}'}
 +
 +
++
++
++# DirecTV's Android TV app sends this User-Agent on its player's requests (Cronet,
++# which the app has on): AnalyticsService::generateUserAgent() in libcpp_core.so,
++# from Build.VERSION.RELEASE, Build.MODEL and Build.BOARD. APP_PROJECT_NAME is
++# literal (DirecTV never fills that placeholder in) and there are two spaces
++# before PureRN. 5.0.136.2002113867 is the app's versionName.
++_APP_USER_AGENT = 'APP_PROJECT_NAME/5.0.136.2002113867 (Android {release}; {model}; {board})  PureRN/0.79.5'
++_UA_CACHE: dict[str, tuple[float, str | None]] = {}
++
++
++def player_user_agent() -> str | None:
++    """The DirecTV app's User-Agent for the bridge device making the current
++    request, built from its own build properties (read once an hour over adb).
++    None when the request isn't from a known bridge device or adb can't read it."""
++    try:
++        from flask import has_request_context, request
++        ip = (request.remote_addr or '').strip() if has_request_context() else ''
++    except Exception:
++        ip = ''
++    if not ip:
++        return None
++    now = time.time()
++    hit = _UA_CACHE.get(ip)
++    if hit and now - hit[0] < _DEVICE_TTL:
++        return hit[1]
++    ua = None
++    try:
++        from .. import bridge_devices
++        address = next((d['address'] for d in bridge_devices.known_devices()[0]
++                        if d.get('host') == ip or d.get('address', '').split(':')[0] == ip), None)
++        if address:
++            subprocess.run(['adb', 'connect', address], capture_output=True, timeout=8)
++            r = subprocess.run(['adb', '-s', address, 'shell',
++                                'getprop ro.build.version.release; getprop ro.product.model; getprop ro.product.board'],
++                               capture_output=True, text=True, timeout=8)
++            release, model, board = ([ln.strip() for ln in (r.stdout or '').splitlines()] + ['', '', ''])[:3]
++            if release and model and board:
++                ua = _APP_USER_AGENT.format(release=release, model=model, board=board)
++    except Exception as exc:
++        logger.debug('[directv-dai] device User-Agent lookup failed: %s', exc)
++    _UA_CACHE[ip] = (now, ua)
++    return ua
 +
 +_ZIP_CACHE: dict[str, str] = {}
 +

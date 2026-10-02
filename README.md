@@ -2,7 +2,7 @@
 
 [kineticman/FastChannels](https://github.com/kineticman/FastChannels) (`main`, the branch his releases come from) with a DirecTV addition, kept up to date automatically:
 
-- **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the account's own targeting values (DMA, billing ZIP, household and profile IDs) and each bridge device's Android ID and ad-tracking setting. That's how it gets the same local ads an Osprey gets.
+- **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the account's own targeting values (DMA, billing ZIP, household and profile IDs) and each bridge device's Android ID and ad-tracking setting. That's how it gets the same local ads an Osprey gets. Bridge devices also send the DirecTV Android TV app's own User-Agent, built from each device's model, board and Android version (Fire TV, Google TV and Shield alike).
 
 ```
 docker pull ghcr.io/mackid1993/fastchannels-mackid1993:latest

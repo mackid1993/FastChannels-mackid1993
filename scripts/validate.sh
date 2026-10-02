@@ -78,6 +78,7 @@ check $d "directv_dai.request_flags("
     || { echo "::error file=$d::missing DAI hook: dai=directv_dai.enabled(...) in resolve() and the license path"; missing=1; }
 check app/routes/api_sources.py "directv_dai.clear_cache_if_toggled("
 check app/routes/directv_proxy.py "directv_dai.keep_drm_session("
+check app/routes/directv_proxy.py "directv_dai.player_user_agent()"
 check app/routes/directv_proxy.py "'yospace.com',  # DAI"
 check app/templates/admin/sources.html "toggleHtml('use_dai'"
 [ "$missing" -eq 0 ]
