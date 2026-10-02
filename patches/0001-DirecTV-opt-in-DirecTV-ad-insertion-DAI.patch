@@ -11,9 +11,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/routes/directv_proxy.py      |   7 +-
  app/scrapers/directv.py          |  27 +-
  app/scrapers/directv_dai.py      | 618 +++++++++++++++++++++++++++++++
- app/scrapers/dtv_android.py      | 282 ++++++++++++++
+ app/scrapers/dtv_android.py      | 250 +++++++++++++
  app/templates/admin/sources.html |   2 +
- 6 files changed, 926 insertions(+), 12 deletions(-)
+ 6 files changed, 894 insertions(+), 12 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_android.py
 
@@ -831,10 +831,10 @@ index 0000000..68d4d76
 +        persist_source_cache_updates(source.id, {'directv_playback': {}})
 diff --git a/app/scrapers/dtv_android.py b/app/scrapers/dtv_android.py
 new file mode 100644
-index 0000000..a035810
+index 0000000..df23522
 --- /dev/null
 +++ b/app/scrapers/dtv_android.py
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,250 @@
 +"""Android TV client for DirecTV.
 +
 +Signs the DirecTV session in as DirecTV's own Android TV app (OAuth client
@@ -876,7 +876,6 @@ index 0000000..a035810
 +_CLIENT_ID = 'UNIFIED_Android_TV_02'
 +_GRANT_BASE = 'https://api.cld.dtvce.com/account/device/grant'
 +_DEVICECODE_URL = f'{_GRANT_BASE}/v2/devicecode'
-+_VALIDATE_URL = f'{_GRANT_BASE}/usercode/validate'
 +_TOKENS_URL = f'{_GRANT_BASE}/tokens'
 +# A real Android TV client signs in once and then refreshes its token — it never
 +# re-logs-in. After the first device-code grant we keep the refresh token + the
@@ -885,11 +884,12 @@ index 0000000..a035810
 +# (authn-refreshgo/v3). If a live refresh 4xx's, adjust from its response.
 +_REFRESH_URL = 'https://api.cld.dtvce.com/authn-refreshgo/v3/tokens'
 +
-+# How long to wait for the in-server approval + token poll before giving up. The
-+# approval is immediate (we approve with our own bearer), so this only bounds a stuck
-+# grant. Kept under the admin UI's status TTL (600 s) so a failure still surfaces.
-+_POLL_DEADLINE = 120
-+_POLL_MIN_INTERVAL = 3
++# The user approves the device code themselves in a browser at directv.com/tvsigninv2
++# (the grant's approval step is the web page's, not an API we can call), so the poll
++# waits long enough for them to open it and enter the code. The code expires in ~600 s;
++# we poll just under that, with the code shown in the admin status the whole time.
++_POLL_DEADLINE = 540
++_POLL_MIN_INTERVAL = 5
 +
 +
 +def _app_headers() -> dict:
@@ -911,17 +911,17 @@ index 0000000..a035810
 +
 +
 +def _device_class_id() -> str:
-+    # One grant per sign-in; a fresh id registers this playback device. (Token
-+    # refresh is not wired, so each re-auth is a fresh grant — see module note.)
++    # A fresh id on the first sign-in registers this playback device; it is then
++    # persisted (store_login_result) and reused by refresh_session, so the account
++    # keeps one registered Android TV device instead of a new one on every refresh.
 +    return str(uuid.uuid4())
 +
 +
 +def start_device_code(session: requests.Session, device_class_id: str) -> dict:
-+    """Begin the Android TV device-code grant. Returns deviceCode, userCode,
-+    registrationToken and pollingInterval."""
++    """Begin the Android TV device-code grant. Returns the user code to show, the
++    verification URL, the device code to poll on, and the poll interval."""
 +    # creationFlow is sent by the app but its literal wasn't recoverable from the
-+    # bundle; the endpoint accepts the grant without it. Add it here if a live call
-+    # rejects the request for a missing creationFlow.
++    # bundle; the endpoint accepts the grant without it.
 +    body = {'clientId': _CLIENT_ID, 'deviceClassID': device_class_id}
 +    r = session.post(_DEVICECODE_URL, json=body, headers=_app_headers(), timeout=20)
 +    if r.status_code < 200 or r.status_code >= 300:
@@ -930,58 +930,38 @@ index 0000000..a035810
 +    data = r.json() if r.content else {}
 +    device_code = (data.get('deviceCode') or '').strip()
 +    user_code = (data.get('userCode') or '').strip()
-+    reg_token = (data.get('registrationToken') or '').strip()
-+    if not device_code or not user_code or not reg_token:
++    if not device_code or not user_code:
 +        logger.warning('[dtv-android] devicecode response missing fields: %s', sorted(data.keys()))
-+        raise _auth_error('device-code start response missing deviceCode/userCode/registrationToken')
++        raise _auth_error('device-code start response missing deviceCode/userCode')
 +    try:
 +        interval = max(_POLL_MIN_INTERVAL, int(float(data.get('pollingInterval') or _POLL_MIN_INTERVAL)))
 +    except Exception:
 +        interval = _POLL_MIN_INTERVAL
-+    return {'device_code': device_code, 'user_code': user_code,
-+            'registration_token': reg_token, 'interval': interval,
-+            'display_url': (data.get('displayURL') or '').strip()}
++    return {'device_code': device_code, 'user_code': user_code, 'interval': interval,
++            'display_url': (data.get('displayURL') or 'directv.com/tvsigninv2').strip()}
 +
 +
-+def approve_user_code(web_bearer: str, user_code: str) -> None:
-+    """Approve the pending Android TV user code under the signed-in account, using
-+    the web account bearer — the same thing directv.com/tvsigninv2 does when a human
-+    enters the code. Done server-side so there is no manual step."""
-+    if not web_bearer:
-+        raise _auth_error('no account bearer to approve the Android TV device code')
-+    headers = {**_app_headers(), 'Content-Type': 'application/json',
-+               'Authorization': f'Bearer {web_bearer}'}
-+    r = requests.post(_VALIDATE_URL, json={'userCode': user_code}, headers=headers, timeout=20)
-+    if r.status_code < 200 or r.status_code >= 300:
-+        logger.warning('[dtv-android] usercode/validate HTTP %s: %s', r.status_code, (r.text or '')[:300])
-+        raise _auth_error(f'device-code approval failed HTTP {r.status_code}')
-+
-+
-+def poll_tokens(session: requests.Session, device_code: str, registration_token: str,
-+                interval: int) -> dict:
-+    """Poll the grant's token endpoint until the approved grant yields tokens.
-+    Returns the raw token_data (access_token, refresh_token, valuePairs)."""
++def poll_tokens(session: requests.Session, device_code: str, interval: int) -> dict:
++    """Poll the grant's token endpoint until the user approves the code and it yields
++    tokens. Returns the raw token_data (access_token, refresh_token, valuePairs). The
++    poll is keyed on the deviceCode alone (unauthenticated, the way the app polls)."""
 +    deadline = time.time() + _POLL_DEADLINE
-+    params = {'clientID': _CLIENT_ID, 'deviceCode': device_code,
-+              'registrationToken': registration_token}
-+    last = ''
++    params = {'clientID': _CLIENT_ID, 'deviceCode': device_code}
 +    while time.time() < deadline:
 +        r = session.get(_TOKENS_URL, params=params, headers=_app_headers(), timeout=20)
 +        data = r.json() if r.content else {}
 +        if data.get('access_token') or data.get('accessToken'):
 +            return data
-+        status = str(((data.get('responseStatus') or {}).get('status')) or '').lower()
-+        last = f'HTTP {r.status_code} status={status or "pending"}'
 +        time.sleep(interval)
-+    raise _auth_error(f'device-code token poll timed out ({last})')
++    raise _auth_error('device code was not approved in time — start the sign-in again')
 +
 +
 +def capture_android_auth(username: str, password: str, *, on_status=None) -> dict:
-+    """Sign in as the Android TV app and return a login result dict in the same shape
-+    as the web login (so run_directv_auth / store_login_result persist it unchanged).
-+
-+    Reuses the existing web sign-in once to get an account bearer for the in-server
-+    device-code approval, then swaps in the Android TV tokens for playback."""
++    """First Android TV sign-in. Start a device-code grant and wait for the user to
++    approve it in a browser at directv.com/tvsigninv2 — exactly like signing in a real
++    Android TV device. After this one approval the session refreshes forever
++    (refresh_session), so the user never signs in again. username/password are unused
++    here (the user approves in their own browser); kept for the call signature."""
 +    from . import directv  # lazy: directv imports this module
 +
 +    def _status(state: str, detail: str = '') -> None:
@@ -991,32 +971,20 @@ index 0000000..a035810
 +            except Exception:
 +                pass
 +
-+    # One account sign-in for the approver bearer only (never the playback identity).
-+    # capture_directv_auth_fast keeps the curl_cffi → Playwright fallback, so WAF
-+    # changes on the lightweight path don't lose auth entirely.
-+    _status('running', 'Signing in to DirecTV…')
-+    web = directv.capture_directv_auth_fast(username, password, on_status=on_status)
-+    web_bearer = (web.get('bearer_token') or '').strip()
-+
-+    _status('running', 'Registering Android TV device…')
 +    session = requests.Session()
 +    device_class_id = _device_class_id()
 +    dc = start_device_code(session, device_class_id)
-+
-+    _status('running', 'Approving Android TV device…')
-+    approve_user_code(web_bearer, dc['user_code'])
-+
-+    _status('running', 'Activating Android TV session…')
-+    token_data = poll_tokens(session, dc['device_code'], dc['registration_token'], dc['interval'])
++    _status('running', f"In a browser, go to {dc['display_url']} and enter code "
++                       f"{dc['user_code']} (signed in to your DirecTV account), then approve this device.")
++    token_data = poll_tokens(session, dc['device_code'], dc['interval'])
 +
 +    bearer = (token_data.get('access_token') or token_data.get('accessToken') or '').strip()
++    if not bearer:
++        raise _auth_error('Android TV grant returned no access token')
 +    refresh = (token_data.get('refresh_token') or token_data.get('refreshToken') or '').strip()
 +    activation = directv._normalize_activation_token(
 +        ((token_data.get('valuePairs') or {}).get('activationToken') or '').strip()
 +    )
-+    if not bearer:
-+        raise _auth_error('Android TV grant returned no access token')
-+
 +    account = requests.Session()
 +    account.headers.update(_app_headers())
 +    _status('success', 'Captured DirecTV Android TV session.')
