@@ -30,6 +30,10 @@ When changing this code, keep that goal ahead of convenience:
 
 "Surround sound (Dolby 5.1)", on by default. Off strips the AC-3/E-AC-3 renditions from the master playlist FastChannels hands bridge sticks (`browser.m3u8`), so the stick plays DirecTV's stereo HE-AAC track (`mp4a.40.5`, 96 kbps). That's exactly what an Osprey plays with Dolby off: verified, it decodes with `c2.android.aac.decoder` at 48 kHz stereo. It skips Dolby's turn-down to reference level and the 5.1-to-stereo fold-down (stereo is ~4–6 dB louder), and avoids the 7 kHz AC-3 ad renditions. It works with DAI on or off, but not when Channels plays the DirecTV URL itself.
 
+## One DRM session through inserted ads (mirrors the Android TV app)
+
+DirecTV's Android TV app keeps its DRM session for clear content (`ExoPlayerWrapper`: `setUseDrmSessionsForClearContent`), so its decoders aren't torn down at each programming/ad boundary. FC Player doesn't. Each inserted (clear) ad switched it from the secure to the non-secure decoders and rebuilt the AC-3 decoder, and once the Dolby decoder failed to start there. Without touching the player, the relay gets the same effect: it drops Yospace's `#EXT-X-KEY:METHOD=NONE` before ad segments (`keep_drm_session()`), so the channel's Widevine key tag keeps applying. Ad init segments have no encryption boxes, so ad samples still play clear.
+
 ## The DAI patch in one paragraph
 
 The opt-in "Use DirecTV ad insertion (DAI)" toggle makes DirecTV playback use `streamURL` (a Yospace server-side ad-insertion session) instead of `fallbackStreamUrl`, adds `yospace.pool=livepause` (Yospace answers 503 without it), and adds the ad flags DirecTV's own Android TV app sends. Nearly all of it lives in `app/scrapers/directv_dai.py`; upstream files get about 15 one-line hooks.

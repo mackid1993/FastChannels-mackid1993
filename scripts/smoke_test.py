@@ -76,6 +76,16 @@ assert 'aac.m3u8' in stereo and stereo.rstrip().endswith('v.m3u8')
 assert dai.strip_surround(master, {}) == master, 'surround must default to on'
 dolby_only = master.replace('mp4a.40.5', 'ac-3')
 assert dai.strip_surround(dolby_only, {'surround_audio': 'false'}) == dolby_only, 'stripped every variant'
+# Inserted ads keep the channel's DRM key in force (no decoder teardown at ad boundaries).
+wv = '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="data:x",KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"'
+media = (f'#EXTM3U\n{wv}\n#EXTINF:2,\nc1.m4a\n#EXT-X-DISCONTINUITY\n#EXT-X-KEY:METHOD=NONE\n'
+         '#EXT-X-MAP:URI="ad-i.mp4"\n#EXTINF:2,\nad1.mp4\n')
+kept = dai.keep_drm_session(media)
+assert 'METHOD=NONE' not in kept and 'ad1.mp4' in kept and kept.count('SAMPLE-AES') == 1, kept
+plain = '#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:2,\na.ts\n'
+assert dai.keep_drm_session(plain) == plain, 'touched a playlist without a Widevine key'
+assert 'directv_dai.keep_drm_session(' in inspect.getsource(directv_proxy.directv_browser_asset), \
+    'the relay no longer keeps the DRM session through inserted ads'
 assert 'directv_dai.strip_surround(' in inspect.getsource(directv_proxy.directv_browser_manifest), \
     'the bridge manifest no longer applies the surround setting'
 assert dai.enabled({'use_dai': 'true'}) is True
