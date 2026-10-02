@@ -2,7 +2,7 @@
 
 [kineticman/FastChannels](https://github.com/kineticman/FastChannels) (`main`, the branch his releases come from) with a DirecTV addition, kept up to date automatically:
 
-- **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the account's own targeting values (DMA, billing ZIP, household and profile IDs) and each bridge device's Android ID and ad-tracking setting. That's how it gets the same local ads an Osprey gets. The server relay identifies itself to Yospace and DirecTV's CDNs as DirecTV's Android TV player (`User-Agent: Custom-Exoplayer`), not as a desktop browser.
+- **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the account's own targeting values (DMA, billing ZIP, household and profile IDs) and each bridge device's Android ID and ad-tracking setting. That's how it gets the same local ads an Osprey gets.
 
 ```
 docker pull ghcr.io/mackid1993/fastchannels-mackid1993:latest

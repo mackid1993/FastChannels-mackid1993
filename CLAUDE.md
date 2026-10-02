@@ -26,9 +26,9 @@ When changing this code, keep that goal ahead of convenience:
 - Don't send fabricated ad-view or measurement data.
 - Don't do anything to skip or suppress ads.
 
-## DirecTV player User-Agent on the relay
+## User-Agent: `Custom-Exoplayer` kills ad insertion (reverted)
 
-The bridge plays DirecTV through `browser.m3u8` and the `browser-asset` relay, so the server makes every request Yospace and DirecTV's CDNs see. It used to send python-requests' UA on the master (the request that opens the Yospace session) and a Windows desktop Chrome UA on every playlist poll and segment. It now sends `Custom-Exoplayer`, the User-Agent DirecTV's Android TV app sets on its player (`com.clientapp.customplayer.ExoPlayerWrapper`), matching the `d=android_tv` identity. Verified 2026-10-01: master, media playlists, init and segments all return 200 with it. Whether it changes which ad files are served is untested. When Cronet is enabled the app's engine uses a runtime UA from native code (`CronetHttpService.getUserAgent`), which isn't readable statically.
+The relay sends python-requests' UA on the bridge master fetch (the request that opens the Yospace session) and a Windows Chrome UA on playlists and segments. On 2026-10-01 both were switched to `Custom-Exoplayer`, the string hard-coded in DirecTV's Android TV `ExoPlayerWrapper`. Side by side on CNN (same account, same URL, only the UA differed), the old UAs got inserted ads at 23:53 and 23:55 and the `Custom-Exoplayer` session got none. Reverted. That string is only the app's non-Cronet fallback; with Cronet (`CRONET_LEVEL = 2`) the app's player sends the native `AnalyticsService::generateUserAgent()` string: `APP_PROJECT_NAME/<app version> (<OS name> <OS version>; <Build.MODEL>; <Build.BOARD>)  PureRN/0.79.5` (literal `APP_PROJECT_NAME`, two spaces before `PureRN`). Any UA change must be A/B tested for inserted ads first.
 
 The Surround sound toggle was removed 2026-10-01 at the user's request (dead weight); bridge sticks always get DirecTV's full master, AC-3 included.
 

@@ -74,10 +74,9 @@ plain = '#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:2,\na.ts\n'
 assert dai.keep_drm_session(plain) == plain, 'touched a playlist without a Widevine key'
 assert 'directv_dai.keep_drm_session(' in inspect.getsource(directv_proxy.directv_browser_asset), \
     'the relay no longer keeps the DRM session through inserted ads'
-# The relay identifies itself to Yospace and DirecTV's CDNs as DirecTV's Android TV player.
-assert dai.PLAYER_USER_AGENT == 'Custom-Exoplayer'
-for fn in (directv_proxy.directv_browser_manifest, directv_proxy.directv_browser_asset):
-    assert 'directv_dai.PLAYER_USER_AGENT' in inspect.getsource(fn), f'{fn.__name__} no longer sends the DirecTV player User-Agent'
+# The relay must not send a made-up player User-Agent: Custom-Exoplayer stopped
+# Yospace from inserting any ads (side-by-side test, 2026-10-01).
+assert not hasattr(dai, 'PLAYER_USER_AGENT'), 'a fixed player User-Agent is back on the relay'
 assert dai.enabled({'use_dai': 'true'}) is True
 assert dai.enabled({'use_dai': False}) is False
 assert dai.enabled(None) is False

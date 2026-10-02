@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 6833dce7fbe5502a6c07aeda9daca5d3555cbc27 Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
 Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
@@ -8,11 +8,11 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |   2 +
- app/routes/directv_proxy.py      |   9 +-
+ app/routes/directv_proxy.py      |   5 +-
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 475 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 469 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 500 insertions(+), 6 deletions(-)
+ 5 files changed, 492 insertions(+), 4 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -29,7 +29,7 @@ index f2e5d42..336d79b 100644
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..986f7cc 100644
+index e7680df..02a43ea 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -49,24 +49,6 @@ index e7680df..986f7cc 100644
  )
  
  
-@@ -320,7 +321,7 @@ def directv_browser_manifest(channel_id: str):
-     scraper = scraper_cls(channel.source.config or {})
-     try:
-         resolved_url = scraper.resolve(channel.stream_url)
--        r = _requests.get(resolved_url, timeout=12)
-+        r = _requests.get(resolved_url, headers={'User-Agent': directv_dai.PLAYER_USER_AGENT}, timeout=12)
-     except Exception as exc:
-         logger.warning('[directv-browser] manifest fetch failed for channel=%s: %s', channel_id, exc)
-         return _unavailable_response()
-@@ -363,7 +364,7 @@ def directv_browser_asset():
-     if target.scheme != 'https' or not _directv_browser_cdn_allowed(target.hostname or ''):
-         abort(400)
-     range_header = request.headers.get('Range')
--    headers = {'User-Agent': _BROWSER_UA}
-+    headers = {'User-Agent': directv_dai.PLAYER_USER_AGENT}
-     if range_header:
-         headers['Range'] = range_header
-     try:
 @@ -375,7 +376,7 @@ def directv_browser_asset():
      content_type = r.headers.get('Content-Type') or 'application/octet-stream'
      if 'mpegurl' in content_type.lower() or raw_url.lower().split('?', 1)[0].endswith(('.m3u8', '.m3u')):
@@ -198,10 +180,10 @@ index e796bf3..86a5067 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..bd0626b
+index 0000000..a50a7bd
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,475 @@
+@@ -0,0 +1,469 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -278,12 +260,6 @@ index 0000000..bd0626b
 +
 +CONFIG_FIELDS = (CONFIG_FIELD,)
 +
-+# The User-Agent DirecTV's Android TV app gives its player (ExoPlayerWrapper in
-+# com.clientapp.customplayer). The FastChannels Player bridge plays DirecTV
-+# through the server relay, so this, not the stick's own User-Agent, is what
-+# Yospace and DirecTV's CDNs see on the master, every playlist poll and every
-+# segment.
-+PLAYER_USER_AGENT = 'Custom-Exoplayer'
 +
 +
 +def keep_drm_session(playlist: str) -> str:
@@ -690,3 +666,6 @@ index f4183ea..42bab94 100644
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
+-- 
+2.50.1 (Apple Git-155)
+
