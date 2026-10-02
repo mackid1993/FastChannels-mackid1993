@@ -159,25 +159,39 @@ dai._client_device = lambda: {**fire, 'android_id': 'ffffffffffffffff'}
 assert not dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True), 'another device reused a session'
 dai._client_device = real_client_device
 
-# A device is read over adb once and saved; after that the saved values are always
-# used (a stable identity), even if a later read would differ or fail.
+# Sessions always use a device's saved values (a stable identity). A new device is
+# read right away; known devices are re-checked in the background and the saved
+# values change only when the device really changed. A failed re-check changes nothing.
 import tempfile  # noqa: E402
 from flask import Flask  # noqa: E402
+class _SyncThread:  # run background re-checks inline so the test is deterministic
+    def __init__(self, target, args=(), daemon=None):
+        self.target, self.args = target, args
+    def start(self):
+        self.target(*self.args)
 _tmp = tempfile.mkdtemp()
 _orig = (dai._bridge_address, dai._read_device, dai._devices_file)
+_orig_thread = dai.threading.Thread
+dai.threading.Thread = _SyncThread
 dai._bridge_address = lambda ip: '10.0.0.9:5555'
 dai._devices_file = lambda: os.path.join(_tmp, 'devices.json')
+reset = {**fire, 'android_id': 'ffffffffffffffff'}
 _ctx = Flask('t').test_request_context(environ_base={'REMOTE_ADDR': '10.0.0.9'})
 with _ctx:
     dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: dict(fire)
-    assert dai._client_device() == fire, 'first read not returned'
-    assert dai._saved_devices() == {'10.0.0.9:5555': fire}, 'first read not saved'
-    dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: {**fire, 'android_id': 'ffffffffffffffff'}
-    assert dai._client_device() == fire, 'saved identity not used'
+    assert dai._client_device() == fire, 'new device not read'
+    assert dai._saved_devices() == {'10.0.0.9:5555': fire}, 'new device not saved'
     dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: {}
-    assert dai._client_device() == fire, 'saved identity not used when adb is down'
-    os.remove(dai._devices_file()); dai._DEVICE_CACHE.clear()
+    assert dai._client_device() == fire and dai._saved_devices()['10.0.0.9:5555'] == fire, \
+        'a failed re-check changed the saved identity'
+    dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: dict(reset)
+    assert dai._client_device() == fire, 'the session must use the saved values, not wait for the re-check'
+    assert dai._saved_devices()['10.0.0.9:5555'] == reset, 'a reset device (new Android ID) was not updated'
+    dai._DEVICE_CACHE.clear()
+    assert dai._client_device() == reset, 'the updated identity is not used afterwards'
+    os.remove(dai._devices_file()); dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: {}
     assert dai._client_device() == {}, 'device values invented with nothing saved and no read'
+dai.threading.Thread = _orig_thread
 dai._bridge_address, dai._read_device, dai._devices_file = _orig
 dai._DEVICE_CACHE.clear()
 
