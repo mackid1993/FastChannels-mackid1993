@@ -42,6 +42,7 @@ Nearly all of it lives in **`app/scrapers/directv_dai.py`**, a file upstream doe
 
 - `CONFIG_FIELD`, `CONFIG_FIELDS`, `enabled()`: the DAI toggle.
 - `player_user_agent()`, `_APP_USER_AGENT`: the DirecTV Android TV app's own User-Agent (`APP_PROJECT_NAME/5.0.136.2002113867 (Android <release>; <model>; <board>)  PureRN/0.79.5`), built from the requesting bridge device's `getprop` values over adb and cached an hour. The relay sends it on the bridge master fetch and every relayed playlist and segment; requests from anything else keep the old UAs.
+- `channel_auth_url()`, `_v2_playback()`: with DAI on, channel authorization goes to `channel/v2` (the Android TV app's endpoint) instead of `channel/v1`; its `playbackData.streamUrls` groups (`DAI`, `Data Center`) are mapped to v1's `streamURL`/`fallbackStreamUrl`, first URL of each.
 - `pick_stream_url()`: chooses `streamURL` when DAI is on, appends `yospace.pool=livepause`, and merges the DAI query with exact-key dedup.
 - `cached_url_usable()`: a cached URL is reused only under the same toggle setting and, with DAI on, only for the same playback device (its `_fw_did` is in the URL).
 - `_CLIENT_PARAMS`: the Android TV app's fixed flags (`d=android_tv`, Nielsen/comScore Android TV values, app constants, Yospace flags).

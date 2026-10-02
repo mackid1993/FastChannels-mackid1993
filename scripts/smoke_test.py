@@ -82,6 +82,13 @@ assert dai._APP_USER_AGENT.format(release='11', model='AFTKRT', board='karat') =
 assert dai.player_user_agent() is None, 'outside a request there is no device to build a User-Agent for'
 for fn in (directv_proxy.directv_browser_manifest, directv_proxy.directv_browser_asset):
     assert 'directv_dai.player_user_agent()' in inspect.getsource(fn), f'{fn.__name__} no longer sends the device User-Agent'
+# DAI authorizes on channel/v2 (the Android TV app's endpoint) and reads its streamUrls groups.
+assert dai.channel_auth_url('v1-url', True).endswith('/channel/v2') and dai.channel_auth_url('v1-url', False) == 'v1-url'
+v2pb = {'streamUrls': [{'groupName': 'DAI', 'URLs': ['https://x.yospace.com/csm/a.m3u8?a=1', 'https://y.yospace.com/b']},
+                       {'groupName': 'Data Center', 'URLs': ['https://cdn.example/c.m3u8']}]}
+assert dai.pick_stream_url(v2pb, True, None) == 'https://x.yospace.com/csm/a.m3u8?a=1&yospace.pool=livepause'
+assert dai.pick_stream_url(v2pb, False, None) == 'https://cdn.example/c.m3u8'
+assert 'directv_dai.channel_auth_url(' in inspect.getsource(directv._fetch_channel_playback), 'channel auth no longer goes through channel_auth_url'
 assert dai.enabled({'use_dai': 'true'}) is True
 assert dai.enabled({'use_dai': False}) is False
 assert dai.enabled(None) is False

@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 6b34674d4e21f6f8965064dba3164f0d1bca0a96 Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
 Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
@@ -9,10 +9,10 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
 ---
  app/routes/api_sources.py        |   2 +
  app/routes/directv_proxy.py      |  10 +-
- app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 512 +++++++++++++++++++++++++++++++
+ app/scrapers/directv.py          |  20 +-
+ app/scrapers/directv_dai.py      | 531 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 538 insertions(+), 6 deletions(-)
+ 5 files changed, 558 insertions(+), 7 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -78,7 +78,7 @@ index e7680df..41f1463 100644
              mimetype='application/vnd.apple.mpegurl',
              headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
-index e796bf3..86a5067 100644
+index e796bf3..2e9c50e 100644
 --- a/app/scrapers/directv.py
 +++ b/app/scrapers/directv.py
 @@ -84,6 +84,7 @@ except ImportError:
@@ -97,6 +97,15 @@ index e796bf3..86a5067 100644
  ) -> dict | None:
      """GET /right/authorization/channel/v1 for one channel — the manifest +
      playToken resolve. Used both by resolve() (via the scraper's live
+@@ -262,7 +264,7 @@ def _fetch_channel_playback(
+         params['clientContext'] = client_context
+ 
+     try:
+-        r = session.get(_CHANNEL_AUTH_URL, params=params, timeout=15)
++        r = session.get(directv_dai.channel_auth_url(_CHANNEL_AUTH_URL, dai), params=params, timeout=15)
+     except requests.RequestException as exc:
+         logger.warning('[directv] channel/v1 request failed for ccid=%s: %s', ccid, exc)
+         return None
 @@ -286,7 +288,7 @@ def _fetch_channel_playback(
          return None
  
@@ -199,10 +208,10 @@ index e796bf3..86a5067 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..b598578
+index 0000000..2281d46
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,512 @@
+@@ -0,0 +1,531 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -303,9 +312,28 @@ index 0000000..b598578
 +
 +# ── Stream URL ───────────────────────────────────────────────────────────────
 +
++# DirecTV's Android TV app authorizes live channels on channel/v2 (its bundled
++# endpoint config), which returns playbackData.streamUrls: [{groupName: 'DAI' |
++# 'Data Center', URLs: [...]}] instead of v1's streamURL/fallbackStreamUrl.
++_CHANNEL_AUTH_V2 = 'https://api.cld.dtvce.com/right/authorization/channel/v2'
++
++
++def channel_auth_url(default: str, dai: bool) -> str:
++    """With DAI on, authorize on channel/v2 as the Android TV app does."""
++    return _CHANNEL_AUTH_V2 if dai else default
++
++
++def _v2_playback(pb: dict) -> dict:
++    groups = {g.get('groupName'): g.get('URLs') or [] for g in pb.get('streamUrls') or [] if isinstance(g, dict)}
++    return {'streamURL': next(iter(groups.get('DAI') or []), None),
++            'fallbackStreamUrl': next(iter(groups.get('Data Center') or []), None)}
++
++
 +def pick_stream_url(playback_data: dict, dai: bool, dai_extra: dict | None) -> str | None:
-+    """The stream URL to play from a channel/v1 ``playbackData`` object."""
++    """The stream URL to play from a channel/v1 or channel/v2 ``playbackData`` object."""
 +    pb = playback_data or {}
++    if 'streamUrls' in pb:
++        pb = _v2_playback(pb)
 +    if dai:
 +        url = pb.get('streamURL') or pb.get('fallbackStreamUrl')
 +    else:
@@ -728,3 +756,6 @@ index f4183ea..42bab94 100644
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
+-- 
+2.50.1 (Apple Git-155)
+

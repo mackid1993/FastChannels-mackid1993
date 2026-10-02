@@ -34,6 +34,10 @@ The patch now sends that real app string, built per bridge device from `getprop 
 
 The Surround sound toggle was removed 2026-10-01 at the user's request (dead weight); bridge sticks always get DirecTV's full master, AC-3 included.
 
+## channel/v2 (the Android TV app's endpoint)
+
+The Android TV app's bundled config authorizes channels on `right/authorization/channel/v2` (the web uses v1). Same query params; the response has `playbackData.streamUrls: [{groupName: 'DAI'|'Data Center', URLs: [...]}]` and the same `dRights.playToken`. Measured 2026-10-02 on CNN: v2's DAI URLs had the same Yospace host, path and parameter names as v1's `streamURL` (one identical after masking tokens). With DAI on the patch now uses v2 anyway, at the user's request, to match the app. The app adds `hevc`/`maxHevcLevel`/`maxAvcLevel`/`hdr`/`deviceModelIdentifier` only when its remote `dualEncodeEnabled` flag is on; not sent.
+
 ## One DRM session through inserted ads (mirrors the Android TV app)
 
 DirecTV's Android TV app keeps its DRM session for clear content (`ExoPlayerWrapper`: `setUseDrmSessionsForClearContent`), so its decoders aren't torn down at each programming/ad boundary. FC Player doesn't. Each inserted (clear) ad switched it from the secure to the non-secure decoders and rebuilt the AC-3 decoder, and once the Dolby decoder failed to start there. Without touching the player, the relay gets the same effect: it drops Yospace's `#EXT-X-KEY:METHOD=NONE` before ad segments (`keep_drm_session()`), so the channel's Widevine key tag keeps applying. Ad init segments have no encryption boxes, so ad samples still play clear.
