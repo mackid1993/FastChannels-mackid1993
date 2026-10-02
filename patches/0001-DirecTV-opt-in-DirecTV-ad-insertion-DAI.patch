@@ -1,4 +1,4 @@
-From 6b34674d4e21f6f8965064dba3164f0d1bca0a96 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
 Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
@@ -756,6 +756,3 @@ index f4183ea..42bab94 100644
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
--- 
-2.50.1 (Apple Git-155)
-
