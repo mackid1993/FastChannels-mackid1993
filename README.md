@@ -4,6 +4,8 @@
 
 - **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the account's own targeting values (DMA, billing ZIP, consent, household and profile IDs) and each bridge device's Android ID, ad-tracking setting and comScore device name. That's how it gets local and political ads for the account's market. Requests look like DirecTV's Android TV app's: its `channel/v2` authorization request and its player User-Agent, built from each device's own model, board and Android version. Fire TV, Google TV and Shield are all handled the same way, and no device sends an advertising ID.
 
+- **Full-range audio on a bridge:** a bridge stick decodes DirecTV's 5.1 AC-3 to stereo PCM for a capture encoder, and on Android 11 the platform decoder's own 5.1→2.0 downmix is band-limited (muffled). By default the relay now declares DirecTV's AC-3 track as stereo in the master it serves the player, so the decoder emits AC-3's own full-range downmix instead — same codec and bitrate, no re-encode. A **Keep 5.1 surround audio** toggle turns this off, leaving the 5.1 declaration for an output that passes AC-3 through to an AV receiver.
+
 ```
 docker pull ghcr.io/mackid1993/fastchannels-mackid1993:latest
 ```
@@ -25,7 +27,7 @@ This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` 
 
 The other six days, a drift check applies the patch to upstream's latest code, runs the static checks and refreshes the patch, without building an image. A conflict is caught the day it appears.
 
-The DAI code lives in its own file, `app/scrapers/directv_dai.py`, which upstream doesn't have and so can't conflict with. Upstream's files only get 18 one-line hooks (listed with re-apply instructions in `AGENTS.md`), which keeps conflicts rare and trivial to fix.
+The DAI code lives in its own file, `app/scrapers/directv_dai.py`, which upstream doesn't have and so can't conflict with. Upstream's files only get 19 one-line hooks (listed with re-apply instructions in `AGENTS.md`), which keeps conflicts rare and trivial to fix.
 
 If any step fails, nothing is published, `:latest` stays on the last good build, and a "Build failed" issue pings you. Until it's resolved, the daily run does a full build instead of a drift check, so a one-off failure (a registry hiccup, say) fixes itself the next day.
 
@@ -33,7 +35,7 @@ If any step fails, nothing is published, `:latest` stays on the last good build,
 
 If upstream rewrites the lines the patch changes, step 2 fails and the workflow opens an issue here with the upstream commit and instructions.
 
-It then asks an AI to resolve the conflict: [Aider](https://aider.chat) with an OpenRouter model (the `OPENROUTER_API_KEY` secret; the model is pinned to DeepSeek V4.1 Flash, `openrouter/deepseek/deepseek-v4.1-flash`, via the `AI_MODEL` repo variable and the workflow default), given the patch and `AGENTS.md` as background. It runs with a read-only token and can edit only the conflicted files. Its result must pass the static checks **and** a full image build, Player APK check, smoke test and boot test before anything is merged. Then CI opens a pull request with it, merges it, and runs the publishing build; the issue closes when that succeeds. If the AI can't produce a passing fix, nothing is merged and the issue gets a comment saying so.
+It then asks an AI to resolve the conflict: [Aider](https://aider.chat) with an OpenRouter model (the `OPENROUTER_API_KEY` secret; the model is set by the `AI_MODEL` repo variable and the workflow default, currently Qwen 3.8 27B, `openrouter/qwen/qwen3.8-27b`), given the patch and `AGENTS.md` as background. It runs with a read-only token and can edit only the conflicted files. Its result must pass the static checks **and** a full image build, Player APK check, smoke test and boot test before anything is merged. Then CI opens a pull request with it, merges it, and runs the publishing build; the issue closes when that succeeds. If the AI can't produce a passing fix, nothing is merged and the issue gets a comment saying so.
 
 The AI's PRs and every status issue @mention you, so GitHub emails you whenever something happens.
 

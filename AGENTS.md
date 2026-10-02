@@ -77,7 +77,8 @@ Upstream's files get one-line hooks only. `scripts/validate.sh` checks each is p
 | `_DIRECTV_BROWSER_CDN_SUFFIXES` | `'yospace.com',` | Yospace playlists go through the same relay. | Keep in the relay allowlist. |
 | `directv_browser_manifest()`, master fetch | `headers=directv_dai.player_headers()` | The app's User-Agent on the request that opens the Yospace session. | On upstream's `requests.get` of the resolved URL. |
 | `directv_browser_asset()`, relay headers | `{'User-Agent': _BROWSER_UA, **directv_dai.player_headers()}` | The app's User-Agent on every playlist and segment. | Merge into whatever headers dict the relay sends. |
-| `app/templates/admin/sources.html`, `renderDirectvConfig` | `toggleHtml('use_dai', ...)` | The setting in the UI. | Next to the other DirecTV toggles. |
+| `directv_browser_manifest()`, the master rewrite | `directv_dai.stereo_downmix_master(r.text, channel.source.config)` wrapping the master-playlist rewrite | Declares DirecTV's AC-3 rendition stereo so a bridge stick emits a full-range downmix (no-op when `keep_surround` is on). | Wrap upstream's master-playlist rewrite (the one that returns the `browser.m3u8` master) in this call. |
+| `app/templates/admin/sources.html`, `renderDirectvConfig` | `toggleHtml('use_dai', ...)` and `toggleHtml('keep_surround', ...)` | The two settings in the UI. | Next to the other DirecTV toggles. |
 
 When resolving a conflict in upstream's files, the fix is almost always to put the hook back where upstream's new code needs it.
 
