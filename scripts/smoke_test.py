@@ -159,6 +159,26 @@ dai._client_device = lambda: {**fire, 'android_id': 'ffffffffffffffff'}
 assert not dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True), 'another device reused a session'
 dai._client_device = real_client_device
 
+# A failed adb read falls back to the device's last good read saved on disk, so a
+# sleeping stick keeps its own id; nothing saved means no device values.
+import tempfile  # noqa: E402
+from flask import Flask  # noqa: E402
+_tmp = tempfile.mkdtemp()
+_orig = (dai._bridge_address, dai._read_device, dai._devices_file)
+dai._bridge_address = lambda ip: '10.0.0.9:5555'
+dai._devices_file = lambda: os.path.join(_tmp, 'devices.json')
+_ctx = Flask('t').test_request_context(environ_base={'REMOTE_ADDR': '10.0.0.9'})
+with _ctx:
+    dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: dict(fire)
+    assert dai._client_device() == fire, 'good read not returned'
+    assert dai._saved_devices() == {'10.0.0.9:5555': fire}, 'good read not saved'
+    dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: {}
+    assert dai._client_device() == fire, 'failed read did not fall back to the saved values'
+    os.remove(dai._devices_file()); dai._DEVICE_CACHE.clear()
+    assert dai._client_device() == {}, 'device values invented with nothing saved'
+dai._bridge_address, dai._read_device, dai._devices_file = _orig
+dai._DEVICE_CACHE.clear()
+
 # Values that weren't sourced from the account are omitted, never invented.
 bare = dai.build_query({}, {}, '123')
 for key in ('hhid', 'u', 'profid', 'dma_location', 'gpp', 'is_lat', 'adid'):

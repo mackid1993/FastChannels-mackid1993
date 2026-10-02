@@ -44,6 +44,10 @@ The Android TV app's bundled config authorizes channels on `right/authorization/
 
 With DAI on, `android_auth_request()` drops the web player's `Origin`/`Referer`, sends the device's app User-Agent, and sends the app's query: `ccid`, `proximity`, `clientContext`, `reserveCTicket=true`, `daiEnabled=true`, `startOver=false`, `abrEnabled=true` (from `getQueryParams` in the app bundle; the web-only `timeShiftEnabled` and `dualManifest` are dropped). Tested 2026-10-02: 200, authorized, play token present, same Yospace host and identical DAI URL parameter set as the web request.
 
+## Stable device ids
+
+The device-wide Android ID (`settings get secure android_id`) only changes on a factory reset, so each bridge device's last good adb read is saved in `/data/directv_dai_devices.json` (keyed by adb address). If a later read fails (stick asleep, adb drop), the session uses the saved values instead of going out with no device id, which would fall back to account consent and mostly national spots. Before 2026-10-02 a failed read cached `{}` for an hour. Failures are logged (`[directv-dai] adb read failed for ...`).
+
 ## Hooks
 
 See `AGENTS.md` for the full hook table: every one-line hook in upstream's files, what it does, and where to put it back if upstream moves the code. 18 hooks as of 2026-10-02 (the DAI flag and channel-name hooks were collapsed: `_fetch_channel_playback` takes one `dai` flag dict, and `note_channel(self, row, ccid)` writes the cache itself).

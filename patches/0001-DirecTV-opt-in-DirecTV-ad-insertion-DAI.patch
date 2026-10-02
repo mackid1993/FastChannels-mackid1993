@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 9cd40db4ac484b3b9a2ec348eead682e45323c73 Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
 Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
@@ -10,9 +10,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/routes/api_sources.py        |   2 +
  app/routes/directv_proxy.py      |   7 +-
  app/scrapers/directv.py          |  16 +-
- app/scrapers/directv_dai.py      | 528 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 588 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 549 insertions(+), 6 deletions(-)
+ 5 files changed, 609 insertions(+), 6 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -180,10 +180,10 @@ index e796bf3..b7e039a 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..445829b
+index 0000000..4513191
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,528 @@
+@@ -0,0 +1,588 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -200,6 +200,7 @@ index 0000000..445829b
 +import base64
 +import json
 +import logging
++import os
 +import re
 +import subprocess
 +import time
@@ -422,9 +423,11 @@ index 0000000..445829b
 +
 +
 +def _client_device() -> dict:
-+    """Build properties of the bridge device making the current request, read
-+    over adb once an hour. {} when the request isn't from a known bridge device,
-+    adb can't read it, or outside a request."""
++    """Build properties of the bridge device making the current request. Read over
++    adb once an hour; when a read fails (device asleep, adb hiccup) the last good
++    read, saved on disk, is used instead, so the session keeps the device's own
++    id. {} when the request isn't from a known bridge device that has ever been
++    read, or outside a request."""
 +    try:
 +        from flask import has_request_context, request
 +        ip = (request.remote_addr or '').strip() if has_request_context() else ''
@@ -434,30 +437,87 @@ index 0000000..445829b
 +        return {}
 +    now = time.time()
 +    hit = _DEVICE_CACHE.get(ip)
-+    if hit and now - hit[0] < _DEVICE_TTL:
++    if hit and now < hit[0]:
 +        return hit[1]
-+    props = _read_device(ip)
-+    _DEVICE_CACHE[ip] = (now, props)
++    address = _bridge_address(ip)
++    if not address:
++        _DEVICE_CACHE[ip] = (now + _RETRY_TTL, {})
++        return {}
++    props = _read_device(address)
++    saved = _saved_devices()
++    if props:
++        if saved.get(address) != props:
++            saved[address] = props
++            _save_devices(saved)
++        _DEVICE_CACHE[ip] = (now + _DEVICE_TTL, props)
++        return props
++    props = saved.get(address) or {}
++    if props:
++        logger.info('[directv-dai] adb read failed for %s; using its saved device values', address)
++    else:
++        logger.warning('[directv-dai] adb read failed for %s and nothing is saved; this session has no device id', address)
++    _DEVICE_CACHE[ip] = (now + _RETRY_TTL, props)
 +    return props
 +
 +
-+def _read_device(ip: str) -> dict:
++_RETRY_TTL = 60
++
++
++def _bridge_address(ip: str) -> str | None:
 +    try:
 +        from .. import bridge_devices
-+        address = next((d['address'] for d in bridge_devices.known_devices()[0]
-+                        if d.get('host') == ip or d.get('address', '').split(':')[0] == ip), None)
-+        if not address:
-+            return {}
++        return next((d['address'] for d in bridge_devices.known_devices()[0]
++                     if d.get('host') == ip or d.get('address', '').split(':')[0] == ip), None)
++    except Exception as exc:
++        logger.debug('[directv-dai] bridge device lookup failed: %s', exc)
++        return None
++
++
++def _read_device(address: str) -> dict:
++    try:
 +        subprocess.run(['adb', 'connect', address], capture_output=True, timeout=8)
 +        r = subprocess.run(['adb', '-s', address, 'shell', '; '.join(cmd for _, cmd in _DEVICE_PROPS)],
 +                           capture_output=True, text=True, timeout=10)
 +    except Exception as exc:
-+        logger.debug('[directv-dai] bridge device read failed: %s', exc)
++        logger.debug('[directv-dai] adb read failed for %s: %s', address, exc)
 +        return {}
 +    values = [ln.strip() for ln in (r.stdout or '').splitlines()]
 +    props = {key: (values[i] if i < len(values) and values[i] != 'null' else '')
 +             for i, (key, _) in enumerate(_DEVICE_PROPS)}
-+    return props if props['model'] else {}
++    return props if props['model'] and len(props['android_id']) >= 8 else {}
++
++
++def _devices_file() -> str:
++    """directv_dai_devices.json next to FastChannels' SQLite database (the /data
++    volume), so saved device values survive restarts and image updates."""
++    uri = ''
++    try:
++        from flask import current_app
++        uri = current_app.config.get('SQLALCHEMY_DATABASE_URI') or ''
++    except Exception:
++        pass
++    folder = os.path.dirname(uri[len('sqlite:///'):]) if uri.startswith('sqlite:///') else ''
++    return os.path.join(folder or '/data', 'directv_dai_devices.json')
++
++
++def _saved_devices() -> dict:
++    try:
++        with open(_devices_file(), encoding='utf-8') as f:
++            data = json.load(f)
++        return data if isinstance(data, dict) else {}
++    except Exception:
++        return {}
++
++
++def _save_devices(devices: dict) -> None:
++    path = _devices_file()
++    try:
++        tmp = f'{path}.{os.getpid()}.tmp'
++        with open(tmp, 'w', encoding='utf-8') as f:
++            json.dump(devices, f)
++        os.replace(tmp, path)
++    except Exception as exc:
++        logger.debug('[directv-dai] could not save device values: %s', exc)
 +
 +
 +def device_ad_flags(props: dict) -> dict:
@@ -725,3 +785,6 @@ index f4183ea..42bab94 100644
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
+-- 
+2.50.1 (Apple Git-155)
+
