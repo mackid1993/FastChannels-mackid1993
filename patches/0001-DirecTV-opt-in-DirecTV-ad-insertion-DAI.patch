@@ -1,4 +1,4 @@
-From e7294474ea2811b846bee8a3c08e354c80c3727f Mon Sep 17 00:00:00 2001
+From c76cc875432ecf781762a559fe5d776603f940ea Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
 Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
@@ -10,9 +10,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/routes/api_sources.py        |   2 +
  app/routes/directv_proxy.py      |   7 +-
  app/scrapers/directv.py          |  16 +-
- app/scrapers/directv_dai.py      | 529 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 528 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 550 insertions(+), 6 deletions(-)
+ 5 files changed, 549 insertions(+), 6 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -180,10 +180,10 @@ index e796bf3..b7e039a 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..30d1ecf
+index 0000000..445829b
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,529 @@
+@@ -0,0 +1,528 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -346,8 +346,7 @@ index 0000000..30d1ecf
 +    if bool(cached.get('dai')) != dai or ('yospace.com' in url and 'yospace.pool=' not in url):
 +        return False
 +    if dai and 'yospace.com' in url:
-+        device = _client_device()
-+        fw_did = device.get('_fw_did') if device else None
++        fw_did = device_ad_flags(_client_device()).get('_fw_did')
 +        if fw_did:
 +            return f'_fw_did={quote(fw_did, safe=",:~")}' in url
 +        return '_fw_did=android_id:' not in url
