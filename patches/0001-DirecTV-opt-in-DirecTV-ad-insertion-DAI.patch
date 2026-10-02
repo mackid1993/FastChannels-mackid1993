@@ -10,9 +10,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/routes/api_sources.py        |   2 +
  app/routes/directv_proxy.py      |   7 +-
  app/scrapers/directv.py          |  16 +-
- app/scrapers/directv_dai.py      | 607 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 611 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 628 insertions(+), 6 deletions(-)
+ 5 files changed, 632 insertions(+), 6 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -180,10 +180,10 @@ index e796bf3..b7e039a 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..06ae165
+index 0000000..f74b5b7
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,611 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -241,11 +241,15 @@ index 0000000..06ae165
 +    # yo.lpa/yo.lp: live-pause mode, which the yospace.pool=livepause session
 +    # needs (the Osprey sends yo.lpa; without them no ads were inserted).
 +    'yo.fr': 'true', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
-+    # The rest of the Android TV app's own live Yospace params (its bundled config:
-+    # shared YSLiveParams merged with the 'atv' overrides). yo.cps is the value it
-+    # sends on a fresh tune (<min> = 3 minutes = 180 s); yo.vm is its ad-macro map,
++    # The Android TV app's own live Yospace params. Its com.att.tv config tree sets
++    # YSLiveParams = {yo.d.cp, yo.vm}; it does NOT send yo.cps for a live tune. yo.cps
++    # is a Content Playback Spec from the app's default/iOS config tree only
++    # ('b.lp.d.s.<min>-3630.0x.s.n' with a computed <min> we can't know), and sending
++    # it pinned Yospace to a band-limited inserted-ad profile (muffled ~7 kHz) that the
++    # real Android TV app — and the Osprey — never get. Leaving it out, per the repo
++    # rule: if we don't know the value, don't invent one. yo.vm is the ad-macro map,
 +    # base64 JSON with APPBUNDLE com.att.tv, sent verbatim.
-+    'yo.sl': '3', 'yo.d.cp': 'true', 'yo.cps': 'b.lp.d.s.180-3630.0x.s.n',
++    'yo.sl': '3', 'yo.d.cp': 'true',
 +    'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
 +}
 +
