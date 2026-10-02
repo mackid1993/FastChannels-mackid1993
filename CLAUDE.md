@@ -46,7 +46,7 @@ With DAI on, `android_auth_request()` drops the web player's `Origin`/`Referer`,
 
 ## Stable device ids
 
-The device-wide Android ID (`settings get secure android_id`) only changes on a factory reset, so each bridge device's last good adb read is saved in `/data/directv_dai_devices.json` (keyed by adb address). If a later read fails (stick asleep, adb drop), the session uses the saved values instead of going out with no device id, which would fall back to account consent and mostly national spots. Before 2026-10-02 a failed read cached `{}` for an hour. Failures are logged (`[directv-dai] adb read failed for ...`).
+Each bridge device is read over adb once (Android ID, `limit_ad_tracking`, release, model, board, manufacturer) and saved in `/data/directv_dai_devices.json`, keyed by adb address. From then on the saved values are always used, never re-read, so every session from that device carries the same identity (user's call, 2026-10-02: a stable identifier matters more than live reads). To pick up a factory reset or an ad-tracking change, delete the device's entry. Previously a failed read cached `{}` for an hour, sending sessions out with no device id (account consent, mostly national spots).
 
 ## Hooks
 

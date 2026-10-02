@@ -159,8 +159,8 @@ dai._client_device = lambda: {**fire, 'android_id': 'ffffffffffffffff'}
 assert not dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True), 'another device reused a session'
 dai._client_device = real_client_device
 
-# A failed adb read falls back to the device's last good read saved on disk, so a
-# sleeping stick keeps its own id; nothing saved means no device values.
+# A device is read over adb once and saved; after that the saved values are always
+# used (a stable identity), even if a later read would differ or fail.
 import tempfile  # noqa: E402
 from flask import Flask  # noqa: E402
 _tmp = tempfile.mkdtemp()
@@ -170,12 +170,14 @@ dai._devices_file = lambda: os.path.join(_tmp, 'devices.json')
 _ctx = Flask('t').test_request_context(environ_base={'REMOTE_ADDR': '10.0.0.9'})
 with _ctx:
     dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: dict(fire)
-    assert dai._client_device() == fire, 'good read not returned'
-    assert dai._saved_devices() == {'10.0.0.9:5555': fire}, 'good read not saved'
+    assert dai._client_device() == fire, 'first read not returned'
+    assert dai._saved_devices() == {'10.0.0.9:5555': fire}, 'first read not saved'
+    dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: {**fire, 'android_id': 'ffffffffffffffff'}
+    assert dai._client_device() == fire, 'saved identity not used'
     dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: {}
-    assert dai._client_device() == fire, 'failed read did not fall back to the saved values'
+    assert dai._client_device() == fire, 'saved identity not used when adb is down'
     os.remove(dai._devices_file()); dai._DEVICE_CACHE.clear()
-    assert dai._client_device() == {}, 'device values invented with nothing saved'
+    assert dai._client_device() == {}, 'device values invented with nothing saved and no read'
 dai._bridge_address, dai._read_device, dai._devices_file = _orig
 dai._DEVICE_CACHE.clear()
 

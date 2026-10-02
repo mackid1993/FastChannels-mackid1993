@@ -1,4 +1,4 @@
-From 9cd40db4ac484b3b9a2ec348eead682e45323c73 Mon Sep 17 00:00:00 2001
+From 2ebafc92f33a19069904ea7b1a9ee3ddf4be4775 Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
 Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
@@ -10,9 +10,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/routes/api_sources.py        |   2 +
  app/routes/directv_proxy.py      |   7 +-
  app/scrapers/directv.py          |  16 +-
- app/scrapers/directv_dai.py      | 588 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 585 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 609 insertions(+), 6 deletions(-)
+ 5 files changed, 606 insertions(+), 6 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -180,10 +180,10 @@ index e796bf3..b7e039a 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..4513191
+index 0000000..5b2122f
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,588 @@
+@@ -0,0 +1,585 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -424,10 +424,11 @@ index 0000000..4513191
 +
 +def _client_device() -> dict:
 +    """Build properties of the bridge device making the current request. Read over
-+    adb once an hour; when a read fails (device asleep, adb hiccup) the last good
-+    read, saved on disk, is used instead, so the session keeps the device's own
-+    id. {} when the request isn't from a known bridge device that has ever been
-+    read, or outside a request."""
++    adb once, the first time a device is seen, and saved on disk; after that the
++    saved values are used, so a device always presents the same identity (the
++    device-wide Android ID only changes on a factory reset). To re-read a device,
++    remove its entry from directv_dai_devices.json. {} when the request isn't from
++    a known bridge device, or outside a request."""
 +    try:
 +        from flask import has_request_context, request
 +        ip = (request.remote_addr or '').strip() if has_request_context() else ''
@@ -440,23 +441,19 @@ index 0000000..4513191
 +    if hit and now < hit[0]:
 +        return hit[1]
 +    address = _bridge_address(ip)
-+    if not address:
-+        _DEVICE_CACHE[ip] = (now + _RETRY_TTL, {})
-+        return {}
-+    props = _read_device(address)
-+    saved = _saved_devices()
-+    if props:
-+        if saved.get(address) != props:
-+            saved[address] = props
-+            _save_devices(saved)
-+        _DEVICE_CACHE[ip] = (now + _DEVICE_TTL, props)
-+        return props
-+    props = saved.get(address) or {}
-+    if props:
-+        logger.info('[directv-dai] adb read failed for %s; using its saved device values', address)
-+    else:
-+        logger.warning('[directv-dai] adb read failed for %s and nothing is saved; this session has no device id', address)
-+    _DEVICE_CACHE[ip] = (now + _RETRY_TTL, props)
++    props = {}
++    if address:
++        saved = _saved_devices()
++        props = saved.get(address) or {}
++        if not props:
++            props = _read_device(address)
++            if props:
++                saved[address] = props
++                _save_devices(saved)
++                logger.info('[directv-dai] saved device values for %s', address)
++            else:
++                logger.warning('[directv-dai] adb read failed for %s; this session has no device id', address)
++    _DEVICE_CACHE[ip] = (now + (_DEVICE_TTL if props else _RETRY_TTL), props)
 +    return props
 +
 +
