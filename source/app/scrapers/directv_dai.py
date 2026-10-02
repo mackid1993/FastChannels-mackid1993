@@ -158,6 +158,29 @@ def pick_stream_url(playback_data: dict, dai: dict | None) -> str | None:
     return url
 
 
+def keep_drm_session(playlist: str) -> str:
+    """Keep the stream's DRM key in force across inserted (clear) ads in a media
+    playlist, the server-side equivalent of what DirecTV's Android TV app does in its
+    player (setUseDrmSessionsForClearContent): the player keeps one DRM session and one
+    set of decoders through each ad instead of tearing them down and rebuilding them at
+    every programming/ad boundary. Yospace marks clear ad segments with
+    EXT-X-KEY:METHOD=NONE; dropping that marker leaves the channel's Widevine key tag
+    applying. Ad samples carry no encryption info in their own init segments, so they
+    still play as clear samples. Playlists without a Widevine key are returned unchanged.
+
+    Re-added 2026-10-02: live evidence (DirecTV's own app plays inserted-ad audio
+    full-range on the same stick + LinkPi, while FC Player — which switches to the
+    non-secure decoder at the METHOD=NONE boundary, with an audio discontinuity — comes
+    out muffled) shows the muffle is that decoder switch, not DirecTV's ad file. Keeping
+    the secure decoder through the ad, like the app, is the fix. The ad's source AC-3
+    measured ~16 kHz, so there is full-range audio to preserve."""
+    if 'METHOD=NONE' not in (playlist or '') or 'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed' not in playlist.lower():
+        return playlist
+    lines = playlist.splitlines()
+    out = [ln for ln in lines if not (ln.startswith('#EXT-X-KEY') and 'METHOD=NONE' in ln.upper())]
+    return '\n'.join(out) + ('\n' if playlist.endswith('\n') else '')
+
+
 def cached_url_usable(cached: dict | None, dai: bool) -> bool:
     """A URL cached under the other DAI setting (or a bare Yospace URL cached
     before the pool fix) must not be served after the toggle changes. With DAI

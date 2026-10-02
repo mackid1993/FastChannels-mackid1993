@@ -97,7 +97,17 @@ assert dai._APP_USER_AGENT.format(release='11', model='AFTKRT', board='karat') =
 assert dai.player_headers() == {}, 'outside a request there is no device to build a User-Agent for'
 for fn in (directv_proxy.directv_browser_manifest, directv_proxy.directv_browser_asset):
     assert 'directv_dai.player_headers()' in inspect.getsource(fn), f'{fn.__name__} no longer sends the device User-Agent'
-assert not hasattr(dai, 'keep_drm_session'), 'the removed DRM-session playlist rewrite is back'
+# keep_drm_session drops Yospace's EXT-X-KEY:METHOD=NONE on clear ad segments so the
+# player keeps its secure decoders through the ad (mirrors the app's
+# setUseDrmSessionsForClearContent) — the fix for muffled inserted-ad audio.
+assert callable(getattr(dai, 'keep_drm_session', None)), 'keep_drm_session (the DRM-session rewrite) is missing'
+assert 'directv_dai.keep_drm_session(' in inspect.getsource(directv_proxy.directv_browser_asset), \
+    'the relay no longer keeps the DRM session through inserted ads'
+_pl = '#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://x",KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"\nseg1.m4s\n#EXT-X-KEY:METHOD=NONE\nad1.mp4\n'
+assert '#EXT-X-KEY:METHOD=NONE' not in dai.keep_drm_session(_pl), 'METHOD=NONE not dropped on a Widevine stream'
+assert 'SAMPLE-AES' in dai.keep_drm_session(_pl), 'the channel key tag was dropped too'
+assert dai.keep_drm_session('#EXTM3U\n#EXT-X-KEY:METHOD=NONE\nseg.mp4\n') == '#EXTM3U\n#EXT-X-KEY:METHOD=NONE\nseg.mp4\n', \
+    'a non-Widevine playlist must be left unchanged'
 # With DAI on, authorization is the Android TV app's request: channel/v2, no browser
 # Origin/Referer, the app's query. DAI off leaves the web request untouched.
 class _S:

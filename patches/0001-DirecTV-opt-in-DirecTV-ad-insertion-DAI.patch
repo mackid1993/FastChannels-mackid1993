@@ -8,20 +8,20 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |   2 +
- app/routes/directv_proxy.py      |   7 +-
+ app/routes/directv_proxy.py      |   9 +-
  app/scrapers/directv.py          |  59 ++-
- app/scrapers/directv_dai.py      | 626 +++++++++++++++++++++++++++++++
- app/scrapers/dtv_android.py      | 360 ++++++++++++++++++
+ app/scrapers/directv_dai.py      | 649 +++++++++++++++++++++++++++++++
+ app/scrapers/dtv_android.py      | 360 +++++++++++++++++
  app/templates/admin/sources.html |  14 +-
- 6 files changed, 1048 insertions(+), 20 deletions(-)
+ 6 files changed, 1072 insertions(+), 21 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_android.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
-index 8e46cf7..16661d4 100644
+index f2e5d42..336d79b 100644
 --- a/app/routes/api_sources.py
 +++ b/app/routes/api_sources.py
-@@ -710,6 +710,8 @@ def save_source_config(source_id):
+@@ -685,6 +685,8 @@ def save_source_config(source_id):
      db.session.commit()
      if pbs_deleted:
          _invalidate_and_refresh_xml()
@@ -31,7 +31,7 @@ index 8e46cf7..16661d4 100644
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..dae0703 100644
+index e7680df..b4ec8e0 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -69,6 +69,15 @@ index e7680df..dae0703 100644
      if range_header:
          headers['Range'] = range_header
      try:
+@@ -375,7 +376,7 @@ def directv_browser_asset():
+     content_type = r.headers.get('Content-Type') or 'application/octet-stream'
+     if 'mpegurl' in content_type.lower() or raw_url.lower().split('?', 1)[0].endswith(('.m3u8', '.m3u')):
+         return Response(
+-            _rewrite_directv_browser_playlist(r.text, r.url),
++            _rewrite_directv_browser_playlist(directv_dai.keep_drm_session(r.text), r.url),
+             status=r.status_code,
+             mimetype='application/vnd.apple.mpegurl',
+             headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
 index e796bf3..35c7276 100644
 --- a/app/scrapers/directv.py
@@ -248,10 +257,10 @@ index e796bf3..35c7276 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..a8bf510
+index 0000000..d2c3d9c
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,626 @@
+@@ -0,0 +1,649 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -410,6 +419,29 @@ index 0000000..a8bf510
 +            url += f'&{quote(str(k), safe="")}={quote(str(v), safe=",:~")}'
 +            existing_keys.add(k)
 +    return url
++
++
++def keep_drm_session(playlist: str) -> str:
++    """Keep the stream's DRM key in force across inserted (clear) ads in a media
++    playlist, the server-side equivalent of what DirecTV's Android TV app does in its
++    player (setUseDrmSessionsForClearContent): the player keeps one DRM session and one
++    set of decoders through each ad instead of tearing them down and rebuilding them at
++    every programming/ad boundary. Yospace marks clear ad segments with
++    EXT-X-KEY:METHOD=NONE; dropping that marker leaves the channel's Widevine key tag
++    applying. Ad samples carry no encryption info in their own init segments, so they
++    still play as clear samples. Playlists without a Widevine key are returned unchanged.
++
++    Re-added 2026-10-02: live evidence (DirecTV's own app plays inserted-ad audio
++    full-range on the same stick + LinkPi, while FC Player — which switches to the
++    non-secure decoder at the METHOD=NONE boundary, with an audio discontinuity — comes
++    out muffled) shows the muffle is that decoder switch, not DirecTV's ad file. Keeping
++    the secure decoder through the ad, like the app, is the fix. The ad's source AC-3
++    measured ~16 kHz, so there is full-range audio to preserve."""
++    if 'METHOD=NONE' not in (playlist or '') or 'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed' not in playlist.lower():
++        return playlist
++    lines = playlist.splitlines()
++    out = [ln for ln in lines if not (ln.startswith('#EXT-X-KEY') and 'METHOD=NONE' in ln.upper())]
++    return '\n'.join(out) + ('\n' if playlist.endswith('\n') else '')
 +
 +
 +def cached_url_usable(cached: dict | None, dai: bool) -> bool:
@@ -1245,10 +1277,10 @@ index 0000000..035cd0e
 +    from .directv import DirectvAuthError
 +    return DirectvAuthError(msg)
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index b818ab0..cc5bf7a 100644
+index f4183ea..aaeb9fa 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
-@@ -3189,6 +3189,8 @@
+@@ -3163,6 +3163,8 @@
              'On = leave out free, ad-supported channels (DirecTV Stream numbers these 4000-4999).')}
            ${toggleHtml('use_provider_numbers', 'Use DirecTV channel numbers',
              'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). Channels that share a number get subchannels, like 213.1.')}
@@ -1257,7 +1289,7 @@ index b818ab0..cc5bf7a 100644
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
-@@ -3236,6 +3238,16 @@
+@@ -3210,6 +3212,16 @@
        directvPollStatus(sourceId);
      }
  
@@ -1274,7 +1306,7 @@ index b818ab0..cc5bf7a 100644
      function directvPollStatus(sourceId) {
        if (_directvPollTimer) clearInterval(_directvPollTimer);
        _directvPollTimer = setInterval(() => _directvCheckStatus(sourceId), 2000);
-@@ -3256,7 +3268,7 @@
+@@ -3230,7 +3242,7 @@
        const statusMap = {
          idle: null,
          starting: '<span style="color:var(--text-muted)">Starting browser...</span>',
