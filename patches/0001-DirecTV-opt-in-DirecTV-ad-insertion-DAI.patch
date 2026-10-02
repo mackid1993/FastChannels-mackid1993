@@ -10,9 +10,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/routes/api_sources.py        |   2 +
  app/routes/directv_proxy.py      |   7 +-
  app/scrapers/directv.py          |  16 +-
- app/scrapers/directv_dai.py      | 611 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 615 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 632 insertions(+), 6 deletions(-)
+ 5 files changed, 636 insertions(+), 6 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -180,10 +180,10 @@ index e796bf3..b7e039a 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..f74b5b7
+index 0000000..77618b0
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,611 @@
+@@ -0,0 +1,615 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -248,7 +248,11 @@ index 0000000..f74b5b7
 +    # it pinned Yospace to a band-limited inserted-ad profile (muffled ~7 kHz) that the
 +    # real Android TV app — and the Osprey — never get. Leaving it out, per the repo
 +    # rule: if we don't know the value, don't invent one. yo.vm is the ad-macro map,
-+    # base64 JSON with APPBUNDLE com.att.tv, sent verbatim.
++    # base64 JSON with APPBUNDLE com.att.tv, sent verbatim. yo.vm is a pinned snapshot of
++    # the app's bundled value: the ${...} inside are Yospace server-side macros (the app
++    # does not substitute them either), so the blob goes as-is and never varies per
++    # session. It drifts only on a DirecTV app update — re-extract YSLiveParams.yo.vm from
++    # the new index.android.bundle then, alongside _APP_USER_AGENT's version.
 +    'yo.sl': '3', 'yo.d.cp': 'true',
 +    'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
 +}
