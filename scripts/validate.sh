@@ -62,21 +62,19 @@ check_re() { grep -qE -- "$2" "$1" || { echo "::error file=$1::missing DAI hook:
 d=app/scrapers/directv.py
 [ -f app/scrapers/directv_dai.py ] || { echo "::error::app/scrapers/directv_dai.py is missing"; missing=1; }
 check $d "from . import directv_dai"
-check_re $d 'dai_extra: *dict' "the dai_extra parameter of _fetch_channel_playback"
+check_re $d 'dai: *dict' "the dai parameter of _fetch_channel_playback"
 check $d "directv_dai.pick_stream_url("
-check $d "'dai': dai"
+check $d "'dai': bool(dai)"
 check $d "directv_dai.login_fields("
 check $d "directv_dai.login_fields_from_cookies("
 check $d "directv_dai.store_login_result("
 check $d "directv_dai.CONFIG_FIELD"
 check $d "directv_dai.note_channel("
-check $d "_update_cache('dai_channel_names'"
 check $d "directv_dai.cached_url_usable("
-check $d "directv_dai.request_flags("
 check $d "directv_dai.android_auth_request("
 # Two callers pass dai=: resolve() and the license path.
-[ "$(grep -cE -- 'dai=directv_dai\.enabled\(' $d)" -ge 2 ] \
-    || { echo "::error file=$d::missing DAI hook: dai=directv_dai.enabled(...) in resolve() and the license path"; missing=1; }
+[ "$(grep -cE -- 'dai=directv_dai\.request_flags\(' $d)" -ge 2 ] \
+    || { echo "::error file=$d::missing DAI hook: dai=directv_dai.request_flags(...) in resolve() and the license path"; missing=1; }
 check app/routes/api_sources.py "directv_dai.clear_cache_if_toggled("
 check app/routes/directv_proxy.py "directv_dai.player_headers()"
 check app/routes/directv_proxy.py "'yospace.com',  # DAI"

@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 01fd21ebb11a9f2c14a9df9b254a574e117133d5 Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
 Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
@@ -9,10 +9,10 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
 ---
  app/routes/api_sources.py        |   2 +
  app/routes/directv_proxy.py      |   7 +-
- app/scrapers/directv.py          |  20 +-
- app/scrapers/directv_dai.py      | 535 +++++++++++++++++++++++++++++++
+ app/scrapers/directv.py          |  16 +-
+ app/scrapers/directv_dai.py      | 533 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 560 insertions(+), 6 deletions(-)
+ 5 files changed, 554 insertions(+), 6 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -68,7 +68,7 @@ index e7680df..dae0703 100644
          headers['Range'] = range_header
      try:
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
-index e796bf3..e624cbc 100644
+index e796bf3..b7e039a 100644
 --- a/app/scrapers/directv.py
 +++ b/app/scrapers/directv.py
 @@ -84,6 +84,7 @@ except ImportError:
@@ -83,7 +83,7 @@ index e796bf3..e624cbc 100644
  
  def _fetch_channel_playback(
      bearer_token: str, cookies: list[dict], client_context: str | None, ccid: str,
-+    dai: bool = False, dai_extra: dict | None = None,
++    dai: dict | None = None,
  ) -> dict | None:
      """GET /right/authorization/channel/v1 for one channel — the manifest +
      playToken resolve. Used both by resolve() (via the scraper's live
@@ -101,7 +101,7 @@ index e796bf3..e624cbc 100644
  
      pb = data.get('playbackData') or {}
 -    fallback_url = pb.get('fallbackStreamUrl') or pb.get('streamURL')
-+    fallback_url = directv_dai.pick_stream_url(pb, dai, dai_extra)
++    fallback_url = directv_dai.pick_stream_url(pb, dai)
      play_token = (data.get('dRights') or {}).get('playToken')
      if not fallback_url or not play_token:
          return None
@@ -109,7 +109,7 @@ index e796bf3..e624cbc 100644
          'play_token': play_token,
          'license_content_id': _license_content_id_from_stream_url(fallback_url, ccid),
          'cached_at': time.time(),
-+        'dai': dai,
++        'dai': bool(dai),
      }
  
  
@@ -145,32 +145,15 @@ index e796bf3..e624cbc 100644
      ]
  
      _FAST_CHANNEL_NUMBER_RANGE = range(4000, 5000)
-@@ -1550,6 +1557,7 @@ class DirectvScraper(BaseScraper):
-         channels: list[ChannelData] = []
-         non_streamable = 0
-         sd_collapsed = 0
-+        dai_channel_names: dict = {}
- 
-         # Hard failures (auth, transport, malformed payload) raise immediately
-         # from _fetch_allchannels_rows() and are not retried here -- only the
-@@ -1613,6 +1621,7 @@ class DirectvScraper(BaseScraper):
+@@ -1613,6 +1620,7 @@ class DirectvScraper(BaseScraper):
                  # also contain internal channel IDs; retain resolver validation and
                  # community-map fallback rather than accepting every value.
                  external_listing_id = _pick(row, 'externalListingId')
-+                directv_dai.note_channel(dai_channel_names, row, ccid)
++                directv_dai.note_channel(self, row, ccid)
  
                  channels.append(ChannelData(
                      source_channel_id=ccid,
-@@ -1656,6 +1665,8 @@ class DirectvScraper(BaseScraper):
-                 )
-                 time.sleep(self._ELIGIBILITY_RETRY_DELAY)
- 
-+        self._update_cache('dai_channel_names', dai_channel_names)
-+
-         if non_streamable == 0 and baseline_non_streamable >= self._MIN_TRUSTED_NON_STREAMABLE:
-             raise ScrapeSkipError(
-                 f'DirecTV Stream: AllChannels returned 0 non-streamable channels after '
-@@ -1897,7 +1908,7 @@ class DirectvScraper(BaseScraper):
+@@ -1897,7 +1905,7 @@ class DirectvScraper(BaseScraper):
              raise RuntimeError(f'DirecTV Stream: malformed stream_url: {raw_url}')
  
          cached = (self.cache.get('directv_playback') or {}).get(ccid)
@@ -179,29 +162,28 @@ index e796bf3..e624cbc 100644
              return cached['fallback_url']
  
          bearer = self.config.get('bearer_token')
-@@ -1910,6 +1921,8 @@ class DirectvScraper(BaseScraper):
+@@ -1910,6 +1918,7 @@ class DirectvScraper(BaseScraper):
          try:
              result = _fetch_channel_playback(
                  bearer, self.config.get('cookies') or [], self.config.get('client_context'), ccid,
-+                dai=directv_dai.enabled(self.config),
-+                dai_extra=directv_dai.request_flags(self.config, self.cache.get('dai_channel_names'), ccid),
++                dai=directv_dai.request_flags(self.config, self.cache.get('dai_channel_names'), ccid),
              )
          except DirectvAuthExpiredError as exc:
              self._mark_auth_stale_and_reauth(f'channel/v1 expired token for ccid={ccid}')
-@@ -2020,6 +2033,7 @@ class DirectvScraper(BaseScraper):
+@@ -2020,6 +2029,7 @@ class DirectvScraper(BaseScraper):
              try:
                  fresh = _fetch_channel_playback(
                      bearer, config.get('cookies') or [], config.get('client_context'), channel_id,
-+                    dai=directv_dai.enabled(config),
++                    dai=directv_dai.request_flags(config, None, channel_id),
                  )
              except DirectvAuthExpiredError as exc:
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..b69c3d9
+index 0000000..49b14e2
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,533 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -317,8 +299,9 @@ index 0000000..b69c3d9
 +            'fallbackStreamUrl': next(iter(groups.get('Data Center') or []), None)}
 +
 +
-+def pick_stream_url(playback_data: dict, dai: bool, dai_extra: dict | None) -> str | None:
-+    """The stream URL to play from a channel/v1 or channel/v2 ``playbackData`` object."""
++def pick_stream_url(playback_data: dict, dai: dict | None) -> str | None:
++    """The stream URL to play from a channel/v1 or channel/v2 ``playbackData``
++    object. ``dai`` is the DAI flag dict from request_flags(), or None with DAI off."""
 +    pb = playback_data or {}
 +    if 'streamUrls' in pb:
 +        pb = _v2_playback(pb)
@@ -335,13 +318,13 @@ index 0000000..b69c3d9
 +    # net) so ad insertion targets the right market
 +    # and honors the account's real ad-personalization choice. Only values we truly
 +    # have are sent; nothing is invented.
-+    if url and dai and dai_extra and 'yospace.com' in url:
++    if url and dai and 'yospace.com' in url:
 +        # Match on exact param keys, not a substring (a naive `'e=' in query`
 +        # would false-positive against the tail of cdncpDevice=/cdncpCtime= and
 +        # silently drop e=prod).
 +        query = url.split('?', 1)[1] if '?' in url else ''
 +        existing_keys = {pair.split('=', 1)[0] for pair in query.split('&') if pair}
-+        for k, v in dai_extra.items():
++        for k, v in dai.items():
 +            if v in (None, '') or k in existing_keys:
 +                continue
 +            # Leave ':' and ',' literal, as DirecTV's clients send them
@@ -402,13 +385,10 @@ index 0000000..b69c3d9
 +    if zip_code:
 +        q['bZipCode'] = zip_code
 +
-+    # The ad id and is_lat come from the playback device, the way DirecTV's TV
-+    # apps set them (the Osprey reads is_lat from the device's own ad-tracking
-+    # setting, not the account's web consent). The id is DirecTV's own fallback,
-+    # android_id:<Android ID>, which every Android TV device exposes over adb.
-+    # Without is_lat=0 the ad server sends national spots only (no local or
-+    # political ads). A device that limits ad tracking gets the apps' opted-out form.
-+    device = _client_device()
++    # The ad id, is_lat and comscore_device come from the playback device, the way
++    # DirecTV's Android TV app sets them (see device_ad_flags). Without is_lat=0
++    # the ad server sends national spots only (no local or political ads).
++    device = device_ad_flags(_client_device())
 +    if device:
 +        q.update(device)
 +    else:
@@ -430,27 +410,37 @@ index 0000000..b69c3d9
 +_DEVICE_CACHE: dict[str, tuple[float, dict]] = {}
 +_DEVICE_TTL = 3600
 +
++# One adb read per bridge device per hour; every device-derived value below
++# (ad id, is_lat, comscore_device, User-Agent) comes from these properties.
++_DEVICE_PROPS = (
++    ('android_id', 'settings get secure android_id'),
++    ('limit_ad_tracking', 'settings get secure limit_ad_tracking'),
++    ('advertising_id', 'settings get secure advertising_id'),
++    ('release', 'getprop ro.build.version.release'),
++    ('model', 'getprop ro.product.model'),
++    ('board', 'getprop ro.product.board'),
++    ('manufacturer', 'getprop ro.product.manufacturer'),
++)
++
 +
 +def _client_device() -> dict:
-+    """Ad-id flags for the bridge device making the current request, read once an
-+    hour over adb. {} when the request isn't from a known bridge device, when adb
-+    can't read it, or outside a request."""
++    """Build properties of the bridge device making the current request, read
++    over adb once an hour. {} when the request isn't from a known bridge device,
++    adb can't read it, or outside a request."""
 +    try:
 +        from flask import has_request_context, request
-+        if not has_request_context():
-+            return {}
-+        ip = (request.remote_addr or '').strip()
++        ip = (request.remote_addr or '').strip() if has_request_context() else ''
 +    except Exception:
-+        return {}
++        ip = ''
 +    if not ip:
 +        return {}
 +    now = time.time()
 +    hit = _DEVICE_CACHE.get(ip)
 +    if hit and now - hit[0] < _DEVICE_TTL:
 +        return hit[1]
-+    flags = _read_device(ip)
-+    _DEVICE_CACHE[ip] = (now, flags)
-+    return flags
++    props = _read_device(ip)
++    _DEVICE_CACHE[ip] = (now, props)
++    return props
 +
 +
 +def _read_device(ip: str) -> dict:
@@ -458,34 +448,44 @@ index 0000000..b69c3d9
 +        from .. import bridge_devices
 +        address = next((d['address'] for d in bridge_devices.known_devices()[0]
 +                        if d.get('host') == ip or d.get('address', '').split(':')[0] == ip), None)
-+    except Exception as exc:
-+        logger.debug('[directv-dai] bridge device lookup failed: %s', exc)
-+        return {}
-+    if not address:
-+        return {}
-+
-+    def setting(key: str) -> str:
-+        try:
-+            r = subprocess.run(['adb', '-s', address, 'shell', 'settings', 'get', 'secure', key],
-+                               capture_output=True, text=True, timeout=8)
-+            return (r.stdout or '').strip()
-+        except Exception:
-+            return ''
-+
-+    try:
++        if not address:
++            return {}
 +        subprocess.run(['adb', 'connect', address], capture_output=True, timeout=8)
-+    except Exception:
++        r = subprocess.run(['adb', '-s', address, 'shell', '; '.join(cmd for _, cmd in _DEVICE_PROPS)],
++                           capture_output=True, text=True, timeout=10)
++    except Exception as exc:
++        logger.debug('[directv-dai] bridge device read failed: %s', exc)
 +        return {}
-+    android_id = setting('android_id')
-+    if not android_id or android_id == 'null' or len(android_id) < 8:
-+        return {}
-+    # Fire OS keeps limit_ad_tracking as a system setting; Google TV keeps it in
-+    # Play services, which adb can't read ('null'), so there it counts as not limited.
-+    if setting('limit_ad_tracking') == '1':
-+        return {'is_lat': '1', '_fw_did': 'google_advertising_id:optout', 'adid': 'optout'}
-+    return {'is_lat': '0', '_fw_did': f'android_id:{android_id}'}
++    values = [ln.strip() for ln in (r.stdout or '').splitlines()]
++    props = {key: (values[i] if i < len(values) and values[i] != 'null' else '')
++             for i, (key, _) in enumerate(_DEVICE_PROPS)}
++    return props if props['model'] else {}
 +
 +
++def device_ad_flags(props: dict) -> dict:
++    """The device ad flags DirecTV's Android TV app sends (universalYospaceParameters
++    and its android_tv branch, app bundle 5.0.136):
++    - comscore_device = <systemName>_<Build.MANUFACTURER>_<Build.MODEL>, whitespace
++      removed; systemName is "Android".
++    - The ad id: on Fire TV the app reads Settings.Secure advertising_id when
++      limit_ad_tracking is 0 (DeviceInformation.getAdvertisingId). It then sends
++      _fw_did=google_advertising_id:<id> and adid=<id> with is_lat=0. With ad tracking
++      limited it sends google_advertising_id:optout, adid=optout, is_lat=1.
++    - Google TV / Shield: the app reads the Google advertising id from Play
++      services, which adb can't. android_id:<Android ID> stands in, with is_lat=0
++      (is_lat=0 is what gets local and political ads)."""
++    if not props:
++        return {}
++    flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{props.get('manufacturer', '')}_{props.get('model', '')}")}
++    fire_tv = props.get('manufacturer') == 'Amazon' or props.get('model', '').startswith('AFT')
++    ad_id = props.get('advertising_id', '')
++    if props.get('limit_ad_tracking') == '1':
++        flags.update({'is_lat': '1', '_fw_did': 'google_advertising_id:optout', 'adid': 'optout'})
++    elif fire_tv and len(ad_id) >= 8:
++        flags.update({'is_lat': '0', '_fw_did': f'google_advertising_id:{ad_id}', 'adid': ad_id})
++    elif len(props.get('android_id', '')) >= 8:
++        flags.update({'is_lat': '0', '_fw_did': f"android_id:{props['android_id']}"})
++    return flags
 +
 +
 +# DirecTV's Android TV app sends this User-Agent on its player's requests (Cronet,
@@ -494,7 +494,6 @@ index 0000000..b69c3d9
 +# literal (DirecTV never fills that placeholder in) and there are two spaces
 +# before PureRN. 5.0.136.2002113867 is the app's versionName.
 +_APP_USER_AGENT = 'APP_PROJECT_NAME/5.0.136.2002113867 (Android {release}; {model}; {board})  PureRN/0.79.5'
-+_UA_CACHE: dict[str, tuple[float, str | None]] = {}
 +
 +
 +def player_headers() -> dict:
@@ -505,36 +504,12 @@ index 0000000..b69c3d9
 +
 +def player_user_agent() -> str | None:
 +    """The DirecTV app's User-Agent for the bridge device making the current
-+    request, built from its own build properties (read once an hour over adb).
-+    None when the request isn't from a known bridge device or adb can't read it."""
-+    try:
-+        from flask import has_request_context, request
-+        ip = (request.remote_addr or '').strip() if has_request_context() else ''
-+    except Exception:
-+        ip = ''
-+    if not ip:
-+        return None
-+    now = time.time()
-+    hit = _UA_CACHE.get(ip)
-+    if hit and now - hit[0] < _DEVICE_TTL:
-+        return hit[1]
-+    ua = None
-+    try:
-+        from .. import bridge_devices
-+        address = next((d['address'] for d in bridge_devices.known_devices()[0]
-+                        if d.get('host') == ip or d.get('address', '').split(':')[0] == ip), None)
-+        if address:
-+            subprocess.run(['adb', 'connect', address], capture_output=True, timeout=8)
-+            r = subprocess.run(['adb', '-s', address, 'shell',
-+                                'getprop ro.build.version.release; getprop ro.product.model; getprop ro.product.board'],
-+                               capture_output=True, text=True, timeout=8)
-+            release, model, board = ([ln.strip() for ln in (r.stdout or '').splitlines()] + ['', '', ''])[:3]
-+            if release and model and board:
-+                ua = _APP_USER_AGENT.format(release=release, model=model, board=board)
-+    except Exception as exc:
-+        logger.debug('[directv-dai] device User-Agent lookup failed: %s', exc)
-+    _UA_CACHE[ip] = (now, ua)
-+    return ua
++    request, or None when it isn't a known bridge device."""
++    props = _client_device()
++    if props.get('release') and props.get('model') and props.get('board'):
++        return _APP_USER_AGENT.format(release=props['release'], model=props['model'], board=props['board'])
++    return None
++
 +
 +_ZIP_CACHE: dict[str, str] = {}
 +
@@ -586,13 +561,18 @@ index 0000000..b69c3d9
 +
 +# ── Scrape ───────────────────────────────────────────────────────────────────
 +
-+def note_channel(channel_names: dict, row: dict, ccid: str) -> None:
-+    """Record the per-channel DAI "net" tag the web client sends (daiChannelName)."""
++def note_channel(scraper, row: dict, ccid: str) -> None:
++    """Record the per-channel DAI "net" tag (the lineup's daiChannelName) in the
++    scraper's cache, where resolve() reads it. Called once per lineup row."""
 +    value = (row or {}).get('daiChannelName')
-+    if isinstance(value, str) and value.strip():
-+        channel_names[ccid] = value.strip()
-+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
-+        channel_names[ccid] = str(value)
++    if isinstance(value, (int, float)) and not isinstance(value, bool):
++        value = str(value)
++    if not isinstance(value, str) or not value.strip():
++        return
++    names = scraper.cache.get('dai_channel_names')
++    names = names if isinstance(names, dict) else {}
++    if names.get(ccid) != value.strip():
++        scraper._update_cache('dai_channel_names', {**names, ccid: value.strip()})
 +
 +
 +# ── Login ────────────────────────────────────────────────────────────────────
@@ -750,3 +730,6 @@ index f4183ea..42bab94 100644
          </div>
  
          <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
+-- 
+2.50.1 (Apple Git-155)
+

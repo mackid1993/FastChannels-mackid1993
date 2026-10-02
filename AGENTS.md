@@ -40,33 +40,44 @@ It adds an opt-in DirecTV source setting, **Use DirecTV ad insertion (DAI)** (`u
 
 Nearly all of it lives in **`app/scrapers/directv_dai.py`**, a file upstream doesn't have, so it can't conflict:
 
-- `CONFIG_FIELD`, `CONFIG_FIELDS`, `enabled()`: the DAI toggle.
-- `player_headers()`, `player_user_agent()`, `_APP_USER_AGENT`: the DirecTV Android TV app's own User-Agent (`APP_PROJECT_NAME/5.0.136.2002113867 (Android <release>; <model>; <board>)  PureRN/0.79.5`), built from the requesting bridge device's `getprop` values over adb and cached an hour. The relay sends it on the bridge master fetch and every relayed playlist and segment; requests from anything else keep the old UAs.
-- `_v2_playback()`: maps channel/v2's `playbackData.streamUrls` groups (`DAI`, `Data Center`) to v1's `streamURL`/`fallbackStreamUrl`, first URL of each; `pick_stream_url()` accepts either shape.
-- `android_auth_request()`: with DAI on, makes the channel authorization the Android TV app's request: `channel/v2` (returned as the URL to call), no browser `Origin`/`Referer`, the device's app User-Agent, and the app's query (`startOver=false`, no `timeShiftEnabled`/`dualManifest`). DAI off returns the v1 URL and changes nothing.
-- `pick_stream_url()`: chooses `streamURL` when DAI is on, appends `yospace.pool=livepause`, and merges the DAI query with exact-key dedup.
-- `cached_url_usable()`: a cached URL is reused only under the same toggle setting and, with DAI on, only for the same playback device (its `_fw_did` is in the URL).
-- `_CLIENT_PARAMS`: the Android TV app's fixed flags (`d=android_tv`, Nielsen/comScore Android TV values, app constants, Yospace flags).
-- `request_flags()` / `build_query()`: those flags plus the account's own values (DMA, GPP, `bZipCode`) and the requesting device's ad id and `is_lat`.
-- `_client_device()` / `_read_device()`: match the request IP to a bridge device and read its Android ID and Fire OS `limit_ad_tracking` over adb, cached an hour.
+- `CONFIG_FIELD`, `CONFIG_FIELDS`, `enabled()`: the DAI toggle (`use_dai`, default off).
+- `android_auth_request(session, params, dai, default_url)`: with DAI on, turns the channel authorization into the Android TV app's request and returns the URL to call: `channel/v2`; no browser `Origin`/`Referer`; the device's app User-Agent; the app's query (`startOver=false`; the web-only `timeShiftEnabled` and `dualManifest` dropped). DAI off: returns `default_url` (upstream's v1) and touches nothing.
+- `_v2_playback()`, `pick_stream_url(pb, dai)`: channel/v2 returns `playbackData.streamUrls` groups (`DAI`, `Data Center`); these map to v1's `streamURL`/`fallbackStreamUrl` (first URL of each). `pick_stream_url` takes either shape; `dai` is the flag dict from `request_flags()` or `None`. With flags it plays the Yospace URL, appends `yospace.pool=livepause`, and merges the flags (exact-key dedup; `:` and `,` left literal).
+- `cached_url_usable()`: a cached URL is reused only under the same toggle setting and, with DAI on, only for the same device (its `_fw_did` is in the URL).
+- `_CLIENT_PARAMS`: the Android TV app's fixed flags (`d=android_tv`, Nielsen/comScore Android TV values, app constants, Yospace live params).
+- `request_flags(config, channel_names, ccid)` / `build_query()`: `_CLIENT_PARAMS` plus the account's values (household/profile ids, DMA, GPP, `bZipCode`), the device flags, and `net`. Returns `None` with DAI off.
+- `_client_device()` / `_read_device()` / `_DEVICE_PROPS`: match the request IP to a bridge device (`bridge_devices.known_devices()`) and read, in one adb call cached an hour: Android ID, `limit_ad_tracking`, Fire OS `advertising_id`, Android version, model, board, manufacturer.
+- `device_ad_flags(props)`: the device's ad flags exactly as the Android TV app builds them: `comscore_device=Android_<manufacturer>_<model>` (whitespace removed); Fire TV `_fw_did=google_advertising_id:<advertising_id>` + `adid=<advertising_id>` + `is_lat=0`; limited tracking `google_advertising_id:optout` + `adid=optout` + `is_lat=1`; Google TV/Shield (Google ad id unreadable over adb) `android_id:<Android ID>` + `is_lat=0`.
+- `player_headers()`, `player_user_agent()`, `_APP_USER_AGENT`: the app's player User-Agent from the device's properties: `APP_PROJECT_NAME/5.0.136.2002113867 (Android <release>; <model>; <board>)  PureRN/0.79.5`. `{}`/`None` for non-bridge requests.
 - `_account_zip()`: the billing ZIP for accounts that logged in before `dai_zip` existed.
-- `gpp_targeted_ad_opt_out()`: decodes the US-National GPP section (id 7).
+- `gpp_targeted_ad_opt_out()`: decodes the US-National GPP section (id 7); used for `is_lat` only when the request isn't from a bridge device.
 - `login_fields()`, `login_fields_from_cookies()`, `store_login_result()`, `fetch_account_context()`, `ids_from_bearer_jwt()`: login-time capture of DMA, ZIP, consent and household/profile ids.
-- `note_channel()`: each channel's `daiChannelName`.
+- `note_channel(scraper, row, ccid)`: stores each lineup row's `daiChannelName` (the `net` flag) in `scraper.cache['dai_channel_names']` via `_update_cache`, only when it changes.
 - `clear_cache_if_toggled()`: drops cached stream URLs when the toggle changes.
 
-Upstream's files only get one-line hooks, and `scripts/validate.sh` checks every one is present:
+Upstream's files get one-line hooks only. `scripts/validate.sh` checks each is present, and `scripts/smoke_test.py` checks the upstream APIs they call. Every hook, what it's for, and how to re-apply it if upstream moves the code:
 
-- `app/scrapers/directv.py`:
-  - `from . import directv_dai`.
-  - `_fetch_channel_playback()`: the `dai`/`dai_extra` parameters, `pick_stream_url()`, and `'dai': dai` on the cache entry.
-  - Both login paths call `login_fields*()`; `run_directv_auth()` calls `store_login_result()`.
-  - `CONFIG_FIELD` in `config_schema`.
-  - The scrape collects `dai_channel_names` and caches it.
-  - `resolve()` uses `cached_url_usable()` and passes `request_flags()`; the license path passes `dai=`.
-- `app/routes/api_sources.py`: calls `clear_cache_if_toggled()` after saving a source's config.
-- `app/routes/directv_proxy.py`: imports `directv_dai`, sends `directv_dai.player_headers()` on the master fetch and the `browser-asset` relay (falling back to the old UAs), and has `'yospace.com'` in `_DIRECTV_BROWSER_CDN_SUFFIXES`, so DAI playlists and segments go through the same `browser-asset` relay as non-DAI streams.
-- `app/templates/admin/sources.html`: the toggle in `renderDirectvConfig`.
+| File / place | Hook | Purpose | If upstream changes it |
+|---|---|---|---|
+| `app/scrapers/directv.py`, imports | `from . import directv_dai` | — | Keep with the other relative imports. |
+| `_fetch_channel_playback()` signature | `dai: dict \| None = None` | Receives the DAI flags (`None` = off). | Add the keyword to whatever function now calls the channel authorization API. |
+| `_fetch_channel_playback()`, the `session.get(...)` | `directv_dai.android_auth_request(session, params, dai, _CHANNEL_AUTH_URL)` as the URL | Android TV app request on channel/v2 when DAI is on. | Wrap upstream's authorization URL in this call after its `params`/headers are built. |
+| `_fetch_channel_playback()`, the stream URL | `fallback_url = directv_dai.pick_stream_url(pb, dai)` | Picks the Yospace URL and adds the flags. | Replace upstream's `fallbackStreamUrl`/`streamURL` pick with this. |
+| `_fetch_channel_playback()`, the returned dict | `'dai': bool(dai),` | Lets `cached_url_usable()` tell DAI from non-DAI cache entries. | Add to the cached playback dict. |
+| `resolve()`, the cache check | `directv_dai.cached_url_usable(cached, directv_dai.enabled(self.config))` | Don't reuse a URL from the other toggle state or another device. | Replace the bare `cached and` check. |
+| `resolve()`, the `_fetch_channel_playback(...)` call | `dai=directv_dai.request_flags(self.config, self.cache.get('dai_channel_names'), ccid)` | Passes the flags. | Add the keyword. |
+| License fallback, its `_fetch_channel_playback(...)` call | `dai=directv_dai.request_flags(config, None, channel_id)` | Same session type for the play token. | Add the keyword. |
+| Lineup scrape, per row | `directv_dai.note_channel(self, row, ccid)` | Records `net`. | Call once per channel row after `ccid` is known. |
+| `config_schema` | `*directv_dai.CONFIG_FIELDS,` | The toggle. | Keep inside the DirecTV schema list. |
+| curl_cffi login result dict | `**directv_dai.login_fields(session, bearer, token_data),` | DMA, consent, household/profile ids. | Add to the dict that path returns. |
+| Playwright login | `captured.update(directv_dai.login_fields_from_cookies(captured))` | Same for that path. | After `captured` has the bearer and cookies. |
+| `run_directv_auth()`, before commit | `directv_dai.store_login_result(cfg, result)` | Saves those values to the config. | Next to upstream's other `cfg[...] = result[...]` lines. |
+| `app/routes/api_sources.py`, `save_source_config()` | `directv_dai.clear_cache_if_toggled(source, old, current)` | Flushes cached URLs on toggle change. | After the config is committed. |
+| `app/routes/directv_proxy.py`, imports | `from ..scrapers import directv_dai, registry` | — | — |
+| `_DIRECTV_BROWSER_CDN_SUFFIXES` | `'yospace.com',` | Yospace playlists go through the same relay. | Keep in the relay allowlist. |
+| `directv_browser_manifest()`, master fetch | `headers=directv_dai.player_headers()` | The app's User-Agent on the request that opens the Yospace session. | On upstream's `requests.get` of the resolved URL. |
+| `directv_browser_asset()`, relay headers | `{'User-Agent': _BROWSER_UA, **directv_dai.player_headers()}` | The app's User-Agent on every playlist and segment. | Merge into whatever headers dict the relay sends. |
+| `app/templates/admin/sources.html`, `renderDirectvConfig` | `toggleHtml('use_dai', ...)` | The setting in the UI. | Next to the other DirecTV toggles. |
 
 When resolving a conflict in upstream's files, the fix is almost always to put the hook back where upstream's new code needs it.
 
@@ -77,7 +88,7 @@ Invariants a port must keep:
 - **Never invent values.** Only the account's own values and the playback device's own ids go in the query. Never mint random ids or make up an advertising id; anything missing is omitted.
 - **`d=android_tv` must be sent.** Without a device name the ad server recognizes, Yospace inserts no ads at all.
 - **Never send the desktop identity** (`d=desktop`, `plt,DSK`, `devgrp,DSK`, comScore `PC`/`b`): it pulls web ad inventory with wrong-market, band-limited ads.
-- **`is_lat` and `_fw_did` come from the playback device** (bridge device matched by request IP): `is_lat=0` with `_fw_did=android_id:<Android ID>`, or the opted-out form (`is_lat=1`, `_fw_did=google_advertising_id:optout`, `adid=optout`) when Fire OS reports `limit_ad_tracking=1`. `is_lat=0` is what gets local ads. Only when the requester isn't a bridge device is `is_lat` derived from GPP, and **only when `gpp_sid` is `7`**.
+- **`is_lat`, `_fw_did`, `adid` and `comscore_device` come from the playback device** (bridge device matched by request IP), built as in `device_ad_flags()`. Fire TV: `google_advertising_id:<Fire OS advertising_id>` + `adid` + `is_lat=0`; limited tracking: the opted-out form (`is_lat=1`, `_fw_did=google_advertising_id:optout`, `adid=optout`) when Fire OS reports `limit_ad_tracking=1`. `is_lat=0` is what gets local ads. Only when the requester isn't a bridge device is `is_lat` derived from GPP, and **only when `gpp_sid` is `7`**.
 - Yospace URLs need `yospace.pool=livepause`; without it Yospace answers 503.
 - DAI params are merged with exact-key dedup: a key already in the URL is never duplicated or overridden.
 - Changing the toggle must clear the cached playback URLs.

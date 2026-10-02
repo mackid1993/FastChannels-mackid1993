@@ -39,10 +39,10 @@ from app.config_store import persist_source_cache_updates  # noqa: E402,F401
 # DAI off, and upstream can rename them without any textual conflict in the patch.
 assert callable(getattr(BaseScraper, '_update_cache', None)), 'BaseScraper._update_cache is gone'
 assert isinstance(inspect.getattr_static(BaseScraper, 'cache'), property), 'BaseScraper.cache is no longer a property'
-assert {'dai', 'dai_extra'} <= set(inspect.signature(directv._fetch_channel_playback).parameters), \
-    '_fetch_channel_playback lost its dai/dai_extra parameters'
+assert 'dai' in inspect.signature(directv._fetch_channel_playback).parameters, \
+    '_fetch_channel_playback lost its dai parameter'
 resolve_src = inspect.getsource(directv.DirectvScraper.resolve)
-for hook in ('directv_dai.cached_url_usable(', 'directv_dai.request_flags(', 'dai=directv_dai.enabled('):
+for hook in ('directv_dai.cached_url_usable(', 'dai=directv_dai.request_flags('):
     assert hook in resolve_src, f'resolve() is missing the {hook} hook'
 save_src = inspect.getsource(api_sources.save_source_config)
 assert 'directv_dai.clear_cache_if_toggled(' in save_src, 'save_source_config lost the cache-clear hook'
@@ -87,8 +87,8 @@ assert 'directv_dai.android_auth_request(' in inspect.getsource(directv._fetch_c
 # channel/v2's streamUrls groups map to the stream (DAI) and fallback (Data Center) URLs.
 v2pb = {'streamUrls': [{'groupName': 'DAI', 'URLs': ['https://x.yospace.com/csm/a.m3u8?a=1', 'https://y.yospace.com/b']},
                        {'groupName': 'Data Center', 'URLs': ['https://cdn.example/c.m3u8']}]}
-assert dai.pick_stream_url(v2pb, True, None) == 'https://x.yospace.com/csm/a.m3u8?a=1&yospace.pool=livepause'
-assert dai.pick_stream_url(v2pb, False, None) == 'https://cdn.example/c.m3u8'
+assert dai.pick_stream_url(v2pb, {'e': 'prod'}) == 'https://x.yospace.com/csm/a.m3u8?a=1&yospace.pool=livepause&e=prod'
+assert dai.pick_stream_url(v2pb, None) == 'https://cdn.example/c.m3u8'
 assert dai.enabled({'use_dai': 'true'}) is True
 assert dai.enabled({'use_dai': False}) is False
 assert dai.enabled(None) is False
@@ -133,17 +133,30 @@ assert 'com.att.tv' in base64.b64decode(query.get('yo.vm', '')).decode(), \
     "yo.vm must carry the Android TV app's ad-macro map (APPBUNDLE com.att.tv)"
 assert query.get('attnid') == 'dfw003' and query.get('p') == 'dfw', 'DirecTV app constants missing'
 assert query.get('metr') == '1071', "metr must be DirecTV's TV device-class code"
-assert 'comscore_device' not in query, 'no minted comScore device id'
+assert 'comscore_device' not in query, 'comscore_device only comes from a real bridge device'
 
-# A bridge device's own Android ID and ad-tracking setting take over from the
-# account consent: DirecTV's android_id fallback with is_lat=0 is what gets local ads.
+# A bridge device's own values take over from the account consent, exactly as the
+# Android TV app builds them (device_ad_flags). Fire TV: its Settings.Secure
+# advertising_id as google_advertising_id:<id> + adid=<id>; limited tracking: optout.
+fire = {'manufacturer': 'Amazon', 'model': 'AFTKRT', 'board': 'karat', 'release': '11',
+        'limit_ad_tracking': '0', 'advertising_id': '12345678-aaaa-bbbb-cccc-1234567890ab',
+        'android_id': 'abcdef0123456789'}
+assert dai.device_ad_flags(fire) == {'comscore_device': 'Android_Amazon_AFTKRT', 'is_lat': '0',
+    '_fw_did': 'google_advertising_id:12345678-aaaa-bbbb-cccc-1234567890ab',
+    'adid': '12345678-aaaa-bbbb-cccc-1234567890ab'}
+assert dai.device_ad_flags({**fire, 'limit_ad_tracking': '1'})['_fw_did'] == 'google_advertising_id:optout'
+shield = {'manufacturer': 'NVIDIA', 'model': 'SHIELD Android TV', 'android_id': 'abcdef0123456789'}
+assert dai.device_ad_flags(shield) == {'comscore_device': 'Android_NVIDIA_SHIELDAndroidTV', 'is_lat': '0',
+    '_fw_did': 'android_id:abcdef0123456789'}
+assert dai.device_ad_flags({}) == {}
 real_client_device = dai._client_device
-dai._client_device = lambda: {'is_lat': '0', '_fw_did': 'android_id:abcdef0123456789'}
+dai._client_device = lambda: fire
 dev = dai.build_query(config, {}, '123')
-assert dev['is_lat'] == '0' and dev['_fw_did'] == 'android_id:abcdef0123456789' and 'adid' not in dev, dev
-dev_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8?yo.up=u'}, True, dev)
+assert dev['is_lat'] == '0' and dev['adid'] == fire['advertising_id'] and dev['comscore_device'] == 'Android_Amazon_AFTKRT', dev
+assert dai.player_user_agent() == 'APP_PROJECT_NAME/5.0.136.2002113867 (Android 11; AFTKRT; karat)  PureRN/0.79.5'
+dev_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8?yo.up=u'}, dev)
 assert dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True)
-dai._client_device = lambda: {'is_lat': '0', '_fw_did': 'android_id:ffffffffffffffff'}
+dai._client_device = lambda: {**fire, 'advertising_id': 'ffffffff-ffff-ffff-ffff-ffffffffffff'}
 assert not dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True), 'another device reused a session'
 dai._client_device = real_client_device
 
@@ -159,16 +172,16 @@ assert dai.request_flags(config, None, '123')['hhid'] == 'hh-1'
 yo = 'https://x.yospace.com/csm/extlive/a/index.m3u8?yo.up=u&cdncpDevice=ABCDEF'
 plain = 'https://cdn.example/index.m3u8'
 pb = {'streamURL': yo, 'fallbackStreamUrl': plain}
-assert dai.pick_stream_url(pb, False, None) == plain, 'DAI off must use the fallback stream'
-url = dai.pick_stream_url(pb, True, {'e': 'prod', 'yo.up': 'other', 'hhid': 'a b', 'x': None})
+assert dai.pick_stream_url(pb, None) == plain, 'DAI off must use the fallback stream'
+url = dai.pick_stream_url(pb, {'e': 'prod', 'yo.up': 'other', 'hhid': 'a b', 'x': None})
 assert url.startswith(yo + '&yospace.pool=livepause'), url
 assert '&e=prod' in url, 'e=prod dropped by a substring match against cdncpDevice='
 assert url.count('yo.up=') == 1, 'an existing param was duplicated'
 assert '&hhid=a%20b' in url and '&x=' not in url
-url2 = dai.pick_stream_url(pb, True, {'_fw_did': 'android_id:abc', 'nielsen_dev_group': 'devgrp,STV'})
+url2 = dai.pick_stream_url(pb, {'_fw_did': 'android_id:abc', 'nielsen_dev_group': 'devgrp,STV'})
 assert '&_fw_did=android_id:abc' in url2 and '&nielsen_dev_group=devgrp,STV' in url2, \
     "':' and ',' must stay literal like DirecTV's clients send them"
-assert dai.pick_stream_url({'fallbackStreamUrl': plain}, True, {'e': 'prod'}) == plain
+assert dai.pick_stream_url({'fallbackStreamUrl': plain}, {'e': 'prod'}) == plain
 
 # Cached URLs are reused only under the same toggle setting.
 assert dai.cached_url_usable({'fallback_url': url, 'dai': True}, True)
@@ -185,9 +198,15 @@ dai.store_login_result(cfg, {'bearer_token': f'h.{claims}.s', 'dai_context': {'d
 assert cfg['dai_partner_profile_id'] == 'pp-9' and cfg['dai_dma_id'] == '501'
 assert not {'dai_adid', 'dai_fw_did', 'dai_comscore_device'} & set(cfg), 'random device ids minted'
 
-names = {}
-dai.note_channel(names, {'daiChannelName': ' cnn '}, '1')
-dai.note_channel(names, {'daiChannelName': ''}, '2')
-assert names == {'1': 'cnn'}
+class _Scraper:
+    def __init__(self):
+        self.cache = {}
+    def _update_cache(self, key, value):
+        self.cache[key] = value
+sc = _Scraper()
+dai.note_channel(sc, {'daiChannelName': ' cnn '}, '1')
+dai.note_channel(sc, {'daiChannelName': ''}, '2')
+assert sc.cache == {'dai_channel_names': {'1': 'cnn'}}, sc.cache
+assert 'directv_dai.note_channel(self, ' in inspect.getsource(directv.DirectvScraper)
 
 print('DAI smoke test passed.')
