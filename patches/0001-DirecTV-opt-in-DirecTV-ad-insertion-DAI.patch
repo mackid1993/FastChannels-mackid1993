@@ -16,10 +16,10 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
-index f2e5d42..336d79b 100644
+index 8e46cf7..16661d4 100644
 --- a/app/routes/api_sources.py
 +++ b/app/routes/api_sources.py
-@@ -685,6 +685,8 @@ def save_source_config(source_id):
+@@ -710,6 +710,8 @@ def save_source_config(source_id):
      db.session.commit()
      if pbs_deleted:
          _invalidate_and_refresh_xml()
@@ -608,10 +608,10 @@ index 0000000..e4e1a80
 +        from ..config_store import persist_source_cache_updates
 +        persist_source_cache_updates(source.id, {'directv_playback': {}})
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index f4183ea..42bab94 100644
+index b818ab0..caeb1bd 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
-@@ -3163,6 +3163,8 @@
+@@ -3189,6 +3189,8 @@
              'On = leave out free, ad-supported channels (DirecTV Stream numbers these 4000-4999).')}
            ${toggleHtml('use_provider_numbers', 'Use DirecTV channel numbers',
              'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). Channels that share a number get subchannels, like 213.1.')}
