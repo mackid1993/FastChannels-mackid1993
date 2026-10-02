@@ -8,11 +8,11 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |   2 +
- app/routes/directv_proxy.py      |   7 +-
+ app/routes/directv_proxy.py      |   5 +-
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 514 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 498 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   3 +
- 5 files changed, 539 insertions(+), 5 deletions(-)
+ 5 files changed, 522 insertions(+), 4 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -29,7 +29,7 @@ index f2e5d42..336d79b 100644
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..74e51ae 100644
+index e7680df..283b89d 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -58,15 +58,6 @@ index e7680df..74e51ae 100644
          status=200,
          mimetype='application/vnd.apple.mpegurl',
          headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
-@@ -375,7 +376,7 @@ def directv_browser_asset():
-     content_type = r.headers.get('Content-Type') or 'application/octet-stream'
-     if 'mpegurl' in content_type.lower() or raw_url.lower().split('?', 1)[0].endswith(('.m3u8', '.m3u')):
-         return Response(
--            _rewrite_directv_browser_playlist(r.text, r.url),
-+            _rewrite_directv_browser_playlist(directv_dai.stereo_ads(r.text), r.url),
-             status=r.status_code,
-             mimetype='application/vnd.apple.mpegurl',
-             headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
 index e796bf3..86a5067 100644
 --- a/app/scrapers/directv.py
@@ -189,10 +180,10 @@ index e796bf3..86a5067 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..2eac260
+index 0000000..52ba694
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,498 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -316,22 +307,6 @@ index 0000000..2eac260
 +            continue
 +        out.append(ln)
 +    return '\n'.join(out) + ('\n' if master.endswith('\n') else '')
-+
-+# Inserted ads' AC-3 renditions are often encoded band-limited (~7 kHz) while the
-+# same ad's stereo AAC rendition is full range. In an AC-3 media playlist, point
-+# each inserted-ad segment (and its init segment) at the ad's AAC rendition, so
-+# programming stays 5.1 and ads play in stereo. Ad files follow one naming
-+# scheme on DirecTV's ad CDN: .../u-<profile>-c-384-<n>-<seq|i>.mp4 (AC-3) and
-+# .../u-<profile>-a-96-<n>-<seq|i>.mp4 (HE-AAC).
-+_AD_AC3_RE = re.compile(r'(yospace\d*-directv\.akamaized\.net/[^"\s?]*/u-\d+-)c-384(-\d+-(?:\d+|i)\.mp4)')
-+
-+
-+def stereo_ads(playlist: str) -> str:
-+    """Swap inserted-ad AC-3 segments for the same ad's AAC segments in a media
-+    playlist. Programming segments and every other playlist pass through."""
-+    if '#EXTINF' not in (playlist or '') or 'c-384' not in playlist:
-+        return playlist
-+    return _AD_AC3_RE.sub(r'\1a-96\2', playlist)
 +
 +def enabled(config: dict | None) -> bool:
 +    return str((config or {}).get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}

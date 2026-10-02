@@ -30,10 +30,6 @@ When changing this code, keep that goal ahead of convenience:
 
 "Surround sound (Dolby 5.1)", on by default. Off strips the AC-3/E-AC-3 renditions from the master playlist FastChannels hands bridge sticks (`browser.m3u8`), so the stick plays DirecTV's stereo HE-AAC track (`mp4a.40.5`, 96 kbps). That's exactly what an Osprey plays with Dolby off: verified, it decodes with `c2.android.aac.decoder` at 48 kHz stereo. It skips Dolby's turn-down to reference level and the 5.1-to-stereo fold-down (stereo is ~4–6 dB louder), and avoids the 7 kHz AC-3 ad renditions. It works with DAI on or off, but not when Channels plays the DirecTV URL itself.
 
-## Stereo for inserted ads
-
-With Surround on, the relay rewrites each AC-3 media playlist so inserted-ad segments (`yospace01-directv.akamaized.net/.../u-<profile>-c-384-<n>-<seq|i>.mp4`) point at the same ad's AAC rendition (`...-a-96-...`). Programming stays 5.1; ads play their full-range stereo audio instead of the often 7 kHz AC-3 encode. Verified 2026-10-01: Briumvi, inserted, AC-3 at 384 kbps, measured 7.1 kHz even with the Android TV app's full request.
-
 ## The DAI patch in one paragraph
 
 The opt-in "Use DirecTV ad insertion (DAI)" toggle makes DirecTV playback use `streamURL` (a Yospace server-side ad-insertion session) instead of `fallbackStreamUrl`, adds `yospace.pool=livepause` (Yospace answers 503 without it), and adds the ad flags DirecTV's own Android TV app sends. Nearly all of it lives in `app/scrapers/directv_dai.py`; upstream files get about 15 one-line hooks.
