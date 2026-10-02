@@ -40,7 +40,7 @@ It adds an opt-in DirecTV source setting, **Use DirecTV ad insertion (DAI)** (`u
 
 Nearly all of it lives in **`app/scrapers/directv_dai.py`**, a file upstream doesn't have, so it can't conflict:
 
-- `CONFIG_FIELD`, `enabled()`: the DAI toggle. `SURROUND_FIELD`, `CONFIG_FIELDS`, `strip_surround()`: the Surround sound toggle; off removes the AC-3/E-AC-3 renditions from the bridge's master playlist so the stick plays DirecTV's stereo track.
+- `CONFIG_FIELD`, `enabled()`: the DAI toggle. `SURROUND_FIELD`, `CONFIG_FIELDS`, `strip_surround()`, `_client_dolby_passthrough()`: the Surround sound toggle. It follows DirecTV's own rule: AC-3 only when the bridge device passes Dolby through, otherwise the stereo track; off means always stereo.
 - `pick_stream_url()`: chooses `streamURL` when DAI is on, appends `yospace.pool=livepause`, and merges the DAI query with exact-key dedup.
 - `cached_url_usable()`: a cached URL is reused only under the same toggle setting and, with DAI on, only for the same playback device (its `_fw_did` is in the URL).
 - `_CLIENT_PARAMS`: the Android TV app's fixed flags (`d=android_tv`, Nielsen/comScore Android TV values, app constants, Yospace flags).

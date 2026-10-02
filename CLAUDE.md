@@ -26,9 +26,11 @@ When changing this code, keep that goal ahead of convenience:
 - Don't send fabricated ad-view or measurement data.
 - Don't do anything to skip or suppress ads.
 
-## Surround sound toggle
+## Surround sound toggle (follows DirecTV's audio rule)
 
-"Surround sound (Dolby 5.1)", on by default. Off strips the AC-3/E-AC-3 renditions from the master playlist FastChannels hands bridge sticks (`browser.m3u8`), so the stick plays DirecTV's stereo HE-AAC track (`mp4a.40.5`, 96 kbps). That's exactly what an Osprey plays with Dolby off: verified, it decodes with `c2.android.aac.decoder` at 48 kHz stereo. It skips Dolby's turn-down to reference level and the 5.1-to-stereo fold-down (stereo is ~4–6 dB louder), and avoids the 7 kHz AC-3 ad renditions. It works with DAI on or off, but not when Channels plays the DirecTV URL itself.
+"Surround sound (Dolby 5.1)", on by default, applies DirecTV's own rule for bridge sticks: **AC-3 only when the device passes Dolby through over HDMI; otherwise stereo.** The Android TV app drops AC-3 unless `AudioCapabilities` supports passthrough (on Fire TV that's `external_surround_sound_enabled`); the Osprey drops it unless its HDMI sink reports surround. Both decode stereo HE-AAC on a PCM-only output. A FastChannels Player stick with Dolby output off would otherwise decode AC-3 itself (`c2.dolby.ac3.decoder`) and fold it to stereo, which DirecTV's apps never do. That's where inserted ads' AC-3 encodes (often at AC-3's minimum ~6.84 kHz bandwidth) came out muffled, while the Osprey passes AC-3 to its hardware decoder.
+
+How: `strip_surround()` removes the AC-3/E-AC-3 renditions from the bridge's master playlist when the requesting bridge device has no Dolby passthrough. It checks over adb, cached an hour: Fire OS `external_surround_sound_enabled`, otherwise `encoded_surround_output == 2`. Off = always stereo. Non-bridge requests are untouched. LinkPi encoders are PCM-only, so this setup always gets stereo, exactly like an Osprey with Dolby off (verified: `c2.android.aac.decoder`, 48 kHz stereo).
 
 ## The DAI patch in one paragraph
 

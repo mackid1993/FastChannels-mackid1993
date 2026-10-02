@@ -74,6 +74,13 @@ stereo = dai.strip_surround(master, {'surround_audio': 'false'})
 assert 'ac-3' not in stereo and 'AC3-384kbps' not in stereo and stereo.count('#EXT-X-STREAM-INF') == 1, stereo
 assert 'aac.m3u8' in stereo and stereo.rstrip().endswith('v.m3u8')
 assert dai.strip_surround(master, {}) == master, 'surround must default to on'
+# DirecTV's rule: with surround on, a bridge device without Dolby passthrough gets stereo.
+real_dolby = dai._client_dolby_passthrough
+dai._client_dolby_passthrough = lambda: False
+assert 'ac-3' not in dai.strip_surround(master, {}), 'PCM-only bridge device was offered AC-3'
+dai._client_dolby_passthrough = lambda: True
+assert dai.strip_surround(master, {}) == master, 'Dolby-passthrough device lost AC-3'
+dai._client_dolby_passthrough = real_dolby
 dolby_only = master.replace('mp4a.40.5', 'ac-3')
 assert dai.strip_surround(dolby_only, {'surround_audio': 'false'}) == dolby_only, 'stripped every variant'
 assert 'directv_dai.strip_surround(' in inspect.getsource(directv_proxy.directv_browser_manifest), \
