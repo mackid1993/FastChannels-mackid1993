@@ -89,36 +89,66 @@ assert callable(getattr(dtv_android, 'refresh_in_place', None)), 'the inline tun
 assert 'dtv_android.refresh_in_place(' in inspect.getsource(directv.DirectvScraper.resolve), \
     'resolve() no longer refreshes inline + retries on an expired token, so a tune can fail instead of recovering'
 
-# The relay sends the DirecTV app's own User-Agent, built from the bridge device's
-# build properties (never the bare Custom-Exoplayer fallback, which stopped ad insertion).
-assert not hasattr(dai, 'PLAYER_USER_AGENT'), 'the fixed Custom-Exoplayer User-Agent is back'
-assert dai._APP_USER_AGENT.format(release='11', model='AFTKRT', board='karat') == \
+# The Android-TV client logic (device reading, app UA, channel/v2 request) lives in
+# dtv_android so the Android login is portable; directv_dai (DAI) depends on it, never
+# the reverse. keep_drm_session was reverted (it broke ad targeting).
+assert 'directv_dai.' not in inspect.getsource(dtv_android) and 'import directv_dai' not in inspect.getsource(dtv_android), \
+    'dtv_android must not depend on directv_dai (portable Android login; DAI depends on it)'
+assert not hasattr(dai, 'player_headers') and not hasattr(dai, 'android_auth_request') and not hasattr(dai, 'keep_drm_session'), \
+    'Android-TV client logic (and the reverted keep_drm_session) must not live in directv_dai'
+assert 'keep_drm_session' not in inspect.getsource(directv_proxy.directv_browser_asset), \
+    'keep_drm_session hook must be gone from the relay (reverted — it broke ad targeting)'
+assert all(callable(getattr(dtv_android, n, None)) for n in ('_client_device', 'player_headers', 'android_auth_request')), \
+    'the Android-TV client logic did not move into dtv_android'
+# The relay sends the DirecTV app's own User-Agent, built from the bridge device's build
+# properties (never the bare Custom-Exoplayer fallback, which stopped ad insertion).
+assert not hasattr(dtv_android, 'PLAYER_USER_AGENT'), 'the fixed Custom-Exoplayer User-Agent is back'
+assert dtv_android._APP_USER_AGENT.format(release='11', model='AFTKRT', board='karat') == \
     'APP_PROJECT_NAME/5.0.136.2002113867 (Android 11; AFTKRT; karat)  PureRN/0.79.5'
-assert dai.player_headers() == {}, 'outside a request there is no device to build a User-Agent for'
+assert dtv_android.player_headers() == {}, 'outside a request there is no device to build a User-Agent for'
 for fn in (directv_proxy.directv_browser_manifest, directv_proxy.directv_browser_asset):
-    assert 'directv_dai.player_headers()' in inspect.getsource(fn), f'{fn.__name__} no longer sends the device User-Agent'
-# keep_drm_session drops Yospace's EXT-X-KEY:METHOD=NONE on clear ad segments so the
-# player keeps its secure decoders through the ad (mirrors the app's
-# setUseDrmSessionsForClearContent) — the fix for muffled inserted-ad audio.
-assert callable(getattr(dai, 'keep_drm_session', None)), 'keep_drm_session (the DRM-session rewrite) is missing'
-assert 'directv_dai.keep_drm_session(' in inspect.getsource(directv_proxy.directv_browser_asset), \
-    'the relay no longer keeps the DRM session through inserted ads'
-_pl = '#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://x",KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"\nseg1.m4s\n#EXT-X-KEY:METHOD=NONE\nad1.mp4\n'
-assert '#EXT-X-KEY:METHOD=NONE' not in dai.keep_drm_session(_pl), 'METHOD=NONE not dropped on a Widevine stream'
-assert 'SAMPLE-AES' in dai.keep_drm_session(_pl), 'the channel key tag was dropped too'
-assert dai.keep_drm_session('#EXTM3U\n#EXT-X-KEY:METHOD=NONE\nseg.mp4\n') == '#EXTM3U\n#EXT-X-KEY:METHOD=NONE\nseg.mp4\n', \
-    'a non-Widevine playlist must be left unchanged'
+    assert 'dtv_android.player_headers()' in inspect.getsource(fn), f'{fn.__name__} no longer sends the device User-Agent'
+# AAC ad swap: each inserted AC-3 ad (segment + its own EXT-X-MAP init) is rewritten to
+# the creative's full-range HE-AAC twin; live (dfwlive-*) content is untouched; the clear
+# ads keep METHOD=NONE.
+from app.scrapers import dtv_aac_ads  # noqa: E402
+_aac_pl = (
+    '#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n'
+    '#EXT-X-MAP:URI="https://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/u-6600-c-384-1-i.mp4"\n'
+    'https://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/u-6600-c-384-1-0.mp4\n'
+    'https://dfwlive-v2-c0p7-ms.directv.fastly-edge.com/live/seg-1.mp4\n'
+)
+_aac_out = dtv_aac_ads.swap_muffled_ads(_aac_pl)
+assert 'u-6600-a-96-1-i.mp4' in _aac_out and 'u-6600-a-96-1-0.mp4' in _aac_out, 'inserted AC-3 ad (and its init) not swapped to the AAC twin'
+assert 'u-6600-c-384' not in _aac_out, 'an AC-3 ad rendition survived the swap'
+assert 'dfwlive-v2-c0p7-ms.directv.fastly-edge.com/live/seg-1.mp4' in _aac_out, 'live content must not be touched'
+assert dtv_aac_ads.swap_muffled_ads(_aac_pl).count('a-96') == 2, 'exactly the ad segment and its init should flip'
+assert dtv_aac_ads.swap_muffled_ads('#EXTM3U\nhttps://dfwlive/live/s.mp4\n') == '#EXTM3U\nhttps://dfwlive/live/s.mp4\n', 'a playlist with no inserted AC-3 ad must be unchanged'
+assert 'dtv_aac_ads.swap_muffled_ads(' in inspect.getsource(directv_proxy.directv_browser_asset), \
+    'the relay no longer swaps muffled inserted ads for their AAC twin'
 # With DAI on, authorization is the Android TV app's request: channel/v2, no browser
 # Origin/Referer, the app's query. DAI off leaves the web request untouched.
 class _S:
     headers = {'Origin': 'o', 'Referer': 'r', 'User-Agent': 'web'}
 _p = {'ccid': '1', 'timeShiftEnabled': 'true', 'dualManifest': 'false', 'daiEnabled': 'true'}
-assert dai.android_auth_request(_S, _p, True, 'v1-url').endswith('/channel/v2')
+assert dtv_android.android_auth_request(_S, _p, True, 'v1-url').endswith('/channel/v2')
 assert 'Origin' not in _S.headers and 'Referer' not in _S.headers, _S.headers
 assert 'timeShiftEnabled' not in _p and 'dualManifest' not in _p and _p['startOver'] == 'false', _p
 _p2 = {'timeShiftEnabled': 'true'}
-assert dai.android_auth_request(_S, _p2, False, 'v1-url') == 'v1-url' and _p2 == {'timeShiftEnabled': 'true'}
-assert 'directv_dai.android_auth_request(' in inspect.getsource(directv._fetch_channel_playback)
+assert dtv_android.android_auth_request(_S, _p2, False, 'v1-url') == 'v1-url' and _p2 == {'timeShiftEnabled': 'true'}
+assert 'dtv_android.android_auth_request(' in inspect.getsource(directv._fetch_channel_playback)
+
+# No stored credentials: the Android TV device-code grant is approved in a browser, so the
+# config schema has no username/password and "configured" means a captured session.
+assert not any(getattr(f, 'key', None) in ('username', 'password') for f in directv.DirectvScraper.config_schema), \
+    'DirecTV should no longer have username/password config fields'
+from app.source_config import is_source_config_complete  # noqa: E402
+assert is_source_config_complete('directv', directv.DirectvScraper, {'bearer_token': 'x'}) is True, \
+    '"configured" must mean a captured session'
+assert is_source_config_complete('directv', directv.DirectvScraper, {}) is False, 'no session must read as not configured'
+assert callable(getattr(api_sources, 'directv_logout', None)), 'the DirecTV logout endpoint is missing'
+assert 'username and password must be saved first' not in inspect.getsource(api_sources.directv_auto_login), \
+    'auto-login must not require stored credentials (the device-code grant needs none)'
 # channel/v2's streamUrls groups map to the stream (DAI) and fallback (Data Center) URLs.
 v2pb = {'streamUrls': [{'groupName': 'DAI', 'URLs': ['https://x.yospace.com/csm/a.m3u8?a=1', 'https://y.yospace.com/b']},
                        {'groupName': 'Data Center', 'URLs': ['https://cdn.example/c.m3u8']}]}
@@ -186,17 +216,17 @@ shield = {'manufacturer': 'NVIDIA', 'model': 'SHIELD Android TV', 'android_id': 
 assert dai.device_ad_flags(shield) == {'comscore_device': 'Android_NVIDIA_SHIELDAndroidTV', 'is_lat': '0',
     '_fw_did': 'android_id:abcdef0123456789'}
 assert dai.device_ad_flags({}) == {}
-assert 'advertising_id' not in dict(dai._DEVICE_PROPS), 'no device reads a platform advertising id'
-real_client_device = dai._client_device
-dai._client_device = lambda: fire
+assert 'advertising_id' not in dict(dtv_android._DEVICE_PROPS), 'no device reads a platform advertising id'
+real_client_device = dtv_android._client_device
+dtv_android._client_device = lambda: fire
 dev = dai.build_query(config, {}, '123')
 assert dev['is_lat'] == '0' and 'adid' not in dev and dev['comscore_device'] == 'Android_Amazon_AFTKRT', dev
-assert dai.player_user_agent() == 'APP_PROJECT_NAME/5.0.136.2002113867 (Android 11; AFTKRT; karat)  PureRN/0.79.5'
+assert dtv_android.player_user_agent() == 'APP_PROJECT_NAME/5.0.136.2002113867 (Android 11; AFTKRT; karat)  PureRN/0.79.5'
 dev_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8?yo.up=u'}, dev)
 assert dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True)
-dai._client_device = lambda: {**fire, 'android_id': 'ffffffffffffffff'}
+dtv_android._client_device = lambda: {**fire, 'android_id': 'ffffffffffffffff'}
 assert not dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True), 'another device reused a session'
-dai._client_device = real_client_device
+dtv_android._client_device = real_client_device
 
 # Sessions always use a device's saved values (a stable identity). A new device is
 # read right away; known devices are re-checked in the background and the saved
@@ -209,30 +239,30 @@ class _SyncThread:  # run background re-checks inline so the test is determinist
     def start(self):
         self.target(*self.args)
 _tmp = tempfile.mkdtemp()
-_orig = (dai._bridge_address, dai._read_device, dai._devices_file)
-_orig_thread = dai.threading.Thread
-dai.threading.Thread = _SyncThread
-dai._bridge_address = lambda ip: '10.0.0.9:5555'
-dai._devices_file = lambda: os.path.join(_tmp, 'devices.json')
+_orig = (dtv_android._bridge_address, dtv_android._read_device, dtv_android._devices_file)
+_orig_thread = dtv_android.threading.Thread
+dtv_android.threading.Thread = _SyncThread
+dtv_android._bridge_address = lambda ip: '10.0.0.9:5555'
+dtv_android._devices_file = lambda: os.path.join(_tmp, 'devices.json')
 reset = {**fire, 'android_id': 'ffffffffffffffff'}
 _ctx = Flask('t').test_request_context(environ_base={'REMOTE_ADDR': '10.0.0.9'})
 with _ctx:
-    dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: dict(fire)
-    assert dai._client_device() == fire, 'new device not read'
-    assert dai._saved_devices() == {'10.0.0.9:5555': fire}, 'new device not saved'
-    dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: {}
-    assert dai._client_device() == fire and dai._saved_devices()['10.0.0.9:5555'] == fire, \
+    dtv_android._DEVICE_CACHE.clear(); dtv_android._read_device = lambda a: dict(fire)
+    assert dtv_android._client_device() == fire, 'new device not read'
+    assert dtv_android._saved_devices() == {'10.0.0.9:5555': fire}, 'new device not saved'
+    dtv_android._DEVICE_CACHE.clear(); dtv_android._read_device = lambda a: {}
+    assert dtv_android._client_device() == fire and dtv_android._saved_devices()['10.0.0.9:5555'] == fire, \
         'a failed re-check changed the saved identity'
-    dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: dict(reset)
-    assert dai._client_device() == fire, 'the session must use the saved values, not wait for the re-check'
-    assert dai._saved_devices()['10.0.0.9:5555'] == reset, 'a reset device (new Android ID) was not updated'
-    dai._DEVICE_CACHE.clear()
-    assert dai._client_device() == reset, 'the updated identity is not used afterwards'
-    os.remove(dai._devices_file()); dai._DEVICE_CACHE.clear(); dai._read_device = lambda a: {}
-    assert dai._client_device() == {}, 'device values invented with nothing saved and no read'
-dai.threading.Thread = _orig_thread
-dai._bridge_address, dai._read_device, dai._devices_file = _orig
-dai._DEVICE_CACHE.clear()
+    dtv_android._DEVICE_CACHE.clear(); dtv_android._read_device = lambda a: dict(reset)
+    assert dtv_android._client_device() == fire, 'the session must use the saved values, not wait for the re-check'
+    assert dtv_android._saved_devices()['10.0.0.9:5555'] == reset, 'a reset device (new Android ID) was not updated'
+    dtv_android._DEVICE_CACHE.clear()
+    assert dtv_android._client_device() == reset, 'the updated identity is not used afterwards'
+    os.remove(dtv_android._devices_file()); dtv_android._DEVICE_CACHE.clear(); dtv_android._read_device = lambda a: {}
+    assert dtv_android._client_device() == {}, 'device values invented with nothing saved and no read'
+dtv_android.threading.Thread = _orig_thread
+dtv_android._bridge_address, dtv_android._read_device, dtv_android._devices_file = _orig
+dtv_android._DEVICE_CACHE.clear()
 
 # Values that weren't sourced from the account are omitted, never invented.
 bare = dai.build_query({}, {}, '123')
