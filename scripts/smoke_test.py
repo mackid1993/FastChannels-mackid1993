@@ -89,6 +89,16 @@ v2pb = {'streamUrls': [{'groupName': 'DAI', 'URLs': ['https://x.yospace.com/csm/
 assert dai.pick_stream_url(v2pb, True, None) == 'https://x.yospace.com/csm/a.m3u8?a=1&yospace.pool=livepause'
 assert dai.pick_stream_url(v2pb, False, None) == 'https://cdn.example/c.m3u8'
 assert 'directv_dai.channel_auth_url(' in inspect.getsource(directv._fetch_channel_playback), 'channel auth no longer goes through channel_auth_url'
+# With DAI on, the authorization request is the Android TV app's, not the web player's.
+class _S:
+    headers = {'Origin': 'o', 'Referer': 'r', 'User-Agent': 'web'}
+_p = {'ccid': '1', 'timeShiftEnabled': 'true', 'dualManifest': 'false', 'daiEnabled': 'true'}
+dai.android_auth_request(_S, _p, True)
+assert 'Origin' not in _S.headers and 'Referer' not in _S.headers, _S.headers
+assert 'timeShiftEnabled' not in _p and 'dualManifest' not in _p and _p['startOver'] == 'false', _p
+_p2 = {'timeShiftEnabled': 'true'}; dai.android_auth_request(_S, _p2, False)
+assert _p2 == {'timeShiftEnabled': 'true'}, 'DAI off must leave the web request alone'
+assert 'directv_dai.android_auth_request(' in inspect.getsource(directv._fetch_channel_playback)
 assert dai.enabled({'use_dai': 'true'}) is True
 assert dai.enabled({'use_dai': False}) is False
 assert dai.enabled(None) is False

@@ -74,6 +74,7 @@ check $d "_update_cache('dai_channel_names'"
 check $d "directv_dai.cached_url_usable("
 check $d "directv_dai.request_flags("
 check $d "directv_dai.channel_auth_url("
+check $d "directv_dai.android_auth_request("
 # Two callers pass dai=: resolve() and the license path.
 [ "$(grep -cE -- 'dai=directv_dai\.enabled\(' $d)" -ge 2 ] \
     || { echo "::error file=$d::missing DAI hook: dai=directv_dai.enabled(...) in resolve() and the license path"; missing=1; }
