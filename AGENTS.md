@@ -41,9 +41,9 @@ It adds an opt-in DirecTV source setting, **Use DirecTV ad insertion (DAI)** (`u
 Nearly all of it lives in **`app/scrapers/directv_dai.py`**, a file upstream doesn't have, so it can't conflict:
 
 - `CONFIG_FIELD`, `CONFIG_FIELDS`, `enabled()`: the DAI toggle.
-- `player_user_agent()`, `_APP_USER_AGENT`: the DirecTV Android TV app's own User-Agent (`APP_PROJECT_NAME/5.0.136.2002113867 (Android <release>; <model>; <board>)  PureRN/0.79.5`), built from the requesting bridge device's `getprop` values over adb and cached an hour. The relay sends it on the bridge master fetch and every relayed playlist and segment; requests from anything else keep the old UAs.
-- `channel_auth_url()`, `_v2_playback()`: with DAI on, channel authorization goes to `channel/v2` (the Android TV app's endpoint) instead of `channel/v1`; its `playbackData.streamUrls` groups (`DAI`, `Data Center`) are mapped to v1's `streamURL`/`fallbackStreamUrl`, first URL of each.
-- `android_auth_request()`: with DAI on, the channel authorization request matches the Android TV app's: no browser `Origin`/`Referer`, the device's app User-Agent, and the app's query (`startOver=false`, no `timeShiftEnabled`/`dualManifest`).
+- `player_headers()`, `player_user_agent()`, `_APP_USER_AGENT`: the DirecTV Android TV app's own User-Agent (`APP_PROJECT_NAME/5.0.136.2002113867 (Android <release>; <model>; <board>)  PureRN/0.79.5`), built from the requesting bridge device's `getprop` values over adb and cached an hour. The relay sends it on the bridge master fetch and every relayed playlist and segment; requests from anything else keep the old UAs.
+- `_v2_playback()`: maps channel/v2's `playbackData.streamUrls` groups (`DAI`, `Data Center`) to v1's `streamURL`/`fallbackStreamUrl`, first URL of each; `pick_stream_url()` accepts either shape.
+- `android_auth_request()`: with DAI on, makes the channel authorization the Android TV app's request: `channel/v2` (returned as the URL to call), no browser `Origin`/`Referer`, the device's app User-Agent, and the app's query (`startOver=false`, no `timeShiftEnabled`/`dualManifest`). DAI off returns the v1 URL and changes nothing.
 - `pick_stream_url()`: chooses `streamURL` when DAI is on, appends `yospace.pool=livepause`, and merges the DAI query with exact-key dedup.
 - `cached_url_usable()`: a cached URL is reused only under the same toggle setting and, with DAI on, only for the same playback device (its `_fw_did` is in the URL).
 - `_CLIENT_PARAMS`: the Android TV app's fixed flags (`d=android_tv`, Nielsen/comScore Android TV values, app constants, Yospace flags).
@@ -65,7 +65,7 @@ Upstream's files only get one-line hooks, and `scripts/validate.sh` checks every
   - The scrape collects `dai_channel_names` and caches it.
   - `resolve()` uses `cached_url_usable()` and passes `request_flags()`; the license path passes `dai=`.
 - `app/routes/api_sources.py`: calls `clear_cache_if_toggled()` after saving a source's config.
-- `app/routes/directv_proxy.py`: imports `directv_dai`, sends `directv_dai.player_user_agent()` on the master fetch and the `browser-asset` relay (falling back to the old UAs), runs relayed media playlists through `directv_dai.keep_drm_session()` (keeps the Widevine key in force through inserted ads, like the Android TV app's `setUseDrmSessionsForClearContent`), and has `'yospace.com'` in `_DIRECTV_BROWSER_CDN_SUFFIXES`, so DAI playlists and segments go through the same `browser-asset` relay as non-DAI streams.
+- `app/routes/directv_proxy.py`: imports `directv_dai`, sends `directv_dai.player_headers()` on the master fetch and the `browser-asset` relay (falling back to the old UAs), and has `'yospace.com'` in `_DIRECTV_BROWSER_CDN_SUFFIXES`, so DAI playlists and segments go through the same `browser-asset` relay as non-DAI streams.
 - `app/templates/admin/sources.html`: the toggle in `renderDirectvConfig`.
 
 When resolving a conflict in upstream's files, the fix is almost always to put the hook back where upstream's new code needs it.

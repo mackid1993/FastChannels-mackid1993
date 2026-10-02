@@ -1,4 +1,4 @@
-From ae0e36a13a658ed296e30440581b9d98dd58fcc0 Mon Sep 17 00:00:00 2001
+From aac0f4ff96a244d3a4bd351f0bd7aa50c9bfe999 Mon Sep 17 00:00:00 2001
 From: mackid1993 <david@brustein.net>
 Date: Sun, 27 Sep 2026 21:15:53 -0400
 Subject: [PATCH] DirecTV: opt-in DirecTV ad insertion (DAI)
@@ -8,11 +8,11 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |   2 +
- app/routes/directv_proxy.py      |  10 +-
- app/scrapers/directv.py          |  21 +-
- app/scrapers/directv_dai.py      | 549 +++++++++++++++++++++++++++++++
+ app/routes/directv_proxy.py      |   7 +-
+ app/scrapers/directv.py          |  20 +-
+ app/scrapers/directv_dai.py      | 535 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   2 +
- 5 files changed, 577 insertions(+), 7 deletions(-)
+ 5 files changed, 560 insertions(+), 6 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -29,7 +29,7 @@ index f2e5d42..336d79b 100644
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..41f1463 100644
+index e7680df..dae0703 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -49,36 +49,26 @@ index e7680df..41f1463 100644
  )
  
  
-@@ -320,7 +321,8 @@ def directv_browser_manifest(channel_id: str):
+@@ -320,7 +321,7 @@ def directv_browser_manifest(channel_id: str):
      scraper = scraper_cls(channel.source.config or {})
      try:
          resolved_url = scraper.resolve(channel.stream_url)
 -        r = _requests.get(resolved_url, timeout=12)
-+        device_ua = directv_dai.player_user_agent()
-+        r = _requests.get(resolved_url, headers={'User-Agent': device_ua} if device_ua else None, timeout=12)
++        r = _requests.get(resolved_url, headers=directv_dai.player_headers(), timeout=12)
      except Exception as exc:
          logger.warning('[directv-browser] manifest fetch failed for channel=%s: %s', channel_id, exc)
          return _unavailable_response()
-@@ -363,7 +365,7 @@ def directv_browser_asset():
+@@ -363,7 +364,7 @@ def directv_browser_asset():
      if target.scheme != 'https' or not _directv_browser_cdn_allowed(target.hostname or ''):
          abort(400)
      range_header = request.headers.get('Range')
 -    headers = {'User-Agent': _BROWSER_UA}
-+    headers = {'User-Agent': directv_dai.player_user_agent() or _BROWSER_UA}
++    headers = {'User-Agent': _BROWSER_UA, **directv_dai.player_headers()}
      if range_header:
          headers['Range'] = range_header
      try:
-@@ -375,7 +377,7 @@ def directv_browser_asset():
-     content_type = r.headers.get('Content-Type') or 'application/octet-stream'
-     if 'mpegurl' in content_type.lower() or raw_url.lower().split('?', 1)[0].endswith(('.m3u8', '.m3u')):
-         return Response(
--            _rewrite_directv_browser_playlist(r.text, r.url),
-+            _rewrite_directv_browser_playlist(directv_dai.keep_drm_session(r.text), r.url),
-             status=r.status_code,
-             mimetype='application/vnd.apple.mpegurl',
-             headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
-index e796bf3..93aa8ae 100644
+index e796bf3..e624cbc 100644
 --- a/app/scrapers/directv.py
 +++ b/app/scrapers/directv.py
 @@ -84,6 +84,7 @@ except ImportError:
@@ -97,19 +87,16 @@ index e796bf3..93aa8ae 100644
  ) -> dict | None:
      """GET /right/authorization/channel/v1 for one channel — the manifest +
      playToken resolve. Used both by resolve() (via the scraper's live
-@@ -260,9 +262,10 @@ def _fetch_channel_playback(
-     }
-     if client_context:
+@@ -262,7 +264,7 @@ def _fetch_channel_playback(
          params['clientContext'] = client_context
-+    directv_dai.android_auth_request(session, params, dai)
  
      try:
 -        r = session.get(_CHANNEL_AUTH_URL, params=params, timeout=15)
-+        r = session.get(directv_dai.channel_auth_url(_CHANNEL_AUTH_URL, dai), params=params, timeout=15)
++        r = session.get(directv_dai.android_auth_request(session, params, dai, _CHANNEL_AUTH_URL), params=params, timeout=15)
      except requests.RequestException as exc:
          logger.warning('[directv] channel/v1 request failed for ccid=%s: %s', ccid, exc)
          return None
-@@ -286,7 +289,7 @@ def _fetch_channel_playback(
+@@ -286,7 +288,7 @@ def _fetch_channel_playback(
          return None
  
      pb = data.get('playbackData') or {}
@@ -118,7 +105,7 @@ index e796bf3..93aa8ae 100644
      play_token = (data.get('dRights') or {}).get('playToken')
      if not fallback_url or not play_token:
          return None
-@@ -295,6 +298,7 @@ def _fetch_channel_playback(
+@@ -295,6 +297,7 @@ def _fetch_channel_playback(
          'play_token': play_token,
          'license_content_id': _license_content_id_from_stream_url(fallback_url, ccid),
          'cached_at': time.time(),
@@ -126,7 +113,7 @@ index e796bf3..93aa8ae 100644
      }
  
  
-@@ -932,6 +936,7 @@ def capture_directv_auth_cffi(
+@@ -932,6 +935,7 @@ def capture_directv_auth_cffi(
          'cookies': [],
          'captured_at': time.time(),
          'auth_method': 'curl_cffi',
@@ -134,7 +121,7 @@ index e796bf3..93aa8ae 100644
      }
  
  
-@@ -1219,6 +1224,7 @@ def capture_directv_auth(
+@@ -1219,6 +1223,7 @@ def capture_directv_auth(
                  for c in context.cookies()
              ]
              captured['captured_at'] = time.time()
@@ -142,7 +129,7 @@ index e796bf3..93aa8ae 100644
              _status('success', 'Captured DirecTV session.')
              return captured
          finally:
-@@ -1298,6 +1304,7 @@ def run_directv_auth(
+@@ -1298,6 +1303,7 @@ def run_directv_auth(
                          cfg.pop('identity_cookie_expires_at', None)
                      if result.get('auth_method'):
                          cfg['auth_method'] = result['auth_method']
@@ -150,7 +137,7 @@ index e796bf3..93aa8ae 100644
                      source.config = cfg
                      db.session.commit()
                      persisted = True
-@@ -1382,6 +1389,7 @@ class DirectvScraper(BaseScraper):
+@@ -1382,6 +1388,7 @@ class DirectvScraper(BaseScraper):
                          'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). '
                          'Channels that share a number get subchannels, like 213.1.'
                      )),
@@ -158,7 +145,7 @@ index e796bf3..93aa8ae 100644
      ]
  
      _FAST_CHANNEL_NUMBER_RANGE = range(4000, 5000)
-@@ -1550,6 +1558,7 @@ class DirectvScraper(BaseScraper):
+@@ -1550,6 +1557,7 @@ class DirectvScraper(BaseScraper):
          channels: list[ChannelData] = []
          non_streamable = 0
          sd_collapsed = 0
@@ -166,7 +153,7 @@ index e796bf3..93aa8ae 100644
  
          # Hard failures (auth, transport, malformed payload) raise immediately
          # from _fetch_allchannels_rows() and are not retried here -- only the
-@@ -1613,6 +1622,7 @@ class DirectvScraper(BaseScraper):
+@@ -1613,6 +1621,7 @@ class DirectvScraper(BaseScraper):
                  # also contain internal channel IDs; retain resolver validation and
                  # community-map fallback rather than accepting every value.
                  external_listing_id = _pick(row, 'externalListingId')
@@ -174,7 +161,7 @@ index e796bf3..93aa8ae 100644
  
                  channels.append(ChannelData(
                      source_channel_id=ccid,
-@@ -1656,6 +1666,8 @@ class DirectvScraper(BaseScraper):
+@@ -1656,6 +1665,8 @@ class DirectvScraper(BaseScraper):
                  )
                  time.sleep(self._ELIGIBILITY_RETRY_DELAY)
  
@@ -183,7 +170,7 @@ index e796bf3..93aa8ae 100644
          if non_streamable == 0 and baseline_non_streamable >= self._MIN_TRUSTED_NON_STREAMABLE:
              raise ScrapeSkipError(
                  f'DirecTV Stream: AllChannels returned 0 non-streamable channels after '
-@@ -1897,7 +1909,7 @@ class DirectvScraper(BaseScraper):
+@@ -1897,7 +1908,7 @@ class DirectvScraper(BaseScraper):
              raise RuntimeError(f'DirecTV Stream: malformed stream_url: {raw_url}')
  
          cached = (self.cache.get('directv_playback') or {}).get(ccid)
@@ -192,7 +179,7 @@ index e796bf3..93aa8ae 100644
              return cached['fallback_url']
  
          bearer = self.config.get('bearer_token')
-@@ -1910,6 +1922,8 @@ class DirectvScraper(BaseScraper):
+@@ -1910,6 +1921,8 @@ class DirectvScraper(BaseScraper):
          try:
              result = _fetch_channel_playback(
                  bearer, self.config.get('cookies') or [], self.config.get('client_context'), ccid,
@@ -201,7 +188,7 @@ index e796bf3..93aa8ae 100644
              )
          except DirectvAuthExpiredError as exc:
              self._mark_auth_stale_and_reauth(f'channel/v1 expired token for ccid={ccid}')
-@@ -2020,6 +2034,7 @@ class DirectvScraper(BaseScraper):
+@@ -2020,6 +2033,7 @@ class DirectvScraper(BaseScraper):
              try:
                  fresh = _fetch_channel_playback(
                      bearer, config.get('cookies') or [], config.get('client_context'), channel_id,
@@ -211,10 +198,10 @@ index e796bf3..93aa8ae 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..b84c9e4
+index 0000000..b69c3d9
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,535 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -293,22 +280,6 @@ index 0000000..b84c9e4
 +
 +
 +
-+def keep_drm_session(playlist: str) -> str:
-+    """Keep the stream's DRM key in force across inserted (clear) ads in a media
-+    playlist, the server-side equivalent of what DirecTV's Android TV app does in
-+    its player (setUseDrmSessionsForClearContent): the player keeps one DRM session
-+    and one set of decoders through each ad instead of tearing them down and
-+    rebuilding them at every programming/ad boundary. Yospace marks clear ad
-+    segments with EXT-X-KEY:METHOD=NONE; dropping that marker leaves the
-+    channel's Widevine key tag applying. Ad samples carry no encryption info in
-+    their own init segments, so they still play as clear samples. Playlists
-+    without a Widevine key are returned unchanged."""
-+    if 'METHOD=NONE' not in (playlist or '') or 'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed' not in playlist.lower():
-+        return playlist
-+    lines = playlist.splitlines()
-+    out = [ln for ln in lines if not (ln.startswith('#EXT-X-KEY') and 'METHOD=NONE' in ln.upper())]
-+    return '\n'.join(out) + ('\n' if playlist.endswith('\n') else '')
-+
 +def enabled(config: dict | None) -> bool:
 +    return str((config or {}).get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
 +
@@ -321,19 +292,14 @@ index 0000000..b84c9e4
 +_CHANNEL_AUTH_V2 = 'https://api.cld.dtvce.com/right/authorization/channel/v2'
 +
 +
-+def channel_auth_url(default: str, dai: bool) -> str:
-+    """With DAI on, authorize on channel/v2 as the Android TV app does."""
-+    return _CHANNEL_AUTH_V2 if dai else default
-+
-+
-+def android_auth_request(session, params: dict, dai: bool) -> None:
++def android_auth_request(session, params: dict, dai: bool, default_url: str) -> str:
 +    """With DAI on, make the channel authorization request the Android TV app's,
 +    not the web player's: no browser Origin/Referer, the app's User-Agent for this
 +    bridge device, and its query (startOver=false; no timeShiftEnabled or
-+    dualManifest, which only the web sends). Verified to return the same stream
-+    and play token."""
++    dualManifest, which only the web sends), on channel/v2. Verified to return
++    the same stream and play token. Returns the URL to request."""
 +    if not dai:
-+        return
++        return default_url
 +    for header in ('Origin', 'Referer'):
 +        session.headers.pop(header, None)
 +    ua = player_user_agent()
@@ -342,6 +308,7 @@ index 0000000..b84c9e4
 +    params.pop('timeShiftEnabled', None)
 +    params.pop('dualManifest', None)
 +    params.setdefault('startOver', 'false')
++    return _CHANNEL_AUTH_V2
 +
 +
 +def _v2_playback(pb: dict) -> dict:
@@ -528,6 +495,12 @@ index 0000000..b84c9e4
 +# before PureRN. 5.0.136.2002113867 is the app's versionName.
 +_APP_USER_AGENT = 'APP_PROJECT_NAME/5.0.136.2002113867 (Android {release}; {model}; {board})  PureRN/0.79.5'
 +_UA_CACHE: dict[str, tuple[float, str | None]] = {}
++
++
++def player_headers() -> dict:
++    """{'User-Agent': <the DirecTV app UA>} for a bridge device, else {}."""
++    ua = player_user_agent()
++    return {'User-Agent': ua} if ua else {}
 +
 +
 +def player_user_agent() -> str | None:

@@ -73,14 +73,12 @@ check $d "directv_dai.note_channel("
 check $d "_update_cache('dai_channel_names'"
 check $d "directv_dai.cached_url_usable("
 check $d "directv_dai.request_flags("
-check $d "directv_dai.channel_auth_url("
 check $d "directv_dai.android_auth_request("
 # Two callers pass dai=: resolve() and the license path.
 [ "$(grep -cE -- 'dai=directv_dai\.enabled\(' $d)" -ge 2 ] \
     || { echo "::error file=$d::missing DAI hook: dai=directv_dai.enabled(...) in resolve() and the license path"; missing=1; }
 check app/routes/api_sources.py "directv_dai.clear_cache_if_toggled("
-check app/routes/directv_proxy.py "directv_dai.keep_drm_session("
-check app/routes/directv_proxy.py "directv_dai.player_user_agent()"
+check app/routes/directv_proxy.py "directv_dai.player_headers()"
 check app/routes/directv_proxy.py "'yospace.com',  # DAI"
 check app/templates/admin/sources.html "toggleHtml('use_dai'"
 [ "$missing" -eq 0 ]

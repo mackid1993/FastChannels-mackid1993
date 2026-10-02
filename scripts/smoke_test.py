@@ -64,41 +64,31 @@ keys = {field.key for field in directv.DirectvScraper.config_schema}
 assert 'use_dai' in keys, 'use_dai toggle missing from the DirecTV config schema'
 assert 'surround_audio' not in keys, 'the removed Surround sound toggle is back'
 
-# Inserted ads keep the channel's DRM key in force (no decoder teardown at ad boundaries).
-wv = '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="data:x",KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"'
-media = (f'#EXTM3U\n{wv}\n#EXTINF:2,\nc1.m4a\n#EXT-X-DISCONTINUITY\n#EXT-X-KEY:METHOD=NONE\n'
-         '#EXT-X-MAP:URI="ad-i.mp4"\n#EXTINF:2,\nad1.mp4\n')
-kept = dai.keep_drm_session(media)
-assert 'METHOD=NONE' not in kept and 'ad1.mp4' in kept and kept.count('SAMPLE-AES') == 1, kept
-plain = '#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:2,\na.ts\n'
-assert dai.keep_drm_session(plain) == plain, 'touched a playlist without a Widevine key'
-assert 'directv_dai.keep_drm_session(' in inspect.getsource(directv_proxy.directv_browser_asset), \
-    'the relay no longer keeps the DRM session through inserted ads'
 # The relay sends the DirecTV app's own User-Agent, built from the bridge device's
 # build properties (never the bare Custom-Exoplayer fallback, which stopped ad insertion).
 assert not hasattr(dai, 'PLAYER_USER_AGENT'), 'the fixed Custom-Exoplayer User-Agent is back'
 assert dai._APP_USER_AGENT.format(release='11', model='AFTKRT', board='karat') == \
     'APP_PROJECT_NAME/5.0.136.2002113867 (Android 11; AFTKRT; karat)  PureRN/0.79.5'
-assert dai.player_user_agent() is None, 'outside a request there is no device to build a User-Agent for'
+assert dai.player_headers() == {}, 'outside a request there is no device to build a User-Agent for'
 for fn in (directv_proxy.directv_browser_manifest, directv_proxy.directv_browser_asset):
-    assert 'directv_dai.player_user_agent()' in inspect.getsource(fn), f'{fn.__name__} no longer sends the device User-Agent'
-# DAI authorizes on channel/v2 (the Android TV app's endpoint) and reads its streamUrls groups.
-assert dai.channel_auth_url('v1-url', True).endswith('/channel/v2') and dai.channel_auth_url('v1-url', False) == 'v1-url'
+    assert 'directv_dai.player_headers()' in inspect.getsource(fn), f'{fn.__name__} no longer sends the device User-Agent'
+assert not hasattr(dai, 'keep_drm_session'), 'the removed DRM-session playlist rewrite is back'
+# With DAI on, authorization is the Android TV app's request: channel/v2, no browser
+# Origin/Referer, the app's query. DAI off leaves the web request untouched.
+class _S:
+    headers = {'Origin': 'o', 'Referer': 'r', 'User-Agent': 'web'}
+_p = {'ccid': '1', 'timeShiftEnabled': 'true', 'dualManifest': 'false', 'daiEnabled': 'true'}
+assert dai.android_auth_request(_S, _p, True, 'v1-url').endswith('/channel/v2')
+assert 'Origin' not in _S.headers and 'Referer' not in _S.headers, _S.headers
+assert 'timeShiftEnabled' not in _p and 'dualManifest' not in _p and _p['startOver'] == 'false', _p
+_p2 = {'timeShiftEnabled': 'true'}
+assert dai.android_auth_request(_S, _p2, False, 'v1-url') == 'v1-url' and _p2 == {'timeShiftEnabled': 'true'}
+assert 'directv_dai.android_auth_request(' in inspect.getsource(directv._fetch_channel_playback)
+# channel/v2's streamUrls groups map to the stream (DAI) and fallback (Data Center) URLs.
 v2pb = {'streamUrls': [{'groupName': 'DAI', 'URLs': ['https://x.yospace.com/csm/a.m3u8?a=1', 'https://y.yospace.com/b']},
                        {'groupName': 'Data Center', 'URLs': ['https://cdn.example/c.m3u8']}]}
 assert dai.pick_stream_url(v2pb, True, None) == 'https://x.yospace.com/csm/a.m3u8?a=1&yospace.pool=livepause'
 assert dai.pick_stream_url(v2pb, False, None) == 'https://cdn.example/c.m3u8'
-assert 'directv_dai.channel_auth_url(' in inspect.getsource(directv._fetch_channel_playback), 'channel auth no longer goes through channel_auth_url'
-# With DAI on, the authorization request is the Android TV app's, not the web player's.
-class _S:
-    headers = {'Origin': 'o', 'Referer': 'r', 'User-Agent': 'web'}
-_p = {'ccid': '1', 'timeShiftEnabled': 'true', 'dualManifest': 'false', 'daiEnabled': 'true'}
-dai.android_auth_request(_S, _p, True)
-assert 'Origin' not in _S.headers and 'Referer' not in _S.headers, _S.headers
-assert 'timeShiftEnabled' not in _p and 'dualManifest' not in _p and _p['startOver'] == 'false', _p
-_p2 = {'timeShiftEnabled': 'true'}; dai.android_auth_request(_S, _p2, False)
-assert _p2 == {'timeShiftEnabled': 'true'}, 'DAI off must leave the web request alone'
-assert 'directv_dai.android_auth_request(' in inspect.getsource(directv._fetch_channel_playback)
 assert dai.enabled({'use_dai': 'true'}) is True
 assert dai.enabled({'use_dai': False}) is False
 assert dai.enabled(None) is False

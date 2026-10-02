@@ -42,9 +42,9 @@ The Android TV app's bundled config authorizes channels on `right/authorization/
 
 With DAI on, `android_auth_request()` drops the web player's `Origin`/`Referer`, sends the device's app User-Agent, and sends the app's query: `ccid`, `proximity`, `clientContext`, `reserveCTicket=true`, `daiEnabled=true`, `startOver=false`, `abrEnabled=true` (from `getQueryParams` in the app bundle; the web-only `timeShiftEnabled` and `dualManifest` are dropped). Tested 2026-10-02: 200, authorized, play token present, same Yospace host and identical DAI URL parameter set as the web request.
 
-## One DRM session through inserted ads (mirrors the Android TV app)
+## Removed: one DRM session through inserted ads
 
-DirecTV's Android TV app keeps its DRM session for clear content (`ExoPlayerWrapper`: `setUseDrmSessionsForClearContent`), so its decoders aren't torn down at each programming/ad boundary. FC Player doesn't. Each inserted (clear) ad switched it from the secure to the non-secure decoders and rebuilt the AC-3 decoder, and once the Dolby decoder failed to start there. Without touching the player, the relay gets the same effect: it drops Yospace's `#EXT-X-KEY:METHOD=NONE` before ad segments (`keep_drm_session()`), so the channel's Widevine key tag keeps applying. Ad init segments have no encryption boxes, so ad samples still play clear.
+`keep_drm_session()` dropped Yospace's `#EXT-X-KEY:METHOD=NONE` so FC Player kept its secure decoders through ads (like the Android TV app's `setUseDrmSessionsForClearContent`). It worked (no decoder switch) but didn't change the ad audio, which is in DirecTV's files, so it was removed 2026-10-02 to keep only what targeting needs.
 
 ## The DAI patch in one paragraph
 
