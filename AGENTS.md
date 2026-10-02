@@ -71,14 +71,19 @@ Upstream's files get one-line hooks only. `scripts/validate.sh` checks each is p
 | `config_schema` | `*directv_dai.CONFIG_FIELDS,` | The toggle. | Keep inside the DirecTV schema list. |
 | curl_cffi login result dict | `**directv_dai.login_fields(session, bearer, token_data),` | DMA, consent, household/profile ids. | Add to the dict that path returns. |
 | Playwright login | `captured.update(directv_dai.login_fields_from_cookies(captured))` | Same for that path. | After `captured` has the bearer and cookies. |
-| `run_directv_auth()`, before commit | `directv_dai.store_login_result(cfg, result)` | Saves those values to the config. | Next to upstream's other `cfg[...] = result[...]` lines. |
+| `run_directv_auth()`, before commit | `directv_dai.store_login_result(cfg, result)` | Saves those values to the config (incl. the Android TV device id + any token expiry). | Next to upstream's other `cfg[...] = result[...]` lines. |
+| `app/scrapers/directv.py`, imports | `from . import dtv_android` | — | Keep with the other relative imports. |
+| `run_directv_auth()`, the capture call | `result = dtv_android.sign_in(source_id, username, password, app=app, on_status=_on_status)` | Sign in / refresh as DirecTV's Android TV app (device-code grant) instead of the web client. | Replace upstream's `capture_directv_auth_fast(...)` call. |
+| `license_request_headers()` | `return dtv_android.license_headers(config)` | App User-Agent, no `stream.directv.com` Origin/Referer, so the DRM device is Android TV not a browser. | Replace the returned headers dict. |
+| `_token_stale()` | `return dtv_android.token_stale(self.config)` | No fixed-timer refresh — stale only when there's no bearer (the grant token is long-lived). | Replace the time-based staleness check. |
+| `resolve()`, the expired-token `except` | `dtv_android.refresh_in_place(self)` then retry `_fetch_channel_playback(...)` once | Refresh inline and retry so a tune recovers instead of failing on an expired token. | Wrap the `DirectvAuthExpiredError` handler; fall back to the background re-auth if it returns False. |
 | `app/routes/api_sources.py`, `save_source_config()` | `directv_dai.clear_cache_if_toggled(source, old, current)` | Flushes cached URLs on toggle change. | After the config is committed. |
 | `app/routes/directv_proxy.py`, imports | `from ..scrapers import directv_dai, registry` | — | — |
 | `_DIRECTV_BROWSER_CDN_SUFFIXES` | `'yospace.com',` | Yospace playlists go through the same relay. | Keep in the relay allowlist. |
 | `directv_browser_manifest()`, master fetch | `headers=directv_dai.player_headers()` | The app's User-Agent on the request that opens the Yospace session. | On upstream's `requests.get` of the resolved URL. |
 | `directv_browser_asset()`, relay headers | `{'User-Agent': _BROWSER_UA, **directv_dai.player_headers()}` | The app's User-Agent on every playlist and segment. | Merge into whatever headers dict the relay sends. |
-| `directv_browser_manifest()`, the master rewrite | `directv_dai.stereo_downmix_master(r.text, channel.source.config)` wrapping the master-playlist rewrite | Declares DirecTV's AC-3 rendition stereo so a bridge stick emits a full-range downmix (no-op when `keep_surround` is on). | Wrap upstream's master-playlist rewrite (the one that returns the `browser.m3u8` master) in this call. |
-| `app/templates/admin/sources.html`, `renderDirectvConfig` | `toggleHtml('use_dai', ...)` and `toggleHtml('keep_surround', ...)` | The two settings in the UI. | Next to the other DirecTV toggles. |
+| `app/templates/admin/sources.html`, `renderDirectvConfig` | `toggleHtml('use_dai', ...)` | The setting in the UI. | Next to the other DirecTV toggles. |
+| `app/templates/admin/sources.html`, `_directvCheckStatus` | `_directvLinkify(detail)` on the `running` status | Makes the tvsigninv2 sign-in URL in the auth status a clickable link. | Wrap the status `detail` before it's put in `innerHTML`. |
 
 When resolving a conflict in upstream's files, the fix is almost always to put the hook back where upstream's new code needs it.
 
