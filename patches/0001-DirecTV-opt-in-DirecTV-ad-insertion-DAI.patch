@@ -10,9 +10,9 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/routes/api_sources.py        |   2 +
  app/routes/directv_proxy.py      |   5 +-
  app/scrapers/directv.py          |  18 +-
- app/scrapers/directv_dai.py      | 549 +++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 499 +++++++++++++++++++++++++++++++
  app/templates/admin/sources.html |   3 +
- 5 files changed, 573 insertions(+), 4 deletions(-)
+ 5 files changed, 523 insertions(+), 4 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
@@ -180,10 +180,10 @@ index e796bf3..86a5067 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..7c1ef25
+index 0000000..29f468c
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,499 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -262,9 +262,9 @@ index 0000000..7c1ef25
 +    'surround_audio', 'Surround sound (Dolby 5.1)',
 +    field_type='toggle', default='true',
 +    help_text=(
-+        'On = DirecTV\'s 5.1 Dolby Digital audio when the bridge device passes Dolby '
-+        'through over HDMI, stereo otherwise (DirecTV\'s own apps follow the same '
-+        'rule). Off = always stereo. Applies to FastChannels Player bridge devices.'
++        'On = DirecTV\'s 5.1 Dolby Digital audio. Off = its stereo audio, what '
++        'DirecTV\'s own boxes play with Dolby turned off. Applies to FastChannels '
++        'Player bridge devices.'
 +    ),
 +)
 +
@@ -272,19 +272,12 @@ index 0000000..7c1ef25
 +
 +
 +def strip_surround(master: str, config: dict | None) -> str:
-+    """Remove the Dolby (AC-3/E-AC-3) renditions from an HLS master playlist when
-+    the playing device shouldn't get them, so the player can only pick the stereo
-+    track. That's the rule DirecTV's own apps follow: the Android TV app drops
-+    AC-3 unless the device can pass Dolby through over HDMI, and the Osprey drops
-+    it unless its HDMI sink reports surround. A bridge stick feeding a PCM-only
-+    capture device decodes AC-3 itself instead, which DirecTV's apps never do.
-+    Surround off strips it always; surround on strips it unless the bridge device
-+    has Dolby passthrough on. Any playlist it can't safely filter (a media
-+    playlist, or one with no non-Dolby variant) is returned unchanged."""
-+    if '#EXT-X-STREAM-INF' not in (master or ''):
-+        return master
++    """With surround off, remove the Dolby (AC-3/E-AC-3) renditions from an HLS
++    master playlist so the player can only pick the stereo track. Any playlist it
++    can't safely filter (a media playlist, or one with no non-Dolby variant) is
++    returned unchanged."""
 +    value = str((config or {}).get('surround_audio', 'true')).strip().lower()
-+    if value in {'1', 'true', 'yes', 'on', ''} and _client_dolby_passthrough() is not False:
++    if value in {'1', 'true', 'yes', 'on', ''} or '#EXT-X-STREAM-INF' not in (master or ''):
 +        return master
 +    lines = master.splitlines()
 +
@@ -488,49 +481,6 @@ index 0000000..7c1ef25
 +    return {'is_lat': '0', '_fw_did': f'android_id:{android_id}'}
 +
 +
-+
-+_DOLBY_CACHE: dict[str, tuple[float, bool | None]] = {}
-+
-+
-+def _client_dolby_passthrough() -> bool | None:
-+    """Whether the bridge device making the current request passes Dolby through
-+    over HDMI (cached an hour). True/False for a known bridge device; None when the
-+    requester isn't one or adb can't tell, so non-bridge playback is untouched."""
-+    try:
-+        from flask import has_request_context, request
-+        if not has_request_context():
-+            return None
-+        ip = (request.remote_addr or '').strip()
-+    except Exception:
-+        return None
-+    if not ip:
-+        return None
-+    now = time.time()
-+    hit = _DOLBY_CACHE.get(ip)
-+    if hit and now - hit[0] < _DEVICE_TTL:
-+        return hit[1]
-+    result = None
-+    try:
-+        from .. import bridge_devices
-+        address = next((d['address'] for d in bridge_devices.known_devices()[0]
-+                        if d.get('host') == ip or d.get('address', '').split(':')[0] == ip), None)
-+        if address:
-+            def setting(ns: str, key: str) -> str:
-+                r = subprocess.run(['adb', '-s', address, 'shell', 'settings', 'get', ns, key],
-+                                   capture_output=True, text=True, timeout=8)
-+                return (r.stdout or '').strip()
-+            subprocess.run(['adb', 'connect', address], capture_output=True, timeout=8)
-+            fire = setting('global', 'external_surround_sound_enabled')  # Fire OS Dolby output
-+            if fire in ('0', '1'):
-+                result = fire == '1'
-+            else:
-+                # Android TV / Google TV: encoded surround output 2 = always pass through.
-+                result = setting('global', 'encoded_surround_output') == '2'
-+    except Exception as exc:
-+        logger.debug('[directv-dai] Dolby passthrough check failed: %s', exc)
-+        result = None
-+    _DOLBY_CACHE[ip] = (now, result)
-+    return result
 +
 +_ZIP_CACHE: dict[str, str] = {}
 +
