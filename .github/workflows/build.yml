@@ -415,38 +415,29 @@ jobs:
           git add -- $conflicted
           GIT_EDITOR=true git am --continue
 
-      - name: Static checks
+      - name: Repair any drift the merge left, then verify the full gauntlet
         if: env.HAS_KEY == 'true'
+        timeout-minutes: 60
         env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}
           UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
+          APK: ${{ needs.build.outputs.apk }}
+          CACHE_BUST: ${{ github.run_id }}
         run: |
-          pip install --quiet ruff jinja2
-          overlay/scripts/validate.sh upstream
-
-      - name: Set up Docker Buildx
-        if: env.HAS_KEY == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build the image with the fix
-        if: env.HAS_KEY == 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: upstream
-          file: upstream/Dockerfile
-          platforms: linux/amd64
-          load: true
-          tags: fastchannels:ci
-          build-args: |
-            YTDLP_REFRESH=${{ github.run_id }}
-            FC_PLAYER_APK_REFRESH=${{ needs.build.outputs.apk }}-${{ github.run_id }}
-
-      - name: Test the image with the fix
-        if: env.HAS_KEY == 'true'
-        run: |
-          docker run --rm --entrypoint sh fastchannels:ci -c 'test -s /app/fc_player_release.apk' \
-            || { echo "::error::the image has no FastChannels Player APK"; exit 1; }
-          docker run --rm -w /app -v "$PWD/overlay/scripts:/ci:ro" --entrypoint python fastchannels:ci /ci/smoke_test.py
-          overlay/scripts/boot_test.sh fastchannels:ci
+          # The conflict is already resolved and committed (git am --continue above). The shared
+          # fixer runs the whole gauntlet: if resolving the markers was enough it exits 2 (nothing
+          # more to do); if the same upstream change also drifted a non-conflicted patch file (e.g.
+          # an added module importing a renamed name) it exits 0 after the AI fixes that too; it
+          # exits 1 if it can't. Either 0 or 2 means the resolved patch now passes everything.
+          # reproduce.sh uses the runner's default Docker builder (loads into the daemon), so no
+          # buildx/container driver here — that would build without loading and break docker run.
+          set +e
+          overlay/scripts/ai_fix_drift.sh upstream overlay
+          code=$?
+          set -e
+          [ "$code" = 0 ] || [ "$code" = 2 ] \
+            || { echo "::error::the resolved patch did not pass the full gauntlet"; exit 1; }
 
       - name: Export the ported patch
         if: env.HAS_KEY == 'true'
@@ -485,7 +476,7 @@ jobs:
     permissions:
       contents: read
     outputs:
-      fixed: ${{ steps.finish.outputs.fixed }}
+      fixed: ${{ steps.repair.outputs.fixed }}
     env:
       HAS_KEY: ${{ secrets.OPENROUTER_API_KEY != '' }}
     steps:
@@ -515,10 +506,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set up Docker Buildx
-        if: env.HAS_KEY == 'true'
-        uses: docker/setup-buildx-action@v3
-
       - name: Log in to GHCR
         if: env.HAS_KEY == 'true'
         uses: docker/login-action@v3
@@ -527,136 +514,39 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Reproduce the failing check
-        id: repro
+      - name: Repair the drift and verify the full gauntlet
+        id: repair
         if: env.HAS_KEY == 'true'
+        timeout-minutes: 60
         env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}
           UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
           APK: ${{ needs.build.outputs.apk }}
           CACHE_BUST: ${{ github.run_id }}
         run: |
-          pip install --quiet ruff jinja2
+          # The patch applied cleanly but a check failed. The shared fixer reproduces the whole
+          # gauntlet, hands the AI the failing log + the patch-touched files, verifies and
+          # re-checks. 0 = a drift was reproduced and fixed (export it); 2 = nothing reproduced,
+          # so the build-job failure was transient or publish/refresh-only (export nothing); 1 =
+          # an infrastructure failure or the AI couldn't fix it. reproduce.sh uses the runner's
+          # default Docker builder (loads into the daemon), so no buildx/container driver here.
           set +e
-          out=$(overlay/scripts/reproduce.sh upstream); code=$?
-          echo "$out"
-          if [ "$code" = 10 ]; then
-            stage=$(printf '%s\n' "$out" | sed -n 's/^DRIFT_STAGE=//p' | tail -1)
-            echo "Reproduced a '$stage' drift the AI should try to fix."
-            echo "failed=true" >> "$GITHUB_OUTPUT"
-          else
-            # 20 = infrastructure/upstream (Docker or APK), 0 = transient or publish/refresh-only.
-            echo "Nothing for the AI to fix (reproduce exit $code); leaving it to the next run."
-            echo "failed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Snapshot before the AI edits
-        if: env.HAS_KEY == 'true' && steps.repro.outputs.failed == 'true'
-        run: |
-          cd upstream
-          # The editable set is exactly the files the patch touches. Everything the AI changes
-          # must stay inside it (checked after).
-          git diff --name-only "${{ needs.build.outputs.sha }}" HEAD > ../editable.txt
-          echo "Files the patch touches (the AI may edit only these):"; cat ../editable.txt
-          find . -path ./.git -prune -o -type f -print0 | xargs -0 sha1sum | sort -k2 > ../before.sha1
-
-      - name: Ask the AI to fix the drift
-        if: env.HAS_KEY == 'true' && steps.repro.outputs.failed == 'true'
-        timeout-minutes: 20
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}
-        run: |
-          pip install --quiet aider-chat==0.86.2
-          cd upstream
-          cat > ../prompt.txt <<'PROMPT'
-          The files you can edit are from the FastChannels repository with the DirecTV "DAI"
-          patch already applied cleanly. The patch adds its own modules (app/scrapers/
-          directv_dai.py, dtv_android.py, dtv_aac_ads.py, dtv_aac_gain.py) plus a few one-line
-          hooks in upstream's files. It applied without conflict, but a check then failed —
-          almost always because upstream renamed or moved something a hook or an added module
-          depends on. reproduce.log holds the failing check's output, and AGENTS.md explains
-          the patch, every hook, and where each one belongs.
-
-          Adapt the patch's code to upstream's current structure so the failing check passes.
-          Rules:
-          - The overlay's own tests (scripts/validate.sh, scripts/smoke_test.py) are the spec
-            for the behavior the patch must keep. You cannot edit them. Make the code satisfy
-            them; never try to defeat them.
-          - If upstream renamed or moved a name the patch uses, update the patch's reference to
-            the new name or location. That is the fix.
-          - Do NOT wrap imports in try/except, stub or shadow a missing name, delete a hook, or
-            skip real work just to make a check pass. Keep every bit of the patch's behavior.
-          - Change only what the failure requires. No refactoring, reformatting or unrelated edits.
-          - Keep the Python valid.
-          PROMPT
-          # Aider edits only the files named on the command line; reproduce.log and AGENTS.md
-          # are read-only context. The two self-contained audio modules import nothing from
-          # upstream (they can't drift), so keep their large bitstream tables out of the edit
-          # set unless the failure actually names one. CI does all git/validation; Aider's own
-          # git, lint, test, shell and URL features are off.
-          edit=()
-          while IFS= read -r f; do
-            case "$f" in
-              *dtv_aac_ads.py|*dtv_aac_gain.py)
-                grep -qF "$(basename "$f")" ../reproduce.log && edit+=("$f") ;;
-              *) edit+=("$f") ;;
-            esac
-          done < ../editable.txt
-          aider --model "$AI_MODEL" --edit-format diff --yes-always --no-git \
-                --no-auto-commits --no-auto-lint --no-auto-test --no-suggest-shell-commands \
-                --no-detect-urls --no-show-model-warnings --no-check-update --no-analytics \
-                --no-pretty --map-tokens 0 --read ../reproduce.log --read ../overlay/AGENTS.md \
-                --message-file ../prompt.txt "${edit[@]}"
-
-      - name: Check the AI only touched the patch's files
-        if: env.HAS_KEY == 'true' && steps.repro.outputs.failed == 'true'
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: |
-          # The overlay checkout (our tests/validate.sh/AGENTS.md) was read-only context and
-          # Aider edits only files under upstream/, but make sure — before refresh-patches.sh
-          # rewrites overlay/patches and overlay/source, which would mask a stray edit.
-          if [ -n "$(git -C overlay status --porcelain --untracked-files=no)" ]; then
-            echo "::error::the AI modified the overlay checkout (its tests are read-only)"; exit 1
-          fi
-          cd upstream
-          find . -path ./.git -prune -o -type f -print0 | xargs -0 sha1sum | sort -k2 > ../after.sha1
-          changed=$(diff ../before.sha1 ../after.sha1 | awk '/^[<>]/{print $3}' | sed 's|^\./||' | sort -u | grep -vE '^\.aider' || true)
-          echo "Files the AI changed:"; echo "${changed:-(none)}"
-          [ -n "$changed" ] || { echo "::error::the AI made no changes"; exit 1; }
-          stray=$(printf '%s\n' $changed | grep -vxF -f ../editable.txt || true)
-          [ -z "$stray" ] || { echo "::error::the AI changed files outside the patch: $stray"; exit 1; }
-          # Belt and braces: the key is never in the model's context, but make sure it can't
-          # end up in files that become a public PR.
-          if grep -qF -- "$OPENROUTER_API_KEY" $changed; then
-            echo "::error::the API key appeared in an edited file"; exit 1
-          fi
-          rm -rf .aider*
-          git add -- $(cat ../editable.txt)
-          GIT_EDITOR=true git commit -q --amend --no-edit
-
-      - name: Re-verify the fix against the full gauntlet
-        if: env.HAS_KEY == 'true' && steps.repro.outputs.failed == 'true'
-        env:
-          UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
-          APK: ${{ needs.build.outputs.apk }}
-          CACHE_BUST: ${{ github.run_id }}-fix
-        run: |
-          # The fix must pass EVERYTHING (not just the stage that failed), the same bar as a
-          # human patch change and the conflict path. reproduce.sh returns 0 only when
-          # compile, validate, build, APK, smoke and boot all pass.
-          overlay/scripts/reproduce.sh upstream \
-            || { echo "::error::the AI's fix did not pass the full gauntlet"; exit 1; }
+          overlay/scripts/ai_fix_drift.sh upstream overlay
+          code=$?
+          set -e
+          case "$code" in
+            0) echo "A drift was reproduced and fixed."; echo "fixed=true" >> "$GITHUB_OUTPUT" ;;
+            2) echo "Nothing reproduced — the build-job failure was transient; leaving it to the next run."; echo "fixed=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::the AI could not fix the drift"; exit 1 ;;
+          esac
 
       - name: Export the ported patch
-        id: finish
-        if: env.HAS_KEY == 'true' && steps.repro.outputs.failed == 'true'
-        run: |
-          overlay/scripts/refresh-patches.sh upstream "${{ needs.build.outputs.sha }}"
-          echo "fixed=true" >> "$GITHUB_OUTPUT"
+        if: env.HAS_KEY == 'true' && steps.repair.outputs.fixed == 'true'
+        run: overlay/scripts/refresh-patches.sh upstream "${{ needs.build.outputs.sha }}"
 
       - name: Upload the ported patch
-        if: env.HAS_KEY == 'true' && steps.finish.outputs.fixed == 'true'
+        if: env.HAS_KEY == 'true' && steps.repair.outputs.fixed == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ported-patches
