@@ -24,15 +24,20 @@ jobs:
           # Aider routes with an "openrouter/" prefix; the raw API wants just the model id.
           model="${AI_MODEL#openrouter/}"
           echo "Testing model '$model' under this account's OpenRouter data policies..."
+          # Generous max_tokens: reasoning models (e.g. Gemini 2.5 Pro) spend tokens
+          # thinking before any visible content, so a tiny budget yields empty content.
           code=$(curl -sS -o resp.json -w '%{http_code}' https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer $OPENROUTER_API_KEY" \
             -H "Content-Type: application/json" \
-            -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}],\"max_tokens\":10}")
+            -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}],\"max_tokens\":2048}")
           echo "HTTP $code"
           content=$(jq -r '.choices[0].message.content // empty' resp.json 2>/dev/null)
           provider=$(jq -r '.provider // empty' resp.json 2>/dev/null)
+          finish=$(jq -r '.choices[0].finish_reason // empty' resp.json 2>/dev/null)
+          usage=$(jq -rc '.usage // empty' resp.json 2>/dev/null)
           err=$(jq -r '(.error.message // .error) // empty' resp.json 2>/dev/null)
           echo "provider routed: ${provider:-（none）}"
+          echo "finish_reason: ${finish:-（none）}   usage: ${usage:-（none）}"
           echo "content: ${content:-（none）}"
           [ -n "$err" ] && echo "error: $err"
           if [ "$code" != "200" ] || [ -z "$content" ]; then
