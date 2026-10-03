@@ -457,6 +457,17 @@ try:
     assert dtv_aac_gain.is_ad_segment(_seg_url) and not dtv_aac_gain.is_ad_segment(
         'https://dfwlive-v2-c0p7-ms.directv.fastly-edge.com/live/seg-1.mp4'), \
         'is_ad_segment must match only the inserted-ad AAC twin, never live content'
+
+    # (c2) The inversion: an inserted-ad creative on ANY CDN host (even one not on the
+    # allowlist) takes the relay path, so its loudness cut always runs; non-ad content on an
+    # unknown CDN is left direct.
+    _ad_other = 'https://unknown-ad-cdn.example.net/dtv-prd/7/u-6600-a-96-1-0.mp4'
+    _content_other = 'https://unknown-ad-cdn.example.net/live/dfwlive-seg-1.mp4'
+    assert directv_proxy._directv_browser_proxyable_url(_ad_other, 'https://p/pl.m3u8') \
+        .startswith('/play/directv/browser-asset'), \
+        'an inserted-ad creative on any CDN must take the relay path so its cut runs'
+    assert directv_proxy._directv_browser_proxyable_url(_content_other, 'https://p/pl.m3u8') \
+        == _content_other, 'non-ad content on an unknown CDN must not be forced through the relay'
 finally:
     directv_proxy._requests = _real_requests
     dtv_android._client_device = _real_client_device

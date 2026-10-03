@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +103,13 @@ EIGHT_SHORT = 2
 
 ID_SCE, ID_CPE, ID_CCE, ID_LFE, ID_DSE, ID_PCE, ID_FIL, ID_END = range(8)
 
-# Only the inserted-ad AAC media twin (u-<id>-a-96-<n>-<seg>.mp4); never its
-# -i init segment, which carries no audio frames.
-_AD_SEG = re.compile(r'u-\d+-a-96-\d+-\d+\.mp4')
+# Any inserted-ad AAC media segment (Yospace creative u-<id>-a-<rate>-...<seg>.mp4) on ANY
+# CDN host, with any segment numbering (e.g. u-6600-a-96-1-1.mp4 or u-6600-a-128-1-1-2.mp4).
+# Deliberately broad: the only thing it must NOT match is the -i init (no audio frames). It is
+# safe to over-match because attenuate_ad_segment is a no-op on anything that is not a clean
+# AAC-LC media fragment (AC-3 content, video, inits, live dfwlive-* segments all pass through
+# untouched). The old narrow u-\d+-a-96-\d+-\d+\.mp4 missed ads whose URL/numbering differed.
+_AD_SEG = re.compile(r'(?:^|/)u-\d+-a-\d+-[\d-]*\d\.mp4$')
 
 # Candidate sample rates to probe (48 kHz covers 44.1 kHz too -- same band
 # tables). The ad must parse cleanly under one of them or it is left untouched.
@@ -125,8 +130,14 @@ class _PE(Exception):
 
 
 def is_ad_segment(url: str) -> bool:
-    """True for an inserted-ad AAC media segment URL (the attenuation target)."""
-    return bool(url) and _AD_SEG.search(url) is not None
+    """True for an inserted-ad AAC media segment URL (the attenuation target).
+
+    Matched against the URL path only (never the host or query string), anchored to
+    the filename: the relay routes on this, so a looser match on the whole URL would
+    let a crafted query turn the public relay into an open proxy."""
+    if not url:
+        return False
+    return _AD_SEG.search(urlsplit(url).path) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -559,16 +570,17 @@ def _write_u8(buf, bitpos, val):
 def attenuate_ad_segment(data: bytes, steps: int = _DEFAULT_STEPS) -> bytes:
     """Return ``data`` with every AAC-LC global_gain lowered by ``steps`` (1.5 dB
     each), or the original bytes unchanged if it is not a cleanly-parseable AAC
-    fMP4 media fragment. Never raises; never returns a corrupted segment. A normal
-    cut logs at DEBUG; a no-op (an inserted ad that went out un-attenuated — e.g. a
-    creative that doesn't parse as clean AAC-LC) logs at INFO so it stays visible."""
+    fMP4 media fragment. Never raises; never returns a corrupted segment. Both the
+    normal cut and a no-op (an inserted ad that went out un-attenuated — e.g. a
+    creative that doesn't parse as clean AAC-LC) log at DEBUG, so a running relay
+    stays quiet; turn on DEBUG to see per-segment detail."""
     body, reason = _attenuate_impl(data, steps)
     if reason.startswith('attenuated'):
         logger.debug('[dtv-aac-gain] inserted-ad AAC segment: %d bytes -> %s',
                      len(data or b''), reason)
     else:
-        logger.info('[dtv-aac-gain] inserted-ad AAC segment left unchanged: %d bytes -> %s',
-                    len(data or b''), reason)
+        logger.debug('[dtv-aac-gain] inserted-ad AAC segment left unchanged: %d bytes -> %s',
+                     len(data or b''), reason)
     return body
 
 

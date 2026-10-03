@@ -8,15 +8,15 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |  78 ++-
- app/routes/directv_proxy.py      |  31 +-
+ app/routes/directv_proxy.py      |  41 +-
  app/scrapers/directv.py          | 120 +++--
  app/scrapers/directv_dai.py      | 467 +++++++++++++++++
  app/scrapers/dtv_aac_ads.py      |  49 ++
- app/scrapers/dtv_aac_gain.py     | 640 +++++++++++++++++++++++
+ app/scrapers/dtv_aac_gain.py     | 652 +++++++++++++++++++++++
  app/scrapers/dtv_android.py      | 872 +++++++++++++++++++++++++++++++
  app/source_config.py             |   5 +
  app/templates/admin/sources.html | 130 ++++-
- 9 files changed, 2305 insertions(+), 87 deletions(-)
+ 9 files changed, 2325 insertions(+), 89 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_aac_gain.py
@@ -130,7 +130,7 @@ index 8e46cf7..751ff44 100644
  def directv_auth_status(source_id):
      import redis as _redis
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..3e3ca42 100644
+index e7680df..764285a 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -171,7 +171,19 @@ index e7680df..3e3ca42 100644
  )
  
  
-@@ -320,7 +318,7 @@ def directv_browser_manifest(channel_id: str):
+@@ -279,7 +277,10 @@ def _directv_browser_asset_proxy_url(upstream_url: str) -> str:
+ def _directv_browser_proxyable_url(raw_url: str, playlist_url: str) -> str:
+     resolved = urljoin(playlist_url, raw_url)
+     parsed = urlsplit(resolved)
+-    if parsed.scheme in ('http', 'https') and _directv_browser_cdn_allowed(parsed.hostname or ''):
++    # A Yospace inserted-ad creative takes the relay path no matter which CDN host it lands
++    # on, so its loudness cut always runs; everything else falls back to the CDN allowlist.
++    if parsed.scheme in ('http', 'https') and (
++            _directv_browser_cdn_allowed(parsed.hostname or '') or dtv_aac_gain.is_ad_segment(resolved)):
+         return _directv_browser_asset_proxy_url(resolved)
+     return resolved
+ 
+@@ -320,7 +321,7 @@ def directv_browser_manifest(channel_id: str):
      scraper = scraper_cls(channel.source.config or {})
      try:
          resolved_url = scraper.resolve(channel.stream_url)
@@ -180,8 +192,15 @@ index e7680df..3e3ca42 100644
      except Exception as exc:
          logger.warning('[directv-browser] manifest fetch failed for channel=%s: %s', channel_id, exc)
          return _unavailable_response()
-@@ -363,7 +361,7 @@ def directv_browser_asset():
-     if target.scheme != 'https' or not _directv_browser_cdn_allowed(target.hostname or ''):
+@@ -360,10 +361,13 @@ def directv_browser_asset():
+     if not raw_url:
+         abort(400)
+     target = urlsplit(raw_url)
+-    if target.scheme != 'https' or not _directv_browser_cdn_allowed(target.hostname or ''):
++    # Accept a Yospace inserted-ad creative from any CDN host (so its cut runs); other
++    # assets must be on an allowlisted CDN.
++    if target.scheme != 'https' or not (
++            _directv_browser_cdn_allowed(target.hostname or '') or dtv_aac_gain.is_ad_segment(raw_url)):
          abort(400)
      range_header = request.headers.get('Range')
 -    headers = {'User-Agent': _BROWSER_UA}
@@ -189,7 +208,7 @@ index e7680df..3e3ca42 100644
      if range_header:
          headers['Range'] = range_header
      try:
-@@ -374,13 +372,28 @@ def directv_browser_asset():
+@@ -374,13 +378,28 @@ def directv_browser_asset():
  
      content_type = r.headers.get('Content-Type') or 'application/octet-stream'
      if 'mpegurl' in content_type.lower() or raw_url.lower().split('?', 1)[0].endswith(('.m3u8', '.m3u')):
@@ -1011,10 +1030,10 @@ index 0000000..8d4dbac
 +    return _AD_AC3_FILE.sub(lambda m: _AC3_RENDITION.sub('-a-96-', m.group(0)), playlist)
 diff --git a/app/scrapers/dtv_aac_gain.py b/app/scrapers/dtv_aac_gain.py
 new file mode 100644
-index 0000000..79d622c
+index 0000000..830a4e4
 --- /dev/null
 +++ b/app/scrapers/dtv_aac_gain.py
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,652 @@
 +"""DirecTV DAI: attenuate inserted AAC ads a fixed amount, losslessly.
 +
 +The inserted-ad AAC twins (see dtv_aac_ads) play a few dB hotter than the
@@ -1035,6 +1054,7 @@ index 0000000..79d622c
 +
 +import logging
 +import re
++from urllib.parse import urlsplit
 +
 +logger = logging.getLogger(__name__)
 +
@@ -1119,9 +1139,13 @@ index 0000000..79d622c
 +
 +ID_SCE, ID_CPE, ID_CCE, ID_LFE, ID_DSE, ID_PCE, ID_FIL, ID_END = range(8)
 +
-+# Only the inserted-ad AAC media twin (u-<id>-a-96-<n>-<seg>.mp4); never its
-+# -i init segment, which carries no audio frames.
-+_AD_SEG = re.compile(r'u-\d+-a-96-\d+-\d+\.mp4')
++# Any inserted-ad AAC media segment (Yospace creative u-<id>-a-<rate>-...<seg>.mp4) on ANY
++# CDN host, with any segment numbering (e.g. u-6600-a-96-1-1.mp4 or u-6600-a-128-1-1-2.mp4).
++# Deliberately broad: the only thing it must NOT match is the -i init (no audio frames). It is
++# safe to over-match because attenuate_ad_segment is a no-op on anything that is not a clean
++# AAC-LC media fragment (AC-3 content, video, inits, live dfwlive-* segments all pass through
++# untouched). The old narrow u-\d+-a-96-\d+-\d+\.mp4 missed ads whose URL/numbering differed.
++_AD_SEG = re.compile(r'(?:^|/)u-\d+-a-\d+-[\d-]*\d\.mp4$')
 +
 +# Candidate sample rates to probe (48 kHz covers 44.1 kHz too -- same band
 +# tables). The ad must parse cleanly under one of them or it is left untouched.
@@ -1142,8 +1166,14 @@ index 0000000..79d622c
 +
 +
 +def is_ad_segment(url: str) -> bool:
-+    """True for an inserted-ad AAC media segment URL (the attenuation target)."""
-+    return bool(url) and _AD_SEG.search(url) is not None
++    """True for an inserted-ad AAC media segment URL (the attenuation target).
++
++    Matched against the URL path only (never the host or query string), anchored to
++    the filename: the relay routes on this, so a looser match on the whole URL would
++    let a crafted query turn the public relay into an open proxy."""
++    if not url:
++        return False
++    return _AD_SEG.search(urlsplit(url).path) is not None
 +
 +
 +# ---------------------------------------------------------------------------
@@ -1576,16 +1606,17 @@ index 0000000..79d622c
 +def attenuate_ad_segment(data: bytes, steps: int = _DEFAULT_STEPS) -> bytes:
 +    """Return ``data`` with every AAC-LC global_gain lowered by ``steps`` (1.5 dB
 +    each), or the original bytes unchanged if it is not a cleanly-parseable AAC
-+    fMP4 media fragment. Never raises; never returns a corrupted segment. A normal
-+    cut logs at DEBUG; a no-op (an inserted ad that went out un-attenuated — e.g. a
-+    creative that doesn't parse as clean AAC-LC) logs at INFO so it stays visible."""
++    fMP4 media fragment. Never raises; never returns a corrupted segment. Both the
++    normal cut and a no-op (an inserted ad that went out un-attenuated — e.g. a
++    creative that doesn't parse as clean AAC-LC) log at DEBUG, so a running relay
++    stays quiet; turn on DEBUG to see per-segment detail."""
 +    body, reason = _attenuate_impl(data, steps)
 +    if reason.startswith('attenuated'):
 +        logger.debug('[dtv-aac-gain] inserted-ad AAC segment: %d bytes -> %s',
 +                     len(data or b''), reason)
 +    else:
-+        logger.info('[dtv-aac-gain] inserted-ad AAC segment left unchanged: %d bytes -> %s',
-+                    len(data or b''), reason)
++        logger.debug('[dtv-aac-gain] inserted-ad AAC segment left unchanged: %d bytes -> %s',
++                     len(data or b''), reason)
 +    return body
 +
 +

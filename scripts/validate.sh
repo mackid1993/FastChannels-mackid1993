@@ -88,6 +88,10 @@ check app/routes/directv_proxy.py "dtv_aac_ads.swap_muffled_ads("
 # Inserted-ad AAC loudness attenuation (own module): the relay hook + the module itself.
 check app/routes/directv_proxy.py "dtv_aac_gain.attenuate_ad_segment("
 check app/scrapers/dtv_aac_gain.py "def attenuate_ad_segment("
+# An inserted-ad creative takes the relay path regardless of CDN host (so the cut always
+# runs); both the routing decision and the attenuation gate go through is_ad_segment.
+check app/routes/directv_proxy.py "dtv_aac_gain.is_ad_segment("
+check app/scrapers/dtv_aac_gain.py "def is_ad_segment("
 check app/routes/directv_proxy.py "'yospace.com',  # DAI"
 check app/templates/admin/sources.html "toggleHtml('use_dai'"
 [ "$missing" -eq 0 ]
