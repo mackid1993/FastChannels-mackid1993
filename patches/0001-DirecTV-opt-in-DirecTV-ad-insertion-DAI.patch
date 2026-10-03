@@ -10,13 +10,13 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/routes/api_sources.py          |  48 ++-
  app/routes/directv_proxy.py        |  20 +-
  app/scrapers/directv.py            | 113 +++---
- app/scrapers/directv_dai.py        | 458 ++++++++++++++++++++++++
+ app/scrapers/directv_dai.py        | 458 +++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py        |  49 +++
- app/scrapers/dtv_android.py        | 544 +++++++++++++++++++++++++++++
+ app/scrapers/dtv_android.py        | 611 +++++++++++++++++++++++++++++
  app/scrapers/dtv_stereo_downmix.py |  53 +++
  app/source_config.py               |   5 +
- app/templates/admin/sources.html   |  60 ++--
- 9 files changed, 1263 insertions(+), 87 deletions(-)
+ app/templates/admin/sources.html   |  60 +--
+ 9 files changed, 1331 insertions(+), 86 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_android.py
@@ -100,7 +100,7 @@ index 8e46cf7..28a911e 100644
  def directv_auth_status(source_id):
      import redis as _redis
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..178d302 100644
+index e7680df..5820ea8 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -112,7 +112,7 @@ index e7680df..178d302 100644
  
  logger = logging.getLogger(__name__)
  directv_proxy_bp = Blueprint('directv_proxy', __name__)
-@@ -143,11 +143,6 @@ def _directv_error_requires_reauth(status: int, content: bytes) -> bool:
+@@ -143,10 +143,7 @@ def _directv_error_requires_reauth(status: int, content: bytes) -> bool:
  
  def _directv_trigger_reauth(source, reason: str) -> None:
      cfg = dict(source.config or {})
@@ -120,11 +120,11 @@ index e7680df..178d302 100644
 -    password = (cfg.get('password') or '').strip()
 -    if not username or not password:
 -        logger.warning('[directv-auth] cannot auto-reauth after %s: username/password missing', reason)
--        return
++    if dtv_android.drm_reauth(source, reason):  # Android TV recovers in its own module: drop the cached DRM identity, keep the token, no refresh storm
+         return
      try:
          from ..extensions import db
-         cfg['token_captured_at'] = 0
-@@ -165,7 +160,7 @@ def _directv_trigger_reauth(source, reason: str) -> None:
+@@ -165,7 +162,7 @@ def _directv_trigger_reauth(source, reason: str) -> None:
          logger.debug('[directv-auth] could not mark tokens stale after %s', reason, exc_info=True)
      try:
          from ..scrapers.directv import DirectvScraper
@@ -133,7 +133,7 @@ index e7680df..178d302 100644
          logger.info('[directv-auth] queued background reauth after %s', reason)
      except Exception:
          logger.exception('[directv-auth] failed to queue background reauth after %s', reason)
-@@ -265,6 +260,7 @@ _DIRECTV_BROWSER_CDN_SUFFIXES = (
+@@ -265,6 +262,7 @@ _DIRECTV_BROWSER_CDN_SUFFIXES = (
      'directv.fastly-edge.com',
      'live.cf.dtvcdn.com',
      'live.cflare.dtvcdn.com',
@@ -141,7 +141,7 @@ index e7680df..178d302 100644
  )
  
  
-@@ -320,7 +316,7 @@ def directv_browser_manifest(channel_id: str):
+@@ -320,7 +318,7 @@ def directv_browser_manifest(channel_id: str):
      scraper = scraper_cls(channel.source.config or {})
      try:
          resolved_url = scraper.resolve(channel.stream_url)
@@ -150,7 +150,7 @@ index e7680df..178d302 100644
      except Exception as exc:
          logger.warning('[directv-browser] manifest fetch failed for channel=%s: %s', channel_id, exc)
          return _unavailable_response()
-@@ -347,7 +343,7 @@ def directv_browser_manifest(channel_id: str):
+@@ -347,7 +345,7 @@ def directv_browser_manifest(channel_id: str):
      if r.status_code >= 400:
          return Response(r.content, status=r.status_code, content_type=r.headers.get('Content-Type') or 'text/plain')
      return Response(
@@ -159,7 +159,7 @@ index e7680df..178d302 100644
          status=200,
          mimetype='application/vnd.apple.mpegurl',
          headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
-@@ -363,7 +359,7 @@ def directv_browser_asset():
+@@ -363,7 +361,7 @@ def directv_browser_asset():
      if target.scheme != 'https' or not _directv_browser_cdn_allowed(target.hostname or ''):
          abort(400)
      range_header = request.headers.get('Range')
@@ -168,7 +168,7 @@ index e7680df..178d302 100644
      if range_header:
          headers['Range'] = range_header
      try:
-@@ -374,8 +370,10 @@ def directv_browser_asset():
+@@ -374,8 +372,10 @@ def directv_browser_asset():
  
      content_type = r.headers.get('Content-Type') or 'application/octet-stream'
      if 'mpegurl' in content_type.lower() or raw_url.lower().split('?', 1)[0].endswith(('.m3u8', '.m3u')):
@@ -958,10 +958,10 @@ index 0000000..8d4dbac
 +    return _AD_AC3_FILE.sub(lambda m: _AC3_RENDITION.sub('-a-96-', m.group(0)), playlist)
 diff --git a/app/scrapers/dtv_android.py b/app/scrapers/dtv_android.py
 new file mode 100644
-index 0000000..79b2033
+index 0000000..4714395
 --- /dev/null
 +++ b/app/scrapers/dtv_android.py
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,611 @@
 +"""Android TV client for DirecTV.
 +
 +Signs the DirecTV session in as DirecTV's own Android TV app (OAuth client
@@ -1300,13 +1300,20 @@ index 0000000..79b2033
 +
 +def sign_in(source_id: int, username: str, password: str, *, app=None, on_status=None) -> dict:
 +    """Entry point for run_directv_auth. Refreshes an existing Android TV session when
-+    one is stored (the normal case — ATV clients don't re-log-in); otherwise runs the
-+    one-time device-code grant. A failed refresh falls back to a fresh grant so a
-+    revoked/expired refresh token still recovers."""
++    one is stored WITH its DRM activation token (the normal case — ATV clients don't
++    re-log-in); otherwise (first sign-in, or the activation token was lost) runs the
++    one-time device-code grant, the only path that restores the activation token. A
++    failed refresh also falls back to a fresh grant so a revoked/expired refresh token
++    still recovers."""
 +    cfg = _load_source_config(source_id, app)
 +    refresh = (cfg.get('refresh_token') or '').strip()
 +    device_id = (cfg.get('dtv_android_device_id') or '').strip()
-+    if refresh and device_id and cfg.get('auth_method') == 'dtv_android':
++    activation = (cfg.get('activation_token') or '').strip()
++    # A refresh never returns a new activationToken (it is absent from the refresh
++    # valuePairs — verified live), so when the DRM activation token is missing we must
++    # NOT refresh: that would hand back a fresh bearer but leave DRM dead. Fall through
++    # to a fresh device-code grant, which is the only thing that mints the token.
++    if refresh and device_id and activation and cfg.get('auth_method') == 'dtv_android':
 +        try:
 +            if on_status:
 +                on_status('running', 'Refreshing Android TV session…')
@@ -1314,6 +1321,66 @@ index 0000000..79b2033
 +        except Exception as exc:
 +            logger.warning('[dtv-android] refresh failed (%s); re-granting via device code', exc)
 +    return capture_android_auth(username, password, on_status=on_status)
++
++
++def drm_reauth(source, reason: str) -> bool:
++    """DRM-failure recovery for an Android TV session. The relay's upstream
++    _directv_trigger_reauth calls this first (a one-line hook); returning True means we
++    handled it and the caller skips its old web-client recovery (wipe the tokens + a
++    background re-login), which cannot help an Android TV session and starved DRM into a
++    1001/1009 loop. Returns False for a non-Android-TV session so that old path still runs.
++
++    How an Android TV session actually recovers:
++      * A bearer *refresh* never returns a new activationToken (absent from the refresh
++        valuePairs — verified live), so a refresh can't fix a DRM failure. We never queue one.
++      * The activation token is the durable root; the identityCookie minted from it is the
++        thing that expires or gets rejected. So on a rejected cookie (license 1009) we drop
++        the cached cookie and let the very next tune re-activate with the SAME stored token.
++      * We NEVER clear activation_token. Clearing it is unrecoverable without a fresh
++        device-code grant, which is exactly what produced the loop this replaces.
++      * If the activation token is already gone, retrying can't restore it: we log that the
++        user must re-authenticate (one-time grant in source settings) and stop — no storm.
++    """
++    cfg = dict(source.config or {})
++    if (cfg.get('auth_method') or '') != 'dtv_android':
++        return False
++
++    # Drop the cached DRM identity cookie so the next license request re-activates
++    # (the cookie, not the token, is what gets rejected). Best-effort: if the relay's
++    # cache helpers move, degrade to "recovers once the cache TTL lapses", never crash.
++    try:
++        from ..routes import directv_proxy, play
++        rdb = play._amazon_sht_redis()
++        if rdb is not None:
++            sid, _ = directv_proxy._directv_device_session_id()
++            rdb.delete(directv_proxy._directv_identity_cache_key(source.id, sid))
++    except Exception:
++        logger.debug('[dtv-android] could not flush cached DRM identity after %s', reason, exc_info=True)
++
++    # Also drop any identity cookie persisted on the source config (keep the activation
++    # token, bearer and refresh token). Never pop activation_token.
++    try:
++        from ..extensions import db
++        if 'identity_cookie' in cfg or 'identity_cookie_expires_at' in cfg:
++            cfg.pop('identity_cookie', None)
++            cfg.pop('identity_cookie_expires_at', None)
++            source.config = cfg
++            db.session.commit()
++    except Exception:
++        try:
++            from ..extensions import db
++            db.session.rollback()
++        except Exception:
++            pass
++        logger.debug('[dtv-android] could not clear stored identity cookie after %s', reason, exc_info=True)
++
++    if not (cfg.get('activation_token') or '').strip():
++        logger.warning('[dtv-android] %s but no DRM activation token is stored — re-authenticate '
++                       '(one-time device-code grant) in source settings; a refresh cannot restore it', reason)
++    else:
++        logger.info('[dtv-android] %s — dropped cached DRM identity; the next tune re-activates with '
++                    'the stored token (no refresh storm)', reason)
++    return True
 +
 +
 +def _auth_error(msg: str) -> Exception:

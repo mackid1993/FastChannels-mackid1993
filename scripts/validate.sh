@@ -79,6 +79,8 @@ check $d "dtv_android.android_auth_request("
     || { echo "::error file=$d::missing DAI hook: dai=directv_dai.request_flags(...) in resolve() and the license path"; missing=1; }
 check app/routes/api_sources.py "directv_dai.clear_cache_if_toggled("
 check app/routes/directv_proxy.py "dtv_android.player_headers()"
+# DRM-failure recovery for an Android TV session delegates to dtv_android (no token wipe, no storm).
+check app/routes/directv_proxy.py "dtv_android.drm_reauth("
 check app/routes/directv_proxy.py "dtv_aac_ads.swap_muffled_ads("
 check app/routes/directv_proxy.py "'yospace.com',  # DAI"
 check app/templates/admin/sources.html "toggleHtml('use_dai'"
