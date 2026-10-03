@@ -10,14 +10,14 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/routes/api_sources.py          |  48 ++-
  app/routes/directv_proxy.py        |  34 +-
  app/scrapers/directv.py            | 113 +++---
- app/scrapers/directv_dai.py        | 458 +++++++++++++++++++++
+ app/scrapers/directv_dai.py        | 460 ++++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py        |  49 +++
- app/scrapers/dtv_aac_gain.py       | 601 ++++++++++++++++++++++++++++
- app/scrapers/dtv_android.py        | 611 +++++++++++++++++++++++++++++
+ app/scrapers/dtv_aac_gain.py       | 612 +++++++++++++++++++++++++++++
+ app/scrapers/dtv_android.py        | 611 ++++++++++++++++++++++++++++
  app/scrapers/dtv_stereo_downmix.py |  53 +++
  app/source_config.py               |   5 +
  app/templates/admin/sources.html   |  60 +--
- 10 files changed, 1946 insertions(+), 86 deletions(-)
+ 10 files changed, 1959 insertions(+), 86 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_aac_gain.py
@@ -460,10 +460,10 @@ index e796bf3..5a9cc16 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..f458003
+index 0000000..cd5c1d5
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,458 @@
+@@ -0,0 +1,460 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -516,9 +516,11 @@ index 0000000..f458003
 +    'nielsen_platform': 'plt,OTT', 'nielsen_dev_group': 'devgrp,STV',
 +    'comscore_platform': 'android', 'comscore_impl_type': 'a',
 +    '_fw_nielsen_app_id': 'P7CFE36DB-A8D9-4801-95FE-51C29101342C',
-+    # yo.lpa/yo.lp: live-pause mode, which the yospace.pool=livepause session
-+    # needs (the Osprey sends yo.lpa; without them no ads were inserted).
-+    'yo.fr': 'true', 'yo.lpa': 'true', 'yo.lp': 'true', 'yo.av': '5',
++    # yo.lpa: live-pause behavior. The Android TV app does NOT send it (it's only in
++    # the Osprey's config); kept for now because an earlier test saw no ad fill without
++    # it, but that predated yospace.pool=livepause + channel/v2 (an A/B removal is
++    # warranted). yo.lp dropped 2026-10-03: no DirecTV client — app or Osprey — sends it.
++    'yo.fr': 'true', 'yo.lpa': 'true', 'yo.av': '5',
 +    # The Android TV app's own live Yospace params. Its com.att.tv config tree sets
 +    # YSLiveParams = {yo.d.cp, yo.vm}; it does NOT send yo.cps for a live tune. yo.cps
 +    # is a Content Playback Spec from the app's default/iOS config tree only
@@ -979,10 +981,10 @@ index 0000000..8d4dbac
 +    return _AD_AC3_FILE.sub(lambda m: _AC3_RENDITION.sub('-a-96-', m.group(0)), playlist)
 diff --git a/app/scrapers/dtv_aac_gain.py b/app/scrapers/dtv_aac_gain.py
 new file mode 100644
-index 0000000..0fb1701
+index 0000000..f19c636
 --- /dev/null
 +++ b/app/scrapers/dtv_aac_gain.py
-@@ -0,0 +1,601 @@
+@@ -0,0 +1,612 @@
 +"""DirecTV DAI: attenuate inserted AAC ads a fixed amount, losslessly.
 +
 +The inserted-ad AAC twins (see dtv_aac_ads) play a few dB hotter than the
@@ -1210,6 +1212,13 @@ index 0000000..0fb1701
 +# AAC-LC bitstream syntax (ISO/IEC 14496-3, 4.4-4.5).
 +# ---------------------------------------------------------------------------
 +
++def _skip_ltp(br, max_sfb):
++    # ltp_data() for a long window (AAC-LC long-term prediction): ltp_lag (11) +
++    # ltp_coef (3) + ltp_long_used[min(max_sfb, MAX_LTP_LONG_SFB=40)] (1 bit each).
++    br.skip(14)
++    br.skip(max_sfb if max_sfb < 40 else 40)
++
++
 +def _parse_ics_info(br):
 +    br.read_bits(1)                     # ics_reserved_bit
 +    window_sequence = br.read_bits(2)
@@ -1217,9 +1226,14 @@ index 0000000..0fb1701
 +    long_win = window_sequence != EIGHT_SHORT
 +    if long_win:
 +        max_sfb = br.read_bits(6)
-+        if br.read_bit():               # predictor_data_present
-+            raise _PE()
-+        return max_sfb, True, 1, [1]
++        pred = br.read_bit()            # predictor_data_present
++        if pred:
++            # AAC-LC signals LTP here (not AAC-MAIN prediction): skip this channel's
++            # ltp_data when present. DirecTV's HE-AAC uses LTP, so this must be parsed,
++            # not rejected.
++            if br.read_bit():           # ltp_data_present
++                _skip_ltp(br, max_sfb)
++        return max_sfb, True, 1, [1], pred
 +    max_sfb = br.read_bits(4)
 +    grouping = br.read_bits(7)
 +    groups = 1
@@ -1230,7 +1244,7 @@ index 0000000..0fb1701
 +            group_len.append(1)
 +        else:
 +            group_len[groups - 1] += 1
-+    return max_sfb, False, groups, group_len
++    return max_sfb, False, groups, group_len, 0
 +
 +
 +def _parse_section_data(br, max_sfb, long_win, groups):
@@ -1329,19 +1343,15 @@ index 0000000..0fb1701
 +    ordb = 5 if long_win else 3
 +    nwin = 1 if long_win else 8
 +    for _ in range(nwin):
-+        remaining = max_sfb
 +        n_filt = br.read_bits(nfb)
 +        if n_filt <= 0:
 +            continue
 +        coef_res = br.read_bits(1)
 +        for _ in range(n_filt):
-+            length = br.read_bits(lenb)
-+            if length > remaining:
-+                raise _PE()
-+            remaining -= length
++            br.read_bits(lenb)                       # filter SFB length (value unused for skipping)
 +            order = br.read_bits(ordb)
 +            if order > 0:
-+                br.read_bits(1)
++                br.read_bits(1)                      # direction
 +                coef_compress = br.read_bits(1)
 +                br.skip(order * (coef_res + 3 - coef_compress))
 +
@@ -1353,7 +1363,7 @@ index 0000000..0fb1701
 +        info = _parse_ics_info(br)
 +    else:
 +        info = shared
-+    max_sfb, long_win, groups, group_len = info
++    max_sfb, long_win, groups, group_len, _pred = info
 +    bands = bands_long if long_win else bands_short
 +    if max_sfb >= len(bands):
 +        raise _PE()
@@ -1384,6 +1394,9 @@ index 0000000..0fb1701
 +        shared = _parse_ics_info(br)
 +        if br.read_bits(2) == 1:             # ms_mask_present == 1
 +            br.skip(shared[2] * shared[0])   # groups * max_sfb ms_used bits
++        if shared[4] and shared[1]:          # predictor present + long: 2nd channel's LTP
++            if br.read_bit():                # ltp_data_present (channel 1)
++                _skip_ltp(br, shared[0])
 +    _parse_ics(br, shared, bl, bs, gains)
 +    _parse_ics(br, shared, bl, bs, gains)
 +

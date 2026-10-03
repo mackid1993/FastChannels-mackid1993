@@ -225,6 +225,13 @@ def _swb(rate):
 # AAC-LC bitstream syntax (ISO/IEC 14496-3, 4.4-4.5).
 # ---------------------------------------------------------------------------
 
+def _skip_ltp(br, max_sfb):
+    # ltp_data() for a long window (AAC-LC long-term prediction): ltp_lag (11) +
+    # ltp_coef (3) + ltp_long_used[min(max_sfb, MAX_LTP_LONG_SFB=40)] (1 bit each).
+    br.skip(14)
+    br.skip(max_sfb if max_sfb < 40 else 40)
+
+
 def _parse_ics_info(br):
     br.read_bits(1)                     # ics_reserved_bit
     window_sequence = br.read_bits(2)
@@ -232,9 +239,14 @@ def _parse_ics_info(br):
     long_win = window_sequence != EIGHT_SHORT
     if long_win:
         max_sfb = br.read_bits(6)
-        if br.read_bit():               # predictor_data_present
-            raise _PE()
-        return max_sfb, True, 1, [1]
+        pred = br.read_bit()            # predictor_data_present
+        if pred:
+            # AAC-LC signals LTP here (not AAC-MAIN prediction): skip this channel's
+            # ltp_data when present. DirecTV's HE-AAC uses LTP, so this must be parsed,
+            # not rejected.
+            if br.read_bit():           # ltp_data_present
+                _skip_ltp(br, max_sfb)
+        return max_sfb, True, 1, [1], pred
     max_sfb = br.read_bits(4)
     grouping = br.read_bits(7)
     groups = 1
@@ -245,7 +257,7 @@ def _parse_ics_info(br):
             group_len.append(1)
         else:
             group_len[groups - 1] += 1
-    return max_sfb, False, groups, group_len
+    return max_sfb, False, groups, group_len, 0
 
 
 def _parse_section_data(br, max_sfb, long_win, groups):
@@ -344,19 +356,15 @@ def _parse_tns(br, max_sfb, long_win):
     ordb = 5 if long_win else 3
     nwin = 1 if long_win else 8
     for _ in range(nwin):
-        remaining = max_sfb
         n_filt = br.read_bits(nfb)
         if n_filt <= 0:
             continue
         coef_res = br.read_bits(1)
         for _ in range(n_filt):
-            length = br.read_bits(lenb)
-            if length > remaining:
-                raise _PE()
-            remaining -= length
+            br.read_bits(lenb)                       # filter SFB length (value unused for skipping)
             order = br.read_bits(ordb)
             if order > 0:
-                br.read_bits(1)
+                br.read_bits(1)                      # direction
                 coef_compress = br.read_bits(1)
                 br.skip(order * (coef_res + 3 - coef_compress))
 
@@ -368,7 +376,7 @@ def _parse_ics(br, shared, bands_long, bands_short, gains):
         info = _parse_ics_info(br)
     else:
         info = shared
-    max_sfb, long_win, groups, group_len = info
+    max_sfb, long_win, groups, group_len, _pred = info
     bands = bands_long if long_win else bands_short
     if max_sfb >= len(bands):
         raise _PE()
@@ -399,6 +407,9 @@ def _parse_cpe(br, bl, bs, gains):
         shared = _parse_ics_info(br)
         if br.read_bits(2) == 1:             # ms_mask_present == 1
             br.skip(shared[2] * shared[0])   # groups * max_sfb ms_used bits
+        if shared[4] and shared[1]:          # predictor present + long: 2nd channel's LTP
+            if br.read_bit():                # ltp_data_present (channel 1)
+                _skip_ltp(br, shared[0])
     _parse_ics(br, shared, bl, bs, gains)
     _parse_ics(br, shared, bl, bs, gains)
 
