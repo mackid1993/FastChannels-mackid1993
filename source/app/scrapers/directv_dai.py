@@ -173,8 +173,12 @@ def build_query(config: dict, dai_channel_names: dict, ccid: str) -> dict:
     if pid:
         q['hhid'] = pid
         q['u'] = pid
-    if config.get('dai_profile_id'):
-        q['profid'] = config['dai_profile_id']
+    # profid is the chosen viewer profile's id. On the Android TV login it comes from the
+    # profiletoken exchange (dtv_android.select_profile → dtv_android_profid); dai_profile_id
+    # is the old web-login value, kept as a fallback. Omitted when unknown (fairness rule).
+    profid = config.get('dtv_android_profid') or config.get('dai_profile_id')
+    if profid:
+        q['profid'] = profid
     if config.get('dai_dma_id'):
         q['dma_location'] = config['dai_dma_id']
         q['dma_billing'] = config['dai_dma_id']

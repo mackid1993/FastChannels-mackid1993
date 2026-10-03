@@ -700,3 +700,168 @@ def android_auth_request(session, params: dict, dai: bool, default_url: str) -> 
     params.pop('dualManifest', None)
     params.setdefault('startOver', 'false')
     return _CHANNEL_AUTH_V2
+
+
+# ── Android TV viewer profiles (the Yospace `profid`) ─────────────────────────
+# A DirecTV account has multiple viewer profiles, like Netflix (e.g. David / Ariana /
+# a parent). The Android TV app runs as one of them and sends THAT profile's ad id as
+# the Yospace `profid`. The device-code grant's valuePairs give the household id
+# (partnerProfileId → hhid/u) but no profile id, so without this the app's `profid` was
+# never sent on the Android login — a targeting gap vs the old web login (which got
+# profileId from its token exchange). The app obtains it by POSTing the chosen profile's
+# profileID to the profiletoken endpoint and reading valuePairs.partnerProfileID1 from the
+# response. It does NOT swap the account bearer per profile — both the launch and the
+# profile-switch paths in the app bundle only store partnerProfileID1 (SET_PARTNER_PROFILE_ID_1)
+# and keep the account session — so only `profid` changes per profile. We do exactly that.
+_PROFILES_URL = 'https://api.cld.dtvce.com/profile/user/manager/v1/profiles'
+_PROFILE_TOKEN_URL = 'https://api.cld.dtvce.com/ac/authn/profiletoken/v1/tokens'
+
+
+def list_profiles(bearer: str) -> dict:
+    """The account's viewer profiles and which one is current, from the Android TV app's
+    profile-manager endpoint. Read-only: a plain GET with the account bearer — no token
+    rotation and no profile switch. Returns
+    ``{'profiles': [{'id', 'name', 'primary'}], 'current_id': <id>}`` or ``{}`` on any
+    failure, so the picker just shows nothing rather than breaking the settings page."""
+    bearer = (bearer or '').strip()
+    if not bearer:
+        return {}
+    try:
+        r = requests.get(_PROFILES_URL,
+                         headers={**_app_headers(), 'Authorization': f'Bearer {bearer}'}, timeout=20)
+    except Exception as exc:
+        logger.debug('[dtv-android] profile list failed: %s', exc)
+        return {}
+    if r.status_code < 200 or r.status_code >= 300:
+        logger.warning('[dtv-android] profiles HTTP %s', r.status_code)
+        return {}
+    data = r.json() if r.content else {}
+    profiles = []
+    for p in (data.get('profiles') or []):
+        if not isinstance(p, dict):
+            continue
+        pid = (p.get('profileID') or '').strip()
+        if pid:
+            profiles.append({'id': pid,
+                             'name': (p.get('profileName') or '').strip() or 'Profile',
+                             'primary': bool(p.get('isPrimaryProfile'))})
+    return {'profiles': profiles, 'current_id': (data.get('currentProfileID') or '').strip()}
+
+
+def _partner_profile_id1(token_data: dict) -> str:
+    """The profile-scoped id the app sends as `profid`, read from a profiletoken response
+    (the key is ``partnerProfileID1`` — capital ID — in the live response; accept the
+    lowercase variant too). Searched in valuePairs first, then the top level."""
+    vp = token_data.get('valuePairs') if isinstance(token_data.get('valuePairs'), dict) else {}
+    for src in (vp, token_data):
+        for k in ('partnerProfileID1', 'partnerProfileId1'):
+            v = src.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ''
+
+
+def profile_token_exchange(profile_id: str, refresh_token: str) -> dict:
+    """Run the Android TV app's profiletoken exchange for one viewer profile. Verified
+    request shape from the app bundle: ``POST`` JSON ``{profileId, refreshToken, clientId}``
+    to the profiletoken endpoint. The response carries ``valuePairs.partnerProfileID1`` — the
+    value the app sends as the Yospace `profid` for that profile. Raises on a non-success
+    response so a caller never persists a dead result. Returns the raw response dict."""
+    profile_id = (profile_id or '').strip()
+    refresh_token = (refresh_token or '').strip()
+    if not profile_id or not refresh_token:
+        raise _auth_error('profile token exchange needs a profile id and a refresh token')
+    body = {'profileId': profile_id, 'refreshToken': refresh_token, 'clientId': _CLIENT_ID}
+    r = requests.post(_PROFILE_TOKEN_URL, json=body,
+                      headers={**_app_headers(), 'Content-Type': 'application/json'}, timeout=30)
+    if r.status_code < 200 or r.status_code >= 300:
+        logger.warning('[dtv-android] profiletoken HTTP %s: %s', r.status_code, (r.text or '')[:200])
+        raise _auth_error(f'profile token exchange failed HTTP {r.status_code}')
+    data = r.json() if r.content else {}
+    if data.get('errorCode') or data.get('success') is False:
+        logger.warning('[dtv-android] profiletoken returned an error (fields=%s)', sorted(data.keys()))
+        raise _auth_error('profile token exchange returned an error')
+    return data
+
+
+def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
+    """Run FastChannels' DirecTV session as the given viewer profile: exchange the profile
+    at the profiletoken endpoint, store its ``partnerProfileID1`` as the Yospace `profid`
+    (read by directv_dai.build_query), and clear the cached Yospace playback so the next
+    tune uses it. The account session (bearer/refresh/activation) is left as-is — the app
+    itself keeps the account session and only swaps `profid` per profile. Single-flight
+    behind the same redis lock as refresh/drm_reauth so a concurrent refresh can't race the
+    exchange and trip DirecTV's refresh reuse-detection. Returns ``{'ok', 'profid', 'error'}``;
+    never raises."""
+    profile_id = (profile_id or '').strip()
+    cfg = dict(source.config or {})
+    if (cfg.get('auth_method') or '') != 'dtv_android':
+        return {'ok': False, 'profid': False, 'error': 'not an Android TV session'}
+    if not profile_id:
+        return {'ok': False, 'profid': False, 'error': 'no profile selected'}
+    rt = (cfg.get('refresh_token') or '').strip()
+    if not rt:
+        return {'ok': False, 'profid': False, 'error': 'no refresh token — Authenticate first'}
+
+    from ..routes import play
+    from ..extensions import db
+    from ..models import SourceCache
+    try:
+        rdb = play._amazon_sht_redis()
+    except Exception:
+        rdb = None
+    lock_key = f'directv:auth:refreshing:{source.name}'
+    have_lock = True
+    if rdb is not None:
+        try:
+            have_lock = bool(rdb.set(lock_key, '1', nx=True, ex=_DRM_REAUTH_COOLDOWN))
+        except Exception:
+            have_lock = True  # redis down: don't wedge a user action
+    if not have_lock:
+        return {'ok': False, 'profid': False, 'error': 'a token refresh is in flight; try again in a moment'}
+
+    try:
+        try:
+            data = profile_token_exchange(profile_id, rt)
+        except Exception as exc:
+            return {'ok': False, 'profid': False, 'error': str(exc)}
+        profid = _partner_profile_id1(data)
+        try:
+            fresh = dict(source.config or {})
+            fresh['dtv_android_profile_id'] = profile_id
+            if profid:
+                fresh['dtv_android_profid'] = profid
+            # Persist a rotated refresh token only if the exchange returned one; otherwise
+            # leave the account session untouched (the profiletoken mints a profile-scoped
+            # bearer the app does not adopt, so we don't adopt it either).
+            vp = data.get('valuePairs') if isinstance(data.get('valuePairs'), dict) else {}
+            new_refresh = (data.get('refresh_token') or data.get('refreshToken')
+                           or vp.get('refreshToken') or '').strip()
+            if new_refresh:
+                fresh['refresh_token'] = new_refresh
+            source.config = fresh
+            # Same cache clear as directv-logout / the DAI toggle, so the new profid applies.
+            SourceCache.query.filter_by(source_id=source.id, cache_key='directv_playback').delete()
+            db.session.commit()
+        except Exception:
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+            logger.debug('[dtv-android] could not persist profile selection', exc_info=True)
+            return {'ok': False, 'profid': False, 'error': 'could not save the selection'}
+    finally:
+        if rdb is not None:
+            try:
+                rdb.delete(lock_key)
+            except Exception:
+                pass
+
+    who = (profile_name or '').strip() or 'the selected profile'
+    if profid:
+        logger.info('[dtv-android] now running as DirecTV profile "%s" (profid set)', who)
+        return {'ok': True, 'profid': True, 'error': ''}
+    logger.warning('[dtv-android] profile "%s": exchange succeeded but no partnerProfileID1 in the '
+                   'response; profid left unset', who)
+    return {'ok': False, 'profid': False,
+            'error': 'the profile exchange returned no profile id (nothing was changed to a bad value)'}

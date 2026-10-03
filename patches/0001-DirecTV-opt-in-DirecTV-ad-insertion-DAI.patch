@@ -7,23 +7,23 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
- app/routes/api_sources.py        |  48 ++-
+ app/routes/api_sources.py        |  78 ++-
  app/routes/directv_proxy.py      |  32 +-
- app/scrapers/directv.py          | 120 +++---
- app/scrapers/directv_dai.py      | 463 ++++++++++++++++++++
- app/scrapers/dtv_aac_ads.py      |  49 +++
- app/scrapers/dtv_aac_gain.py     | 640 ++++++++++++++++++++++++++++
- app/scrapers/dtv_android.py      | 702 +++++++++++++++++++++++++++++++
+ app/scrapers/directv.py          | 120 +++--
+ app/scrapers/directv_dai.py      | 467 +++++++++++++++++
+ app/scrapers/dtv_aac_ads.py      |  49 ++
+ app/scrapers/dtv_aac_gain.py     | 640 +++++++++++++++++++++++
+ app/scrapers/dtv_android.py      | 867 +++++++++++++++++++++++++++++++
  app/source_config.py             |   5 +
- app/templates/admin/sources.html |  58 ++-
- 9 files changed, 2030 insertions(+), 87 deletions(-)
+ app/templates/admin/sources.html | 130 ++++-
+ 9 files changed, 2301 insertions(+), 87 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_aac_gain.py
  create mode 100644 app/scrapers/dtv_android.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
-index 8e46cf7..28a911e 100644
+index 8e46cf7..751ff44 100644
 --- a/app/routes/api_sources.py
 +++ b/app/routes/api_sources.py
 @@ -710,6 +710,8 @@ def save_source_config(source_id):
@@ -35,7 +35,7 @@ index 8e46cf7..28a911e 100644
      full_scrape_queued = False
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
-@@ -1565,24 +1567,56 @@ def directv_auto_login(source_id):
+@@ -1565,24 +1567,86 @@ def directv_auto_login(source_id):
      if source.name != 'directv':
          return jsonify({'error': 'not a directv source'}), 400
  
@@ -94,6 +94,36 @@ index 8e46cf7..28a911e 100644
 +    SourceCache.query.filter_by(source_id=source_id, cache_key='directv_playback').delete()
 +    db.session.commit()
 +    return jsonify({'status': 'logged_out'})
++
++
++@sources_bp.route('/sources/<int:source_id>/directv-profile', methods=['GET', 'POST'])
++def directv_profile(source_id):
++    """List the DirecTV account's viewer profiles and which one FastChannels runs as, and
++    (POST) switch to a chosen profile. The chosen profile's ad id (partnerProfileID1) becomes
++    the Yospace `profid`; the account session is unchanged. All logic is in dtv_android."""
++    from ..scrapers import dtv_android
++
++    source = Source.query.get_or_404(source_id)
++    if source.name != 'directv':
++        return jsonify({'error': 'not a directv source'}), 400
++    cfg = dict(source.config or {})
++    if (cfg.get('auth_method') or '') != 'dtv_android':
++        return jsonify({'error': 'profiles need an Android TV sign-in', 'profiles': []}), 400
++
++    if request.method == 'GET':
++        info = dtv_android.list_profiles(cfg.get('bearer_token') or '')
++        selected = (cfg.get('dtv_android_profile_id') or '').strip() or (info.get('current_id') or '')
++        return jsonify({'profiles': info.get('profiles') or [],
++                        'selected_id': selected,
++                        'current_id': info.get('current_id') or ''})
++
++    data = request.get_json(silent=True) or request.form
++    profile_id = (data.get('profile_id') or '').strip()
++    profile_name = (data.get('profile_name') or '').strip()
++    if not profile_id:
++        return jsonify({'error': 'no profile_id'}), 400
++    result = dtv_android.select_profile(source, profile_id, profile_name)
++    return jsonify(result), (200 if result.get('ok') else 400)
 +
 +
  @sources_bp.route('/sources/<int:source_id>/directv-auth-status')
@@ -454,10 +484,10 @@ index e796bf3..9ccf86b 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..8c68123
+index 0000000..2392429
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,463 @@
+@@ -0,0 +1,467 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -633,8 +663,12 @@ index 0000000..8c68123
 +    if pid:
 +        q['hhid'] = pid
 +        q['u'] = pid
-+    if config.get('dai_profile_id'):
-+        q['profid'] = config['dai_profile_id']
++    # profid is the chosen viewer profile's id. On the Android TV login it comes from the
++    # profiletoken exchange (dtv_android.select_profile → dtv_android_profid); dai_profile_id
++    # is the old web-login value, kept as a fallback. Omitted when unknown (fairness rule).
++    profid = config.get('dtv_android_profid') or config.get('dai_profile_id')
++    if profid:
++        q['profid'] = profid
 +    if config.get('dai_dma_id'):
 +        q['dma_location'] = config['dai_dma_id']
 +        q['dma_billing'] = config['dai_dma_id']
@@ -1624,10 +1658,10 @@ index 0000000..79d622c
 +        return data, 'no-op: %s' % type(exc).__name__
 diff --git a/app/scrapers/dtv_android.py b/app/scrapers/dtv_android.py
 new file mode 100644
-index 0000000..0943011
+index 0000000..743348d
 --- /dev/null
 +++ b/app/scrapers/dtv_android.py
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,867 @@
 +"""Android TV client for DirecTV.
 +
 +Signs the DirecTV session in as DirecTV's own Android TV app (OAuth client
@@ -2330,6 +2364,171 @@ index 0000000..0943011
 +    params.pop('dualManifest', None)
 +    params.setdefault('startOver', 'false')
 +    return _CHANNEL_AUTH_V2
++
++
++# ── Android TV viewer profiles (the Yospace `profid`) ─────────────────────────
++# A DirecTV account has multiple viewer profiles, like Netflix (e.g. David / Ariana /
++# a parent). The Android TV app runs as one of them and sends THAT profile's ad id as
++# the Yospace `profid`. The device-code grant's valuePairs give the household id
++# (partnerProfileId → hhid/u) but no profile id, so without this the app's `profid` was
++# never sent on the Android login — a targeting gap vs the old web login (which got
++# profileId from its token exchange). The app obtains it by POSTing the chosen profile's
++# profileID to the profiletoken endpoint and reading valuePairs.partnerProfileID1 from the
++# response. It does NOT swap the account bearer per profile — both the launch and the
++# profile-switch paths in the app bundle only store partnerProfileID1 (SET_PARTNER_PROFILE_ID_1)
++# and keep the account session — so only `profid` changes per profile. We do exactly that.
++_PROFILES_URL = 'https://api.cld.dtvce.com/profile/user/manager/v1/profiles'
++_PROFILE_TOKEN_URL = 'https://api.cld.dtvce.com/ac/authn/profiletoken/v1/tokens'
++
++
++def list_profiles(bearer: str) -> dict:
++    """The account's viewer profiles and which one is current, from the Android TV app's
++    profile-manager endpoint. Read-only: a plain GET with the account bearer — no token
++    rotation and no profile switch. Returns
++    ``{'profiles': [{'id', 'name', 'primary'}], 'current_id': <id>}`` or ``{}`` on any
++    failure, so the picker just shows nothing rather than breaking the settings page."""
++    bearer = (bearer or '').strip()
++    if not bearer:
++        return {}
++    try:
++        r = requests.get(_PROFILES_URL,
++                         headers={**_app_headers(), 'Authorization': f'Bearer {bearer}'}, timeout=20)
++    except Exception as exc:
++        logger.debug('[dtv-android] profile list failed: %s', exc)
++        return {}
++    if r.status_code < 200 or r.status_code >= 300:
++        logger.warning('[dtv-android] profiles HTTP %s', r.status_code)
++        return {}
++    data = r.json() if r.content else {}
++    profiles = []
++    for p in (data.get('profiles') or []):
++        if not isinstance(p, dict):
++            continue
++        pid = (p.get('profileID') or '').strip()
++        if pid:
++            profiles.append({'id': pid,
++                             'name': (p.get('profileName') or '').strip() or 'Profile',
++                             'primary': bool(p.get('isPrimaryProfile'))})
++    return {'profiles': profiles, 'current_id': (data.get('currentProfileID') or '').strip()}
++
++
++def _partner_profile_id1(token_data: dict) -> str:
++    """The profile-scoped id the app sends as `profid`, read from a profiletoken response
++    (the key is ``partnerProfileID1`` — capital ID — in the live response; accept the
++    lowercase variant too). Searched in valuePairs first, then the top level."""
++    vp = token_data.get('valuePairs') if isinstance(token_data.get('valuePairs'), dict) else {}
++    for src in (vp, token_data):
++        for k in ('partnerProfileID1', 'partnerProfileId1'):
++            v = src.get(k)
++            if isinstance(v, str) and v.strip():
++                return v.strip()
++    return ''
++
++
++def profile_token_exchange(profile_id: str, refresh_token: str) -> dict:
++    """Run the Android TV app's profiletoken exchange for one viewer profile. Verified
++    request shape from the app bundle: ``POST`` JSON ``{profileId, refreshToken, clientId}``
++    to the profiletoken endpoint. The response carries ``valuePairs.partnerProfileID1`` — the
++    value the app sends as the Yospace `profid` for that profile. Raises on a non-success
++    response so a caller never persists a dead result. Returns the raw response dict."""
++    profile_id = (profile_id or '').strip()
++    refresh_token = (refresh_token or '').strip()
++    if not profile_id or not refresh_token:
++        raise _auth_error('profile token exchange needs a profile id and a refresh token')
++    body = {'profileId': profile_id, 'refreshToken': refresh_token, 'clientId': _CLIENT_ID}
++    r = requests.post(_PROFILE_TOKEN_URL, json=body,
++                      headers={**_app_headers(), 'Content-Type': 'application/json'}, timeout=30)
++    if r.status_code < 200 or r.status_code >= 300:
++        logger.warning('[dtv-android] profiletoken HTTP %s: %s', r.status_code, (r.text or '')[:200])
++        raise _auth_error(f'profile token exchange failed HTTP {r.status_code}')
++    data = r.json() if r.content else {}
++    if data.get('errorCode') or data.get('success') is False:
++        logger.warning('[dtv-android] profiletoken returned an error (fields=%s)', sorted(data.keys()))
++        raise _auth_error('profile token exchange returned an error')
++    return data
++
++
++def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
++    """Run FastChannels' DirecTV session as the given viewer profile: exchange the profile
++    at the profiletoken endpoint, store its ``partnerProfileID1`` as the Yospace `profid`
++    (read by directv_dai.build_query), and clear the cached Yospace playback so the next
++    tune uses it. The account session (bearer/refresh/activation) is left as-is — the app
++    itself keeps the account session and only swaps `profid` per profile. Single-flight
++    behind the same redis lock as refresh/drm_reauth so a concurrent refresh can't race the
++    exchange and trip DirecTV's refresh reuse-detection. Returns ``{'ok', 'profid', 'error'}``;
++    never raises."""
++    profile_id = (profile_id or '').strip()
++    cfg = dict(source.config or {})
++    if (cfg.get('auth_method') or '') != 'dtv_android':
++        return {'ok': False, 'profid': False, 'error': 'not an Android TV session'}
++    if not profile_id:
++        return {'ok': False, 'profid': False, 'error': 'no profile selected'}
++    rt = (cfg.get('refresh_token') or '').strip()
++    if not rt:
++        return {'ok': False, 'profid': False, 'error': 'no refresh token — Authenticate first'}
++
++    from ..routes import play
++    from ..extensions import db
++    from ..models import SourceCache
++    try:
++        rdb = play._amazon_sht_redis()
++    except Exception:
++        rdb = None
++    lock_key = f'directv:auth:refreshing:{source.name}'
++    have_lock = True
++    if rdb is not None:
++        try:
++            have_lock = bool(rdb.set(lock_key, '1', nx=True, ex=_DRM_REAUTH_COOLDOWN))
++        except Exception:
++            have_lock = True  # redis down: don't wedge a user action
++    if not have_lock:
++        return {'ok': False, 'profid': False, 'error': 'a token refresh is in flight; try again in a moment'}
++
++    try:
++        try:
++            data = profile_token_exchange(profile_id, rt)
++        except Exception as exc:
++            return {'ok': False, 'profid': False, 'error': str(exc)}
++        profid = _partner_profile_id1(data)
++        try:
++            fresh = dict(source.config or {})
++            fresh['dtv_android_profile_id'] = profile_id
++            if profid:
++                fresh['dtv_android_profid'] = profid
++            # Persist a rotated refresh token only if the exchange returned one; otherwise
++            # leave the account session untouched (the profiletoken mints a profile-scoped
++            # bearer the app does not adopt, so we don't adopt it either).
++            vp = data.get('valuePairs') if isinstance(data.get('valuePairs'), dict) else {}
++            new_refresh = (data.get('refresh_token') or data.get('refreshToken')
++                           or vp.get('refreshToken') or '').strip()
++            if new_refresh:
++                fresh['refresh_token'] = new_refresh
++            source.config = fresh
++            # Same cache clear as directv-logout / the DAI toggle, so the new profid applies.
++            SourceCache.query.filter_by(source_id=source.id, cache_key='directv_playback').delete()
++            db.session.commit()
++        except Exception:
++            try:
++                db.session.rollback()
++            except Exception:
++                pass
++            logger.debug('[dtv-android] could not persist profile selection', exc_info=True)
++            return {'ok': False, 'profid': False, 'error': 'could not save the selection'}
++    finally:
++        if rdb is not None:
++            try:
++                rdb.delete(lock_key)
++            except Exception:
++                pass
++
++    who = (profile_name or '').strip() or 'the selected profile'
++    if profid:
++        logger.info('[dtv-android] now running as DirecTV profile "%s" (profid set)', who)
++        return {'ok': True, 'profid': True, 'error': ''}
++    logger.warning('[dtv-android] profile "%s": exchange succeeded but no partnerProfileID1 in the '
++                   'response; profid left unset', who)
++    return {'ok': False, 'profid': False,
++            'error': 'the profile exchange returned no profile id (nothing was changed to a bad value)'}
 diff --git a/app/source_config.py b/app/source_config.py
 index 640deee..66b972d 100644
 --- a/app/source_config.py
@@ -2347,10 +2546,18 @@ index 640deee..66b972d 100644
      # into login mode but hasn't supplied both credentials yet. Installs
      # from before 'auth_mode' existed (username/password used to be
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index b818ab0..dfa165b 100644
+index b818ab0..7bf01b4 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
-@@ -3141,7 +3141,6 @@
+@@ -2951,6 +2951,7 @@
+           container.innerHTML = renderConfigFields(sourceId, sourceName, schema, values, cfg);
+           container.classList.remove('hidden');
+           if (sourceName === 'pbs') pbsLoadManualFeeds(sourceId);
++          if (sourceName === 'directv') directvLoadProfiles(sourceId);
+         }
+       } catch (e) {
+         if (badge) { badge.textContent = 'Config error'; badge.className = 'config-badge anon'; badge.style.display = ''; }
+@@ -3141,7 +3142,6 @@
  
      function renderDirectvConfig(sourceId, schema, values, cfg = {}) {
        const hasSession = cfg.config_complete === true || cfg.config_status === 'configured';
@@ -2358,7 +2565,7 @@ index b818ab0..dfa165b 100644
        const toggleHtml = (key, fallbackLabel, fallbackHelp) => {
          const field = schema.find(f => f.key === key);
          const checked = ['1', 'true', 'yes', 'on'].includes(
-@@ -3169,17 +3168,16 @@
+@@ -3169,48 +3169,46 @@
            DirecTV Stream channels are DRM-protected and only play through a DRM bridge
            (Bridge &rarr; PrismCast Capture, HDMI Capture, or ah4c Capture). ${hasSession
              ? 'FastChannels has an active DirecTV session.'
@@ -2378,7 +2585,23 @@ index b818ab0..dfa165b 100644
              </span>
            </div>
          </div>
-@@ -3189,28 +3187,13 @@
+ 
++        ${hasSession ? `
++        <div class="field field-full" style="margin-top:4px">
++          <label for="directv-profile-select-${sourceId}" style="font-weight:600">Run as DirecTV profile</label>
++          <div class="help">FastChannels requests ads as this viewer profile &mdash; its ad id becomes DirecTV's <code>profid</code>. Changing it clears the cached stream so the next tune uses it.</div>
++          <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">
++            <select id="directv-profile-select-${sourceId}" disabled style="min-width:180px;padding:6px">
++              <option>Loading profiles&hellip;</option>
++            </select>
++            <button class="btn btn-run" type="button" id="directv-profile-btn-${sourceId}"
++                    onclick="directvSelectProfile(${sourceId})" disabled>Use profile</button>
++            <span id="directv-profile-status-${sourceId}" style="color:var(--text-muted)"></span>
++          </div>
++        </div>` : ''}
++
+         <div class="fields-grid">
+           ${toggleHtml('exclude_fast_channels', 'Exclude FAST channels',
              'On = leave out free, ad-supported channels (DirecTV Stream numbers these 4000-4999).')}
            ${toggleHtml('use_provider_numbers', 'Use DirecTV channel numbers',
              'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). Channels that share a number get subchannels, like 213.1.')}
@@ -2410,7 +2633,7 @@ index b818ab0..dfa165b 100644
            <button class="btn btn-run" type="button" onclick="saveSourceConfig(${sourceId})">Save Settings</button>
          </div>`;
      }
-@@ -3236,6 +3219,35 @@
+@@ -3236,6 +3234,92 @@
        directvPollStatus(sourceId);
      }
  
@@ -2433,6 +2656,63 @@ index b818ab0..dfa165b 100644
 +      loadSourceConfig(sourceId, 'directv');  // re-render the panel in its signed-out state
 +    }
 +
++    // Load the account's viewer profiles into the picker (only present on an authenticated
++    // Android TV session). Shows which profile is current and which FastChannels runs as.
++    async function directvLoadProfiles(sourceId) {
++      const sel = document.getElementById(`directv-profile-select-${sourceId}`);
++      const btn = document.getElementById(`directv-profile-btn-${sourceId}`);
++      const statusEl = document.getElementById(`directv-profile-status-${sourceId}`);
++      if (!sel) return;
++      try {
++        const r = await fetch(`/api/sources/${sourceId}/directv-profile`);
++        const d = await r.json().catch(() => ({}));
++        const profiles = d.profiles || [];
++        if (!r.ok || !profiles.length) {
++          sel.innerHTML = `<option>${escapeHtml(r.ok ? 'No profiles found' : (d.error || 'Could not load profiles'))}</option>`;
++          return;
++        }
++        sel.innerHTML = profiles.map(p =>
++          `<option value="${escapeHtml(p.id)}"${p.id === d.selected_id ? ' selected' : ''}>` +
++          `${escapeHtml(p.name)}${p.primary ? ' (primary)' : ''}${p.id === d.current_id ? ' — current' : ''}</option>`
++        ).join('');
++        sel.disabled = false;
++        if (btn) btn.disabled = false;
++        if (statusEl) statusEl.textContent = '';
++      } catch (e) {
++        sel.innerHTML = '<option>Could not load profiles</option>';
++      }
++    }
++
++    // Switch FastChannels to the chosen viewer profile (POST → profiletoken exchange →
++    // its ad id becomes profid, cached stream cleared). The account session is unchanged.
++    async function directvSelectProfile(sourceId) {
++      const sel = document.getElementById(`directv-profile-select-${sourceId}`);
++      const btn = document.getElementById(`directv-profile-btn-${sourceId}`);
++      const statusEl = document.getElementById(`directv-profile-status-${sourceId}`);
++      if (!sel || !sel.value) return;
++      const name = (sel.options[sel.selectedIndex]?.text || '').replace(/ \(primary\)| — current/g, '');
++      if (btn) btn.disabled = true;
++      if (statusEl) { statusEl.style.color = 'var(--text-muted)'; statusEl.textContent = 'Switching…'; }
++      try {
++        const r = await fetch(`/api/sources/${sourceId}/directv-profile`, {
++          method: 'POST',
++          headers: {'Content-Type': 'application/json'},
++          body: JSON.stringify({profile_id: sel.value, profile_name: name}),
++        });
++        const d = await r.json().catch(() => ({}));
++        if (r.ok && d.ok) {
++          if (statusEl) { statusEl.style.color = 'var(--success-soft)'; statusEl.innerHTML = '&#10003; Running as this profile.'; }
++        } else if (statusEl) {
++          statusEl.style.color = 'var(--danger)';
++          statusEl.textContent = d.error || 'Could not switch profile';
++        }
++      } catch (e) {
++        if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = 'Network error'; }
++      } finally {
++        if (btn) btn.disabled = false;
++      }
++    }
++
 +    // Turn the tvsigninv2 URL in the auth status into a clickable link (the text is
 +    // escaped first, then the known-safe URL is wrapped in an anchor).
 +    function _directvLinkify(text) {
@@ -2446,7 +2726,7 @@ index b818ab0..dfa165b 100644
      function directvPollStatus(sourceId) {
        if (_directvPollTimer) clearInterval(_directvPollTimer);
        _directvPollTimer = setInterval(() => _directvCheckStatus(sourceId), 2000);
-@@ -3256,7 +3268,7 @@
+@@ -3256,7 +3340,7 @@
        const statusMap = {
          idle: null,
          starting: '<span style="color:var(--text-muted)">Starting browser...</span>',
