@@ -8,15 +8,15 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py        |  78 ++-
- app/routes/directv_proxy.py      |  32 +-
+ app/routes/directv_proxy.py      |  27 +-
  app/scrapers/directv.py          | 120 +++--
  app/scrapers/directv_dai.py      | 467 +++++++++++++++++
  app/scrapers/dtv_aac_ads.py      |  49 ++
- app/scrapers/dtv_aac_gain.py     | 640 +++++++++++++++++++++++
+ app/scrapers/dtv_aac_gain.py     | 703 +++++++++++++++++++++++++
  app/scrapers/dtv_android.py      | 867 +++++++++++++++++++++++++++++++
  app/source_config.py             |   5 +
  app/templates/admin/sources.html | 130 ++++-
- 9 files changed, 2301 insertions(+), 87 deletions(-)
+ 9 files changed, 2359 insertions(+), 87 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_aac_gain.py
@@ -130,7 +130,7 @@ index 8e46cf7..751ff44 100644
  def directv_auth_status(source_id):
      import redis as _redis
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..75466d4 100644
+index e7680df..aff04aa 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -189,7 +189,7 @@ index e7680df..75466d4 100644
      if range_header:
          headers['Range'] = range_header
      try:
-@@ -374,13 +372,29 @@ def directv_browser_asset():
+@@ -374,13 +372,24 @@ def directv_browser_asset():
  
      content_type = r.headers.get('Content-Type') or 'application/octet-stream'
      if 'mpegurl' in content_type.lower() or raw_url.lower().split('?', 1)[0].endswith(('.m3u8', '.m3u')):
@@ -203,19 +203,14 @@ index e7680df..75466d4 100644
              headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
          )
  
-+    # Inserted AAC ad (the swap's byte-level sibling): pull its loudness down ~4.5 dB
-+    # losslessly by editing global_gain only; safe no-op on anything that isn't a clean
-+    # inserted-ad AAC fragment. Gated to full (non-range) fetches so a partial request is
-+    # never half-attenuated.
-+    if dtv_aac_gain.is_ad_segment(raw_url) and not range_header:
-+        body = dtv_aac_gain.attenuate_ad_segment(r.content)
-+        return Response(
-+            body,
-+            status=r.status_code,
-+            content_type=content_type,
-+            headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*',
-+                     'Content-Length': str(len(body))},
-+        )
++    # Inserted-ad loudness: attenuate inserted-ad AAC by codec (all logic in dtv_aac_gain);
++    # returns a Response for an audio-sized segment, or None to stream it through below.
++    hooked = dtv_aac_gain.browser_asset_response(
++        r, raw_url, range_header, content_type,
++        lambda u: _requests.get(u, headers={'User-Agent': _BROWSER_UA, **dtv_android.player_headers()},
++                                timeout=(5, 30)).content)
++    if hooked is not None:
++        return hooked
 +
      response_headers = {'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'}
      for key in ('Content-Length', 'Accept-Ranges', 'Content-Range'):
@@ -1012,10 +1007,10 @@ index 0000000..8d4dbac
 +    return _AD_AC3_FILE.sub(lambda m: _AC3_RENDITION.sub('-a-96-', m.group(0)), playlist)
 diff --git a/app/scrapers/dtv_aac_gain.py b/app/scrapers/dtv_aac_gain.py
 new file mode 100644
-index 0000000..79d622c
+index 0000000..8674b16
 --- /dev/null
 +++ b/app/scrapers/dtv_aac_gain.py
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,703 @@
 +"""DirecTV DAI: attenuate inserted AAC ads a fixed amount, losslessly.
 +
 +The inserted-ad AAC twins (see dtv_aac_ads) play a few dB hotter than the
@@ -1588,6 +1583,69 @@ index 0000000..79d622c
 +        logger.info('[dtv-aac-gain] inserted-ad AAC segment left unchanged: %d bytes -> %s',
 +                    len(data or b''), reason)
 +    return body
++
++
++# ── Relay hook: codec-gated attenuation for a browser-asset segment fetch ──────
++# All the relay's segment-loudness logic lives here so directv_proxy.py keeps only a one-line
++# hook. Inserted ads are AAC (~12 dB hotter than the AC-3 content and national ads, which are
++# already at the right level); attenuate_ad_segment lowers a segment iff it is clean AAC-LC and
++# no-ops on AC-3/DRM/video — so the audio CODEC triggers it, never the ad URL (which DirecTV
++# renames under us). Only audio-sized segments are buffered; video streams through (returns
++# None). The edit is length-preserving, so a byte-range request is served by attenuating the
++# full segment and slicing the result.
++_AD_AUDIO_MAX_BYTES = 1_000_000   # above any audio segment, below a 1080p video segment
++
++
++def _full_segment_size(status_code: int, headers) -> int | None:
++    """The segment's full size: Content-Range total on a 206 partial, else Content-Length.
++    None when unknown — the caller then streams rather than guess."""
++    if status_code == 206:
++        m = re.search(r'/\s*(\d+)\s*$', headers.get('Content-Range') or '')
++        return int(m.group(1)) if m else None
++    cl = headers.get('Content-Length')
++    return int(cl) if (cl and str(cl).isdigit()) else None
++
++
++def _range_response(body: bytes, range_header: str, content_type: str):
++    """A 206 slice of an already-attenuated full segment. Byte offsets are unchanged because
++    the attenuation is length-preserving."""
++    from flask import Response
++    total = len(body)
++    start, end = 0, (total - 1 if total else 0)
++    m = re.match(r'\s*bytes=(\d*)-(\d*)', range_header or '')
++    if m:
++        s, e = m.group(1), m.group(2)
++        if s == '' and e:
++            start = max(0, total - int(e))
++        else:
++            start = int(s) if s else 0
++            end = int(e) if e else (total - 1 if total else 0)
++    start = max(0, min(start, total - 1 if total else 0))
++    end = max(start, min(end, total - 1 if total else 0))
++    chunk = body[start:end + 1]
++    return Response(chunk, status=206, content_type=content_type,
++                    headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*',
++                             'Accept-Ranges': 'bytes', 'Content-Length': str(len(chunk)),
++                             'Content-Range': f'bytes {start}-{end}/{total}'})
++
++
++def browser_asset_response(r, raw_url: str, range_header, content_type: str, refetch_full):
++    """Relay hook for a DAI segment fetch. Returns a Flask Response with the inserted-ad AAC
++    attenuated 12 dB, or None to let the relay stream the segment unchanged (a large video
++    segment, or a non-ad/non-AAC segment). ``r`` is the upstream requests response and
++    ``refetch_full(url) -> bytes`` returns the whole segment (used when the player sent a
++    byte-range request, so attenuation sees whole AAC frames)."""
++    size = _full_segment_size(r.status_code, r.headers)
++    if size is None or size > _AD_AUDIO_MAX_BYTES:
++        return None   # unknown size or a large (video) segment: stream it through
++    data = r.content if r.status_code != 206 else refetch_full(raw_url)
++    body = attenuate_ad_segment(data)   # -12 dB iff clean AAC-LC, else the original bytes
++    if range_header:
++        return _range_response(body, range_header, content_type)
++    from flask import Response
++    return Response(body, status=200, content_type=content_type,
++                    headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*',
++                             'Accept-Ranges': 'bytes', 'Content-Length': str(len(body))})
 +
 +
 +def _attenuate_impl(data: bytes, steps: int):
@@ -2546,7 +2604,7 @@ index 640deee..66b972d 100644
      # into login mode but hasn't supplied both credentials yet. Installs
      # from before 'auth_mode' existed (username/password used to be
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index b818ab0..7bf01b4 100644
+index b818ab0..84310e8 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
 @@ -2951,6 +2951,7 @@
@@ -2673,7 +2731,7 @@ index b818ab0..7bf01b4 100644
 +        }
 +        sel.innerHTML = profiles.map(p =>
 +          `<option value="${escapeHtml(p.id)}"${p.id === d.selected_id ? ' selected' : ''}>` +
-+          `${escapeHtml(p.name)}${p.primary ? ' (primary)' : ''}${p.id === d.current_id ? ' — current' : ''}</option>`
++          `${escapeHtml(p.name)}${p.primary ? ' (primary)' : ''}${p.id === d.selected_id ? ' — running' : ''}</option>`
 +        ).join('');
 +        sel.disabled = false;
 +        if (btn) btn.disabled = false;
