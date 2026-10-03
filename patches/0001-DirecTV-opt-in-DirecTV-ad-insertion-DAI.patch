@@ -8,16 +8,16 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
  app/routes/api_sources.py          |  48 +-
- app/routes/directv_proxy.py        |  37 +-
+ app/routes/directv_proxy.py        |  34 +-
  app/scrapers/directv.py            | 122 +++--
  app/scrapers/directv_dai.py        | 460 +++++++++++++++++++
  app/scrapers/dtv_aac_ads.py        |  49 ++
- app/scrapers/dtv_aac_gain.py       | 638 ++++++++++++++++++++++++++
+ app/scrapers/dtv_aac_gain.py       | 640 ++++++++++++++++++++++++++
  app/scrapers/dtv_android.py        | 702 +++++++++++++++++++++++++++++
  app/scrapers/dtv_stereo_downmix.py |  53 +++
  app/source_config.py               |   5 +
  app/templates/admin/sources.html   |  60 ++-
- 10 files changed, 2086 insertions(+), 88 deletions(-)
+ 10 files changed, 2085 insertions(+), 88 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_aac_gain.py
@@ -102,7 +102,7 @@ index 8e46cf7..28a911e 100644
  def directv_auth_status(source_id):
      import redis as _redis
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..c7b1cc1 100644
+index e7680df..0e98347 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -170,7 +170,7 @@ index e7680df..c7b1cc1 100644
      if range_header:
          headers['Range'] = range_header
      try:
-@@ -374,13 +372,32 @@ def directv_browser_asset():
+@@ -374,13 +372,29 @@ def directv_browser_asset():
  
      content_type = r.headers.get('Content-Type') or 'application/octet-stream'
      if 'mpegurl' in content_type.lower() or raw_url.lower().split('?', 1)[0].endswith(('.m3u8', '.m3u')):
@@ -188,18 +188,15 @@ index e7680df..c7b1cc1 100644
 +    # losslessly by editing global_gain only; safe no-op on anything that isn't a clean
 +    # inserted-ad AAC fragment. Gated to full (non-range) fetches so a partial request is
 +    # never half-attenuated.
-+    if dtv_aac_gain.is_ad_segment(raw_url):
-+        if range_header:
-+            dtv_aac_gain.note_range_skip(raw_url, range_header)   # logs why the cut was skipped
-+        else:
-+            body = dtv_aac_gain.attenuate_ad_segment(r.content)
-+            return Response(
-+                body,
-+                status=r.status_code,
-+                content_type=content_type,
-+                headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*',
-+                         'Content-Length': str(len(body))},
-+            )
++    if dtv_aac_gain.is_ad_segment(raw_url) and not range_header:
++        body = dtv_aac_gain.attenuate_ad_segment(r.content)
++        return Response(
++            body,
++            status=r.status_code,
++            content_type=content_type,
++            headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*',
++                     'Content-Length': str(len(body))},
++        )
 +
      response_headers = {'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'}
      for key in ('Content-Length', 'Accept-Ranges', 'Content-Range'):
@@ -991,18 +988,18 @@ index 0000000..8d4dbac
 +    return _AD_AC3_FILE.sub(lambda m: _AC3_RENDITION.sub('-a-96-', m.group(0)), playlist)
 diff --git a/app/scrapers/dtv_aac_gain.py b/app/scrapers/dtv_aac_gain.py
 new file mode 100644
-index 0000000..df9d12c
+index 0000000..79d622c
 --- /dev/null
 +++ b/app/scrapers/dtv_aac_gain.py
-@@ -0,0 +1,638 @@
+@@ -0,0 +1,640 @@
 +"""DirecTV DAI: attenuate inserted AAC ads a fixed amount, losslessly.
 +
 +The inserted-ad AAC twins (see dtv_aac_ads) play a few dB hotter than the
 +stereo-downmixed AC-3 programming, so breaks blast. This drops every inserted
 +ad's loudness by editing the AAC-LC ``global_gain`` field of every channel of
 +every frame -- the same lossless lever mp3gain/aacgain use -- implemented here
-+from the ISO/IEC 14496-3 bitstream syntax. 3 steps x 1.5 dB = -4.5 dB; no
-+re-encoding, no dependencies.
++from the ISO/IEC 14496-3 bitstream syntax. 8 steps x 1.5 dB = -12 dB (calibrated to
++the bridge's actual feed -- see _DEFAULT_STEPS); no re-encoding, no dependencies.
 +
 +A stereo ad is a channel_pair_element whose second channel's ``global_gain``
 +sits *after* the first channel's Huffman-coded spectral data, so each frame is
@@ -1107,7 +1104,14 @@ index 0000000..df9d12c
 +# tables). The ad must parse cleanly under one of them or it is left untouched.
 +_RATES = (48000, 32000, 24000, 16000, 8000)
 +
-+_STEP_DB = 1.5  # one global_gain step, informational only
++_STEP_DB = 1.5  # one global_gain step
++
++# How many steps to cut each inserted ad. Calibrated to the bridge's actual LinkPi feed:
++# the inserted AAC ads measure ~-20.6 LUFS, the stereo-downmixed AC-3 programming ~-32 LUFS
++# (box 16, 2026-10-03, integrated -32.2, never above -32.4 short-term over 4 min). 8 steps
++# = -12 dB lands a break at ~-32.6, matching the programming instead of ~7 dB over it. The
++# per-segment log line reports the actual dB, so this is easy to re-tune against a live ad.
++_DEFAULT_STEPS = 8
 +
 +
 +class _PE(Exception):
@@ -1546,24 +1550,19 @@ index 0000000..df9d12c
 +            buf[bi] &= ~mask
 +
 +
-+def note_range_skip(url: str, range_header: str) -> None:
-+    """Log that an inserted-ad AAC segment arrived with a Range header, so the loudness
-+    cut was skipped (a partial fragment can't be edited). If this shows up on live ads,
-+    that is why the cut isn't landing — the player fetches segments with ranged requests,
-+    and the fix is to fetch the whole segment, attenuate, and re-slice the range."""
-+    logger.info('[dtv-aac-gain] inserted-ad AAC segment requested with Range=%r — loudness '
-+                'cut SKIPPED (partial fetch)', range_header)
-+
-+
-+def attenuate_ad_segment(data: bytes, steps: int = 3) -> bytes:
++def attenuate_ad_segment(data: bytes, steps: int = _DEFAULT_STEPS) -> bytes:
 +    """Return ``data`` with every AAC-LC global_gain lowered by ``steps`` (1.5 dB
 +    each), or the original bytes unchanged if it is not a cleanly-parseable AAC
-+    fMP4 media fragment. Never raises; never returns a corrupted segment. Logs one
-+    INFO line per call with the outcome, so a live ad shows whether the cut landed
-+    or why it no-op'd (e.g. HE-AAC/SBR would fail to parse as clean AAC-LC)."""
++    fMP4 media fragment. Never raises; never returns a corrupted segment. A normal
++    cut logs at DEBUG; a no-op (an inserted ad that went out un-attenuated — e.g. a
++    creative that doesn't parse as clean AAC-LC) logs at INFO so it stays visible."""
 +    body, reason = _attenuate_impl(data, steps)
-+    logger.info('[dtv-aac-gain] inserted-ad AAC segment: %d bytes -> %s',
-+                len(data or b''), reason)
++    if reason.startswith('attenuated'):
++        logger.debug('[dtv-aac-gain] inserted-ad AAC segment: %d bytes -> %s',
++                     len(data or b''), reason)
++    else:
++        logger.info('[dtv-aac-gain] inserted-ad AAC segment left unchanged: %d bytes -> %s',
++                    len(data or b''), reason)
 +    return body
 +
 +

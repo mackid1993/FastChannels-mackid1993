@@ -4,8 +4,8 @@ The inserted-ad AAC twins (see dtv_aac_ads) play a few dB hotter than the
 stereo-downmixed AC-3 programming, so breaks blast. This drops every inserted
 ad's loudness by editing the AAC-LC ``global_gain`` field of every channel of
 every frame -- the same lossless lever mp3gain/aacgain use -- implemented here
-from the ISO/IEC 14496-3 bitstream syntax. 3 steps x 1.5 dB = -4.5 dB; no
-re-encoding, no dependencies.
+from the ISO/IEC 14496-3 bitstream syntax. 8 steps x 1.5 dB = -12 dB (calibrated to
+the bridge's actual feed -- see _DEFAULT_STEPS); no re-encoding, no dependencies.
 
 A stereo ad is a channel_pair_element whose second channel's ``global_gain``
 sits *after* the first channel's Huffman-coded spectral data, so each frame is
@@ -110,7 +110,14 @@ _AD_SEG = re.compile(r'u-\d+-a-96-\d+-\d+\.mp4')
 # tables). The ad must parse cleanly under one of them or it is left untouched.
 _RATES = (48000, 32000, 24000, 16000, 8000)
 
-_STEP_DB = 1.5  # one global_gain step, informational only
+_STEP_DB = 1.5  # one global_gain step
+
+# How many steps to cut each inserted ad. Calibrated to the bridge's actual LinkPi feed:
+# the inserted AAC ads measure ~-20.6 LUFS, the stereo-downmixed AC-3 programming ~-32 LUFS
+# (box 16, 2026-10-03, integrated -32.2, never above -32.4 short-term over 4 min). 8 steps
+# = -12 dB lands a break at ~-32.6, matching the programming instead of ~7 dB over it. The
+# per-segment log line reports the actual dB, so this is easy to re-tune against a live ad.
+_DEFAULT_STEPS = 8
 
 
 class _PE(Exception):
@@ -549,24 +556,19 @@ def _write_u8(buf, bitpos, val):
             buf[bi] &= ~mask
 
 
-def note_range_skip(url: str, range_header: str) -> None:
-    """Log that an inserted-ad AAC segment arrived with a Range header, so the loudness
-    cut was skipped (a partial fragment can't be edited). If this shows up on live ads,
-    that is why the cut isn't landing — the player fetches segments with ranged requests,
-    and the fix is to fetch the whole segment, attenuate, and re-slice the range."""
-    logger.info('[dtv-aac-gain] inserted-ad AAC segment requested with Range=%r — loudness '
-                'cut SKIPPED (partial fetch)', range_header)
-
-
-def attenuate_ad_segment(data: bytes, steps: int = 3) -> bytes:
+def attenuate_ad_segment(data: bytes, steps: int = _DEFAULT_STEPS) -> bytes:
     """Return ``data`` with every AAC-LC global_gain lowered by ``steps`` (1.5 dB
     each), or the original bytes unchanged if it is not a cleanly-parseable AAC
-    fMP4 media fragment. Never raises; never returns a corrupted segment. Logs one
-    INFO line per call with the outcome, so a live ad shows whether the cut landed
-    or why it no-op'd (e.g. HE-AAC/SBR would fail to parse as clean AAC-LC)."""
+    fMP4 media fragment. Never raises; never returns a corrupted segment. A normal
+    cut logs at DEBUG; a no-op (an inserted ad that went out un-attenuated — e.g. a
+    creative that doesn't parse as clean AAC-LC) logs at INFO so it stays visible."""
     body, reason = _attenuate_impl(data, steps)
-    logger.info('[dtv-aac-gain] inserted-ad AAC segment: %d bytes -> %s',
-                len(data or b''), reason)
+    if reason.startswith('attenuated'):
+        logger.debug('[dtv-aac-gain] inserted-ad AAC segment: %d bytes -> %s',
+                     len(data or b''), reason)
+    else:
+        logger.info('[dtv-aac-gain] inserted-ad AAC segment left unchanged: %d bytes -> %s',
+                    len(data or b''), reason)
     return body
 
 
