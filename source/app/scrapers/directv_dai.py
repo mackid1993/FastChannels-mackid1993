@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 import requests
 
-from .base import ConfigField
+from .base import ConfigItem
 from . import dtv_android
 
 logger = logging.getLogger(__name__)
@@ -74,7 +74,7 @@ _CLIENT_PARAMS = {
     'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
 }
 
-CONFIG_FIELD = ConfigField(
+CONFIG_FIELD = ConfigItem(
     'use_dai', 'Use DirecTV ad insertion (DAI)',
     field_type='toggle', default='false',
     help_text=(
