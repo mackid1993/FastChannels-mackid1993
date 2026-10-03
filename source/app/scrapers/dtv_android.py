@@ -424,6 +424,11 @@ def drm_reauth(source, reason: str) -> bool:
     if (cfg.get('auth_method') or '') != 'dtv_android':
         return False
 
+    # Reassure first: the 403 the relay just logged looks alarming but is a routine, expected
+    # DRM token expiry that we recover from automatically. Say so before doing it.
+    logger.info('[dtv-android] heads up: DirecTV flagged the DRM token as expired (%s). This is '
+                'normal and handled automatically — re-minting it now, no action needed.', reason)
+
     from ..routes import directv_proxy, play
     from ..extensions import db
     try:
@@ -499,8 +504,8 @@ def drm_reauth(source, reason: str) -> bool:
     _flush_redis_cookie()
 
     if minted:
-        logger.info('[dtv-android] %s — refreshed the Android TV session and re-minted the DRM '
-                    'activation token; the next tune re-activates automatically', reason)
+        logger.info('[dtv-android] DirecTV DRM token had expired and was automatically refreshed '
+                    'and re-minted (triggered by %s); playback recovers on its own — no action needed', reason)
     elif result:
         logger.warning('[dtv-android] %s — refresh succeeded but returned no DRM activation token; '
                        're-authenticate once in source settings (Log out, then Authenticate)', reason)

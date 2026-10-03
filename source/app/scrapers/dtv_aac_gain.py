@@ -559,16 +559,15 @@ def _write_u8(buf, bitpos, val):
 def attenuate_ad_segment(data: bytes, steps: int = _DEFAULT_STEPS) -> bytes:
     """Return ``data`` with every AAC-LC global_gain lowered by ``steps`` (1.5 dB
     each), or the original bytes unchanged if it is not a cleanly-parseable AAC
-    fMP4 media fragment. Never raises; never returns a corrupted segment. A normal
-    cut logs at DEBUG; a no-op (an inserted ad that went out un-attenuated — e.g. a
-    creative that doesn't parse as clean AAC-LC) logs at INFO so it stays visible."""
+    fMP4 media fragment. Never raises; never returns a corrupted segment. The gain runs on
+    every audio segment the relay fetches, so passing content/other codecs through is the
+    normal case (logged at DEBUG); only a real attenuation is logged at INFO."""
     body, reason = _attenuate_impl(data, steps)
     if reason.startswith('attenuated'):
-        logger.debug('[dtv-aac-gain] inserted-ad AAC segment: %d bytes -> %s',
-                     len(data or b''), reason)
+        logger.info('[dtv-aac-gain] lowered an inserted ad: %s', reason)
     else:
-        logger.info('[dtv-aac-gain] inserted-ad AAC segment left unchanged: %d bytes -> %s',
-                    len(data or b''), reason)
+        logger.debug('[dtv-aac-gain] segment passed through unchanged (%d bytes): %s',
+                     len(data or b''), reason)
     return body
 
 
