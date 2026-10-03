@@ -9,7 +9,7 @@
 # 2. ruff's error-class rules (syntax errors, undefined names, invalid comparisons)
 #    report nothing NEW compared with pristine upstream.
 # 3. The templates the patches touch parse.
-# 4. The DAI module and every hook into upstream's files are present.
+# 4. The overlay's modules and every hook into upstream's files are present.
 set -euo pipefail
 
 dir=${1:?usage: validate.sh <patched-checkout>}
@@ -50,8 +50,8 @@ print(f'{len(sys.argv) - 1} template(s) parsed, {errors} errors')
 sys.exit(1 if errors else 0)
 PY
 
-echo "== DAI module and hooks present"
-# Nearly all of the DAI code lives in app/scrapers/directv_dai.py, a file upstream
+echo "== overlay modules and hooks present"
+# Most of the overlay's code lives in its own app/scrapers/*.py modules, files upstream
 # doesn't have. What sits in upstream's files is a set of one-line hooks; a merge
 # (or an AI conflict fix) must not lose any of them. Only the call targets are
 # checked, not their arguments, so a correct port that adapts to an upstream

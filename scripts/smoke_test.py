@@ -1,7 +1,7 @@
-"""DAI smoke test, run inside the freshly built image (cwd /app).
+"""Overlay smoke test, run inside the freshly built image (cwd /app).
 
 Imports the patched modules with the image's real dependencies and exercises the
-DAI code with synthetic inputs, so a merge that compiles but no longer works
+overlay's code with synthetic inputs, so a merge that compiles but no longer works
 still fails the build. No network access and no real account data.
 """
 import base64
@@ -209,6 +209,12 @@ expected = {'hhid': 'hh-1', 'u': 'hh-1', 'profid': 'prof-1', 'dma_location': '99
 for key, value in expected.items():
     assert query.get(key) == value, f'{key}: expected {value!r}, got {query.get(key)!r}'
 
+# The Android TV login's chosen viewer profile (dtv_android_profid, set by the profile
+# picker's profiletoken exchange) is what the app sends as profid, and it wins over the old
+# web-login dai_profile_id. Guards the picker against a future drift fix silently dropping it.
+assert dai.build_query({**config, 'dtv_android_profid': 'pp1-android'}, {}, '123')['profid'] == 'pp1-android', \
+    'profid must come from dtv_android_profid (the chosen viewer profile) when present'
+
 # Consent from a different GPP section must not be decoded with the US-National layout.
 other = dai.build_query({**config, 'dai_gpp_sid': '8'}, {}, '123')
 assert 'is_lat' not in other, 'is_lat derived from a non-US-National GPP section'
@@ -347,4 +353,160 @@ dai.note_channel(sc, {'daiChannelName': ''}, '2')
 assert sc.cache == {'dai_channel_names': {'1': 'cnn'}}, sc.cache
 assert 'directv_dai.note_channel(self, ' in inspect.getsource(directv.DirectvScraper)
 
-print('DAI smoke test passed.')
+# ── Behavioral relay tests ────────────────────────────────────────────────────
+# The assertions above grep inspect.getsource for each hook. That proves the call
+# is still written, but not that it still RUNS: a conflict/drift fix that keeps the
+# string and guts the work (an early return, `if False`, a dropped wrap) would pass
+# them. These drive the actual Flask relay routes with a stubbed upstream so the
+# swap, the loudness cut and the DRM self-heal must really happen or the build fails.
+import types as _types  # noqa: E402
+from urllib.parse import quote as _quote  # noqa: E402
+from flask import Flask as _Flask  # noqa: E402
+
+from app.scrapers import dtv_aac_gain  # noqa: E402
+assert callable(getattr(dtv_aac_gain, 'attenuate_ad_segment', None)) and callable(
+    getattr(dtv_aac_gain, 'is_ad_segment', None)), 'dtv_aac_gain lost attenuate_ad_segment/is_ad_segment'
+
+
+class _Resp:
+    """Minimal stand-in for a requests.Response the relay fetches from upstream."""
+    def __init__(self, *, text='', content=b'', status=200,
+                 ctype='application/octet-stream', url='', content_length=None):
+        self.text, self.content, self.status_code = text, content, status
+        self.headers, self.url = {'Content-Type': ctype}, url
+        cl = content_length if content_length is not None else (len(content) if content else None)
+        if cl is not None:
+            self.headers['Content-Length'] = str(cl)
+
+    def iter_content(self, chunk_size=65536):
+        yield self.content
+
+    def close(self):
+        pass
+
+
+_app = _Flask('smoke')
+_app.testing = True
+_app.register_blueprint(directv_proxy.directv_proxy_bp)
+_client = _app.test_client()
+_ASSET = '/play/directv/browser-asset?url='
+
+_real_requests = directv_proxy._requests  # `import requests as _requests` — the real module
+# Under the test client there IS a request context, so player_headers() would try to match a
+# bridge device (DB/adb). Stub the device lookup so the relay never reaches for either.
+_real_client_device = dtv_android._client_device
+dtv_android._client_device = lambda: {}
+try:
+    # (a) An inserted-ad AC-3 audio playlist is swapped to the full-range AAC twin — segment
+    # AND its own EXT-X-MAP init — THROUGH the relay; live (dfwlive) content is left alone.
+    _pl = ('#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n'
+           '#EXT-X-MAP:URI="https://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/u-6600-c-384-1-i.mp4"\n'
+           'https://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/u-6600-c-384-1-0.mp4\n'
+           'https://dfwlive-v2-c0p7-ms.directv.fastly-edge.com/live/seg-1.mp4\n')
+    _pl_url = 'https://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/audio.m3u8'
+    directv_proxy._requests = _types.SimpleNamespace(
+        get=lambda url, **kw: _Resp(text=_pl, ctype='application/vnd.apple.mpegurl', url=_pl_url))
+    _body = _client.get(_ASSET + _quote(_pl_url, safe='')).get_data(as_text=True)
+    # Filenames survive the percent-encoding of the rewritten proxy URLs (only '/' and ':' encode).
+    assert 'u-6600-a-96-1-0.mp4' in _body and 'u-6600-a-96-1-i.mp4' in _body, \
+        'the relay did not swap the inserted AC-3 ad (segment + its EXT-X-MAP init) to the AAC twin'
+    assert 'u-6600-c-384' not in _body, 'an AC-3 ad rendition survived the relay swap'
+    assert 'dfwlive-v2-c0p7-ms' in _body, 'the relay dropped the live (non-ad) content line'
+
+    # (b) A master playlist passes through untouched by the swap: the stock 5.1 CHANNELS="6"
+    # survives (the downmix was removed) and nothing is turned into an AAC ad.
+    _master = ('#EXTM3U\n'
+               '#EXT-X-STREAM-INF:BANDWIDTH=6500000,CODECS="avc1.640028,ac-3",AUDIO="aud"\n'
+               'https://yospace01-directv.akamaized.net/dtv-prd/x/variant-1080.m3u8\n'
+               '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",CHANNELS="6",'
+               'URI="https://yospace01-directv.akamaized.net/dtv-prd/x/audio.m3u8"\n')
+    _m_url = 'https://yospace01-directv.akamaized.net/dtv-prd/x/master.m3u8'
+    directv_proxy._requests = _types.SimpleNamespace(
+        get=lambda url, **kw: _Resp(text=_master, ctype='application/vnd.apple.mpegurl', url=_m_url))
+    _mbody = _client.get(_ASSET + _quote(_m_url, safe='')).get_data(as_text=True)
+    assert 'CHANNELS="6"' in _mbody, 'the master AC-3 channel count was altered (downmix must stay removed)'
+    assert 'a-96' not in _mbody, 'the swap must not touch a master playlist'
+    assert 'BANDWIDTH=6500000' in _mbody, 'the master STREAM-INF was mangled'
+
+    # (c) Codec-gated loudness: an inserted-ad audio segment reaches attenuate_ad_segment and
+    # the attenuated bytes reach the client — on a plain fetch AND on a byte-range request (the
+    # edit is length-preserving, so the range is served from the attenuated full segment, NOT
+    # bypassed). A large (video-sized) segment streams through untouched. The trigger is the
+    # audio codec via dtv_aac_gain, not the ad URL.
+    _seg_url = 'https://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/u-6600-a-96-1-0.mp4'
+    _raw = b'\xff\xf1raw-aac-ad-bytes-stand-in'
+    directv_proxy._requests = _types.SimpleNamespace(
+        get=lambda url, **kw: _Resp(content=_raw, ctype='video/mp4', url=_seg_url))
+    _seen, _SENT = [], b'ATTENUATED-SENTINEL-0123456789'
+    _real_att = dtv_aac_gain.attenuate_ad_segment
+    dtv_aac_gain.attenuate_ad_segment = lambda data, *a, **k: (_seen.append(data) or _SENT)
+    # The passthrough streamer is wired up by the app factory, which the smoke test doesn't
+    # run, so stub it to echo the upstream bytes (the large/video stream-through path).
+    from flask import Response as _Response  # noqa: E402
+    _real_stream = directv_proxy._stream_upstream_response
+    directv_proxy._stream_upstream_response = lambda up, **kw: _Response(
+        up.content, status=kw.get('status', 200), content_type=kw.get('content_type'))
+    try:
+        _sr = _client.get(_ASSET + _quote(_seg_url, safe=''))
+        assert _sr.get_data() == _SENT, 'the attenuated bytes did not reach the client (gain hook gutted?)'
+        assert _seen == [_raw], 'attenuate_ad_segment was not called with the upstream segment bytes'
+        _seen.clear()
+        _rr = _client.get(_ASSET + _quote(_seg_url, safe=''), headers={'Range': 'bytes=0-9'})
+        assert _seen == [_raw], 'a Range request must still be attenuated (fetch full, then slice)'
+        assert _rr.status_code == 206 and _rr.get_data() == _SENT[0:10], \
+            'a Range fetch must return the requested slice of the attenuated segment'
+        _seen.clear()
+        _big_url = 'https://yospace01-directv.akamaized.net/dtv-prd/x/video-seg.mp4'
+        directv_proxy._requests = _types.SimpleNamespace(
+            get=lambda url, **kw: _Resp(content=b'VIDEOBYTES', ctype='video/mp4', url=_big_url,
+                                        content_length=50_000_000))
+        _vr = _client.get(_ASSET + _quote(_big_url, safe=''))
+        assert _seen == [], 'a large (video) segment must stream through, never be attenuated'
+        assert _vr.get_data() == b'VIDEOBYTES', 'the video segment bytes were altered'
+    finally:
+        dtv_aac_gain.attenuate_ad_segment = _real_att
+        directv_proxy._stream_upstream_response = _real_stream
+    # Codec-gated: attenuate_ad_segment no-ops (returns the bytes unchanged) on non-AAC input,
+    # so AC-3 content and national ads are never touched.
+    assert dtv_aac_gain.attenuate_ad_segment(b'\x00' * 256) == b'\x00' * 256, \
+        'attenuate_ad_segment must return non-AAC bytes unchanged (AC-3 content must pass through)'
+finally:
+    directv_proxy._requests = _real_requests
+    dtv_android._client_device = _real_client_device
+
+# (d) A DRM 403 on an Android TV session self-heals by REFRESHING (re-minting the activation
+# token), not by the web client's wipe-tokens-and-re-login. Drive the relay's
+# _directv_trigger_reauth and prove drm_reauth took over: refresh_session is called once and
+# the web token-wipe path (which zeroes token_captured_at) is never reached.
+from app.routes import play as _play  # noqa: E402
+_real_sht = getattr(_play, '_amazon_sht_redis', None)
+_real_refresh = dtv_android.refresh_session
+_refresh_calls = []
+
+
+def _fake_refresh(rt, did, *a, **k):
+    _refresh_calls.append((rt, did))
+    return {'bearer_token': 'NEW-BEARER', 'refresh_token': 'ROTATED-REFRESH',
+            'captured_at': _t.time(), 'activation_token': 'FRESH-ACT', 'token_expires_at': None}
+
+
+_play._amazon_sht_redis = lambda: None          # no redis in the --rm smoke container
+dtv_android.refresh_session = _fake_refresh
+try:
+    _src = _types.SimpleNamespace(id=1, name='directv', config={
+        'auth_method': 'dtv_android', 'refresh_token': 'OLD-REFRESH',
+        'dtv_android_device_id': 'dev-1', 'bearer_token': 'OLD-BEARER',
+        'activation_token': 'OLD-ACT', 'identity_cookie': 'OLD-CK', 'token_captured_at': 123.0})
+    directv_proxy._directv_trigger_reauth(_src, 'license 1009 (smoke)')
+    assert len(_refresh_calls) == 1, 'drm_reauth did not refresh the Android TV session (re-mint the token)'
+    assert _src.config.get('bearer_token') == 'NEW-BEARER' and _src.config.get('activation_token') == 'FRESH-ACT', \
+        'the re-minted bearer/activation token was not persisted'
+    assert 'identity_cookie' not in _src.config, 'the stale identity cookie was not dropped'
+    assert _src.config.get('token_captured_at') != 0, \
+        'the web token-wipe recovery ran for an Android TV session (it must be skipped)'
+finally:
+    dtv_android.refresh_session = _real_refresh
+    if _real_sht is not None:
+        _play._amazon_sht_redis = _real_sht
+
+print('Overlay smoke test passed.')
