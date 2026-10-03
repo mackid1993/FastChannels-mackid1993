@@ -175,27 +175,13 @@ assert callable(getattr(api_sources, 'directv_logout', None)), 'the DirecTV logo
 assert 'username and password must be saved first' not in inspect.getsource(api_sources.directv_auto_login), \
     'auto-login must not require stored credentials (the device-code grant needs none)'
 
-# Opt-in stereo-downmix (its own module): off by default; when on, the master declares the
-# AC-3 audio rendition CHANNELS="2" (fuller/louder stereo downmix), nothing else changed.
-from app.scrapers import dtv_stereo_downmix as sdm  # noqa: E402
-_sdm_master = (
-    '#EXTM3U\n'
-    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="AC3-384kbps",NAME="English",CHANNELS="6",URI="a.m3u8"\n'
-    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="HEAAC-96kbps",NAME="English",CHANNELS="2",URI="b.m3u8"\n'
-    '#EXT-X-STREAM-INF:BANDWIDTH=6500000,CODECS="avc1.640028,ac-3",AUDIO="AC3-384kbps"\nv.m3u8\n'
-)
-assert sdm.enabled({}) is False and sdm.enabled({'stereo_downmix': 'true'}) is True
-assert sdm.stereo_downmix_master(_sdm_master, {}) == _sdm_master, 'stereo_downmix must be a no-op when off (default)'
-_sdm_on = sdm.stereo_downmix_master(_sdm_master, {'stereo_downmix': 'on'})
-assert 'GROUP-ID="AC3-384kbps",NAME="English",CHANNELS="2"' in _sdm_on, 'AC-3 rendition not declared stereo when on'
-assert 'GROUP-ID="HEAAC-96kbps",NAME="English",CHANNELS="2"' in _sdm_on, 'the HE-AAC rendition must not be altered'
-assert 'CODECS="avc1.640028,ac-3"' in _sdm_on, 'the STREAM-INF/codec list must not be altered'
-assert sdm.stereo_downmix_master('#EXTM3U\n#EXTINF:6,\nseg.mp4\n', {'stereo_downmix': 'on'}) == '#EXTM3U\n#EXTINF:6,\nseg.mp4\n', \
-    'a playlist with no AC-3 audio rendition must be unchanged'
-assert any(getattr(f, 'key', None) == 'stereo_downmix' for f in directv.DirectvScraper.config_schema), \
-    'stereo_downmix toggle missing from the DirecTV config schema'
-assert 'dtv_stereo_downmix.stereo_downmix_master(' in inspect.getsource(directv_proxy.directv_browser_manifest), \
-    'the master no longer gets the stereo-downmix hook'
+# Stereo-downmix feature REMOVED 2026-10-03 (flawed: declaring CHANNELS="2" on a 5.1 AC-3
+# bitstream made the stick/media3 do a thin fold). The AC-3 rendition is left stock; assert
+# no trace of it comes back on an upstream merge / conflict fix.
+assert not any(getattr(f, 'key', None) == 'stereo_downmix' for f in directv.DirectvScraper.config_schema), \
+    'the removed stereo_downmix toggle is back'
+assert 'stereo_downmix' not in inspect.getsource(directv_proxy.directv_browser_manifest), \
+    'the removed stereo-downmix master hook is back in the relay'
 # channel/v2's streamUrls groups map to the stream (DAI) and fallback (Data Center) URLs.
 v2pb = {'streamUrls': [{'groupName': 'DAI', 'URLs': ['https://x.yospace.com/csm/a.m3u8?a=1', 'https://y.yospace.com/b']},
                        {'groupName': 'Data Center', 'URLs': ['https://cdn.example/c.m3u8']}]}

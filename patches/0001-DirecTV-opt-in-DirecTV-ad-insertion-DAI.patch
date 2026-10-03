@@ -7,22 +7,20 @@ Adds a per-source 'Use DirecTV ad insertion (DAI)' toggle. When on, playback use
 
 The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line hooks.
 ---
- app/routes/api_sources.py          |  48 +-
- app/routes/directv_proxy.py        |  34 +-
- app/scrapers/directv.py            | 122 +++--
- app/scrapers/directv_dai.py        | 460 +++++++++++++++++++
- app/scrapers/dtv_aac_ads.py        |  49 ++
- app/scrapers/dtv_aac_gain.py       | 640 ++++++++++++++++++++++++++
- app/scrapers/dtv_android.py        | 702 +++++++++++++++++++++++++++++
- app/scrapers/dtv_stereo_downmix.py |  53 +++
- app/source_config.py               |   5 +
- app/templates/admin/sources.html   |  60 ++-
- 10 files changed, 2085 insertions(+), 88 deletions(-)
+ app/routes/api_sources.py        |  48 ++-
+ app/routes/directv_proxy.py      |  32 +-
+ app/scrapers/directv.py          | 120 +++---
+ app/scrapers/directv_dai.py      | 460 ++++++++++++++++++++
+ app/scrapers/dtv_aac_ads.py      |  49 +++
+ app/scrapers/dtv_aac_gain.py     | 640 ++++++++++++++++++++++++++++
+ app/scrapers/dtv_android.py      | 702 +++++++++++++++++++++++++++++++
+ app/source_config.py             |   5 +
+ app/templates/admin/sources.html |  58 ++-
+ 9 files changed, 2027 insertions(+), 87 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_aac_gain.py
  create mode 100644 app/scrapers/dtv_android.py
- create mode 100644 app/scrapers/dtv_stereo_downmix.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
 index 8e46cf7..28a911e 100644
@@ -102,7 +100,7 @@ index 8e46cf7..28a911e 100644
  def directv_auth_status(source_id):
      import redis as _redis
 diff --git a/app/routes/directv_proxy.py b/app/routes/directv_proxy.py
-index e7680df..0e98347 100644
+index e7680df..75466d4 100644
 --- a/app/routes/directv_proxy.py
 +++ b/app/routes/directv_proxy.py
 @@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, request
@@ -110,7 +108,7 @@ index e7680df..0e98347 100644
  from app.config_store import persist_source_cache_updates, persist_source_config_updates
  from ..models import AppSettings, Channel, Source
 -from ..scrapers import registry
-+from ..scrapers import dtv_aac_ads, dtv_aac_gain, dtv_android, dtv_stereo_downmix, registry
++from ..scrapers import dtv_aac_ads, dtv_aac_gain, dtv_android, registry
  
  logger = logging.getLogger(__name__)
  directv_proxy_bp = Blueprint('directv_proxy', __name__)
@@ -152,15 +150,6 @@ index e7680df..0e98347 100644
      except Exception as exc:
          logger.warning('[directv-browser] manifest fetch failed for channel=%s: %s', channel_id, exc)
          return _unavailable_response()
-@@ -347,7 +345,7 @@ def directv_browser_manifest(channel_id: str):
-     if r.status_code >= 400:
-         return Response(r.content, status=r.status_code, content_type=r.headers.get('Content-Type') or 'text/plain')
-     return Response(
--        _rewrite_directv_browser_playlist(r.text, r.url),
-+        _rewrite_directv_browser_playlist(dtv_stereo_downmix.stereo_downmix_master(r.text, channel.source.config), r.url),
-         status=200,
-         mimetype='application/vnd.apple.mpegurl',
-         headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'},
 @@ -363,7 +361,7 @@ def directv_browser_asset():
      if target.scheme != 'https' or not _directv_browser_cdn_allowed(target.hostname or ''):
          abort(400)
@@ -202,20 +191,19 @@ index e7680df..0e98347 100644
      for key in ('Content-Length', 'Accept-Ranges', 'Content-Range'):
          value = r.headers.get(key)
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
-index e796bf3..c58ba89 100644
+index e796bf3..9ccf86b 100644
 --- a/app/scrapers/directv.py
 +++ b/app/scrapers/directv.py
-@@ -84,6 +84,9 @@ except ImportError:
+@@ -84,6 +84,8 @@ except ImportError:
      _CFFI_IMPERSONATE = None
  
  from .directv_numbers import assign_provider_numbers
 +from . import directv_dai
 +from . import dtv_android
-+from . import dtv_stereo_downmix
  from .base import (
      BaseScraper, ChannelData, ConfigField, ProgramData, ScrapeSkipError,
      infer_language_from_metadata,
-@@ -227,6 +230,7 @@ def _license_content_id_from_stream_url(stream_url: str, fallback: str) -> str:
+@@ -227,6 +229,7 @@ def _license_content_id_from_stream_url(stream_url: str, fallback: str) -> str:
  
  def _fetch_channel_playback(
      bearer_token: str, cookies: list[dict], client_context: str | None, ccid: str,
@@ -223,7 +211,7 @@ index e796bf3..c58ba89 100644
  ) -> dict | None:
      """GET /right/authorization/channel/v1 for one channel — the manifest +
      playToken resolve. Used both by resolve() (via the scraper's live
-@@ -262,7 +266,7 @@ def _fetch_channel_playback(
+@@ -262,7 +265,7 @@ def _fetch_channel_playback(
          params['clientContext'] = client_context
  
      try:
@@ -232,7 +220,7 @@ index e796bf3..c58ba89 100644
      except requests.RequestException as exc:
          logger.warning('[directv] channel/v1 request failed for ccid=%s: %s', ccid, exc)
          return None
-@@ -286,7 +290,7 @@ def _fetch_channel_playback(
+@@ -286,7 +289,7 @@ def _fetch_channel_playback(
          return None
  
      pb = data.get('playbackData') or {}
@@ -241,7 +229,7 @@ index e796bf3..c58ba89 100644
      play_token = (data.get('dRights') or {}).get('playToken')
      if not fallback_url or not play_token:
          return None
-@@ -295,6 +299,7 @@ def _fetch_channel_playback(
+@@ -295,6 +298,7 @@ def _fetch_channel_playback(
          'play_token': play_token,
          'license_content_id': _license_content_id_from_stream_url(fallback_url, ccid),
          'cached_at': time.time(),
@@ -249,7 +237,7 @@ index e796bf3..c58ba89 100644
      }
  
  
-@@ -932,6 +937,7 @@ def capture_directv_auth_cffi(
+@@ -932,6 +936,7 @@ def capture_directv_auth_cffi(
          'cookies': [],
          'captured_at': time.time(),
          'auth_method': 'curl_cffi',
@@ -257,7 +245,7 @@ index e796bf3..c58ba89 100644
      }
  
  
-@@ -1219,6 +1225,7 @@ def capture_directv_auth(
+@@ -1219,6 +1224,7 @@ def capture_directv_auth(
                  for c in context.cookies()
              ]
              captured['captured_at'] = time.time()
@@ -265,7 +253,7 @@ index e796bf3..c58ba89 100644
              _status('success', 'Captured DirecTV session.')
              return captured
          finally:
-@@ -1253,7 +1260,7 @@ def run_directv_auth(
+@@ -1253,7 +1259,7 @@ def run_directv_auth(
  
      try:
          try:
@@ -274,7 +262,7 @@ index e796bf3..c58ba89 100644
          except Exception as exc:
              logger.warning('[directv-auth] capture failed for source_id=%s: %s', source_id, exc)
              _write_status(r, source_id, 'failed', str(exc))
-@@ -1298,6 +1305,7 @@ def run_directv_auth(
+@@ -1298,6 +1304,7 @@ def run_directv_auth(
                          cfg.pop('identity_cookie_expires_at', None)
                      if result.get('auth_method'):
                          cfg['auth_method'] = result['auth_method']
@@ -282,7 +270,7 @@ index e796bf3..c58ba89 100644
                      source.config = cfg
                      db.session.commit()
                      persisted = True
-@@ -1363,13 +1371,11 @@ class DirectvScraper(BaseScraper):
+@@ -1363,13 +1370,11 @@ class DirectvScraper(BaseScraper):
      stream_audit_enabled  = True
      audit_requires_config = ['username', 'password']
  
@@ -300,16 +288,15 @@ index e796bf3..c58ba89 100644
          ConfigField('exclude_fast_channels', 'Exclude FAST channels',
                      field_type='toggle', default='false',
                      help_text=(
-@@ -1382,6 +1388,8 @@ class DirectvScraper(BaseScraper):
+@@ -1382,6 +1387,7 @@ class DirectvScraper(BaseScraper):
                          'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). '
                          'Channels that share a number get subchannels, like 213.1.'
                      )),
 +        *directv_dai.CONFIG_FIELDS,
-+        *dtv_stereo_downmix.CONFIG_FIELDS,
      ]
  
      _FAST_CHANNEL_NUMBER_RANGE = range(4000, 5000)
-@@ -1436,41 +1444,42 @@ class DirectvScraper(BaseScraper):
+@@ -1436,41 +1442,42 @@ class DirectvScraper(BaseScraper):
      # ── Auth ─────────────────────────────────────────────────────────────────
  
      def _token_stale(self) -> bool:
@@ -378,7 +365,7 @@ index e796bf3..c58ba89 100644
          """
          try:
              import redis as _redis
-@@ -1506,8 +1515,8 @@ class DirectvScraper(BaseScraper):
+@@ -1506,8 +1513,8 @@ class DirectvScraper(BaseScraper):
                  'app.scrapers.directv.run_directv_auth',
                  current_app.config['REDIS_URL'],
                  source.id,
@@ -389,7 +376,7 @@ index e796bf3..c58ba89 100644
                  None,
                  lock_key,
                  job_timeout=1800,
-@@ -1613,6 +1622,7 @@ class DirectvScraper(BaseScraper):
+@@ -1613,6 +1620,7 @@ class DirectvScraper(BaseScraper):
                  # also contain internal channel IDs; retain resolver validation and
                  # community-map fallback rather than accepting every value.
                  external_listing_id = _pick(row, 'externalListingId')
@@ -397,7 +384,7 @@ index e796bf3..c58ba89 100644
  
                  channels.append(ChannelData(
                      source_channel_id=ccid,
-@@ -1897,7 +1907,7 @@ class DirectvScraper(BaseScraper):
+@@ -1897,7 +1905,7 @@ class DirectvScraper(BaseScraper):
              raise RuntimeError(f'DirecTV Stream: malformed stream_url: {raw_url}')
  
          cached = (self.cache.get('directv_playback') or {}).get(ccid)
@@ -406,7 +393,7 @@ index e796bf3..c58ba89 100644
              return cached['fallback_url']
  
          bearer = self.config.get('bearer_token')
-@@ -1910,13 +1920,30 @@ class DirectvScraper(BaseScraper):
+@@ -1910,13 +1918,30 @@ class DirectvScraper(BaseScraper):
          try:
              result = _fetch_channel_playback(
                  bearer, self.config.get('cookies') or [], self.config.get('client_context'), ccid,
@@ -442,7 +429,7 @@ index e796bf3..c58ba89 100644
          if not result:
              raise RuntimeError(f'DirecTV Stream: could not resolve playback for channel {ccid}')
  
-@@ -1952,11 +1979,9 @@ class DirectvScraper(BaseScraper):
+@@ -1952,11 +1977,9 @@ class DirectvScraper(BaseScraper):
  
      @classmethod
      def license_request_headers(cls, config: dict) -> dict:
@@ -457,7 +444,7 @@ index e796bf3..c58ba89 100644
  
      @classmethod
      def prepare_activation_request(cls, challenge: bytes, config: dict) -> tuple[bytes, dict]:
-@@ -2020,6 +2045,7 @@ class DirectvScraper(BaseScraper):
+@@ -2020,6 +2043,7 @@ class DirectvScraper(BaseScraper):
              try:
                  fresh = _fetch_channel_playback(
                      bearer, config.get('cookies') or [], config.get('client_context'), channel_id,
@@ -2340,65 +2327,6 @@ index 0000000..0943011
 +    params.pop('dualManifest', None)
 +    params.setdefault('startOver', 'false')
 +    return _CHANNEL_AUTH_V2
-diff --git a/app/scrapers/dtv_stereo_downmix.py b/app/scrapers/dtv_stereo_downmix.py
-new file mode 100644
-index 0000000..319ffa6
---- /dev/null
-+++ b/app/scrapers/dtv_stereo_downmix.py
-@@ -0,0 +1,53 @@
-+"""DirecTV: optionally declare the AC-3 audio rendition as stereo in the master.
-+
-+Opt-in toggle ("Downmix DirecTV audio to stereo"), off by default. When on, the master
-+playlist we proxy declares DirecTV's AC-3 audio rendition ``CHANNELS="2"`` instead of
-+``"6"``. On Android 11 the stick's media3 sets the AC-3 decoder's channel count from the
-+master's CHANNELS attribute: with ``CHANNELS="6"`` the platform decoder does its own
-+band-limited 5.1->2.0 downmix (muffled, and a few dB quieter after the fold-down), while
-+``CHANNELS="2"`` makes it emit AC-3's own full-range Lo/Ro stereo downmix -- fuller and
-+louder. That lifts the quiet AC-3 programming toward the (hot) inserted-ad level, so a
-+bridge stick with a stereo-only (PCM) encoder can raise the whole feed uniformly on the
-+LinkPi/receiver without the ads blasting.
-+
-+Only the master's AC-3 ``#EXT-X-MEDIA`` CHANNELS attribute changes -- the 384 kbps AC-3
-+segments, the codec, the STREAM-INF lines and the other renditions are untouched, and
-+media playlists pass through unchanged. Leave it off for an output that passes AC-3
-+through to an AV receiver (keep 5.1). Lives in its own module; directv.py/directv_proxy.py
-+get one-line hooks.
-+"""
-+from __future__ import annotations
-+
-+import re
-+
-+from .base import ConfigField
-+
-+CONFIG_FIELDS = (
-+    ConfigField(
-+        'stereo_downmix', 'Downmix DirecTV audio to stereo',
-+        field_type='toggle', default='false',
-+        help_text=(
-+            'On = declare DirecTV audio as stereo so a bridge stick with a stereo-only '
-+            '(PCM) output plays a fuller, louder full-range downmix instead of the muffled, '
-+            'quieter in-decoder 5.1->2.0 one, which also closes the loudness gap to the '
-+            'inserted ads. Off (default) = keep the 5.1 declaration for AC-3 passthrough to a receiver.'
-+        )),
-+)
-+
-+# The AC-3 audio rendition line in a master playlist, and its CHANNELS attribute.
-+_AC3_MEDIA_RE = re.compile(r'(#EXT-X-MEDIA:[^\r\n]*?TYPE=AUDIO[^\r\n]*?GROUP-ID="AC3[^"]*"[^\r\n]*)', re.IGNORECASE)
-+_CHANNELS_RE = re.compile(r'CHANNELS="\d+"', re.IGNORECASE)
-+
-+
-+def enabled(config: dict | None) -> bool:
-+    return str((config or {}).get('stereo_downmix', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
-+
-+
-+def stereo_downmix_master(master: str, config: dict | None) -> str:
-+    """With the toggle on, rewrite the AC-3 audio rendition's CHANNELS to "2" in the master
-+    so the bridge player's AC-3 decoder emits AC-3's own full-range stereo downmix. A no-op
-+    when the toggle is off or the playlist has no AC-3 audio rendition (so it's safe on any
-+    master or media playlist)."""
-+    if not enabled(config) or 'TYPE=AUDIO' not in (master or '') or 'AC3' not in master:
-+        return master
-+    return _AC3_MEDIA_RE.sub(lambda m: _CHANNELS_RE.sub('CHANNELS="2"', m.group(1)), master)
 diff --git a/app/source_config.py b/app/source_config.py
 index 640deee..66b972d 100644
 --- a/app/source_config.py
@@ -2416,7 +2344,7 @@ index 640deee..66b972d 100644
      # into login mode but hasn't supplied both credentials yet. Installs
      # from before 'auth_mode' existed (username/password used to be
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index b818ab0..6159d7e 100644
+index b818ab0..dfa165b 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
 @@ -3141,7 +3141,6 @@
@@ -2447,14 +2375,12 @@ index b818ab0..6159d7e 100644
              </span>
            </div>
          </div>
-@@ -3189,28 +3187,15 @@
+@@ -3189,28 +3187,13 @@
              'On = leave out free, ad-supported channels (DirecTV Stream numbers these 4000-4999).')}
            ${toggleHtml('use_provider_numbers', 'Use DirecTV channel numbers',
              'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). Channels that share a number get subchannels, like 213.1.')}
 +          ${toggleHtml('use_dai', 'Use DirecTV ad insertion (DAI)',
 +            'On = play the stream DirecTV\'s own apps use, with DirecTV\'s local ads in commercial breaks. Off = the national feed without DirecTV\'s inserted ads.')}
-+          ${toggleHtml('stereo_downmix', 'Downmix DirecTV audio to stereo',
-+            'On = declare DirecTV audio as stereo so a bridge stick with a stereo-only (PCM) output plays a fuller, louder full-range downmix (closing the loudness gap to inserted ads). Off (default) = keep 5.1 for AC-3 passthrough to a receiver.')}
          </div>
  
 -        <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
@@ -2481,7 +2407,7 @@ index b818ab0..6159d7e 100644
            <button class="btn btn-run" type="button" onclick="saveSourceConfig(${sourceId})">Save Settings</button>
          </div>`;
      }
-@@ -3236,6 +3221,35 @@
+@@ -3236,6 +3219,35 @@
        directvPollStatus(sourceId);
      }
  
@@ -2517,7 +2443,7 @@ index b818ab0..6159d7e 100644
      function directvPollStatus(sourceId) {
        if (_directvPollTimer) clearInterval(_directvPollTimer);
        _directvPollTimer = setInterval(() => _directvCheckStatus(sourceId), 2000);
-@@ -3256,7 +3270,7 @@
+@@ -3256,7 +3268,7 @@
        const statusMap = {
          idle: null,
          starting: '<span style="color:var(--text-muted)">Starting browser...</span>',
