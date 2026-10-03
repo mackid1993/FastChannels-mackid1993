@@ -25,7 +25,7 @@ ls "$root/patches"
 
 # Keep source/ (readable copies of the overlay's own modules — files upstream doesn't
 # have, which the patch adds in full) in sync with the patch. See source/README.md.
-for f in app/scrapers/directv_dai.py app/scrapers/dtv_android.py app/scrapers/dtv_aac_ads.py; do
+for f in app/scrapers/directv_dai.py app/scrapers/dtv_android.py app/scrapers/dtv_aac_ads.py app/scrapers/dtv_stereo_downmix.py; do
   if [ -f "$dir/$f" ]; then
     mkdir -p "$root/source/$(dirname "$f")"
     cp "$dir/$f" "$root/source/$f"

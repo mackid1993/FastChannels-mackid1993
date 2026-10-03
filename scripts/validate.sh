@@ -82,5 +82,9 @@ check app/routes/directv_proxy.py "dtv_android.player_headers()"
 check app/routes/directv_proxy.py "dtv_aac_ads.swap_muffled_ads("
 check app/routes/directv_proxy.py "'yospace.com',  # DAI"
 check app/templates/admin/sources.html "toggleHtml('use_dai'"
+# Opt-in stereo-downmix (its own module): the master-rewrite hook + the UI toggle.
+check app/scrapers/directv.py "dtv_stereo_downmix.CONFIG_FIELDS"
+check app/routes/directv_proxy.py "dtv_stereo_downmix.stereo_downmix_master("
+check app/templates/admin/sources.html "toggleHtml('stereo_downmix'"
 [ "$missing" -eq 0 ]
 echo "All static checks passed."
