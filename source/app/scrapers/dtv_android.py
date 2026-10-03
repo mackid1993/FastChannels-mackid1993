@@ -60,12 +60,16 @@ _CLIENT_MODEL = 'Chrome'
 _POLL_DEADLINE = 540
 _POLL_MIN_INTERVAL = 5
 
-# If the token response ever gives us an expiry, refresh a little before it (the way the
-# app does, via RefreshTokenBeforeExpirationMinutes). DirecTV's response carries no
-# expiry and the token is opaque, so in practice we don't refresh on a timer at all — the
-# token rides until a real request is rejected (401), which the reactive re-auth path
-# turns into a refresh. The 401 is the check; there is no blind auto-refresh.
+# The Android TV app refreshes every ~55 min (its bundled minRefreshTimeout) and re-mints
+# its DRM activation token on each refresh (reqParams=ACTIVATIONTOKEN — see
+# refresh_session), so DRM never meets the activation JWT's ~2 h expiry. We do the same:
+# background_refresh_due()/pre_run_setup refresh proactively on that cadence, and the
+# reactive paths (resolve + drm_reauth) refresh on an actual rejection. If a token response
+# ever carries a real expiry we refresh this many seconds before it.
 _REFRESH_BUFFER = 600
+_REFRESH_INTERVAL = 55 * 60   # the app's minRefreshTimeout: keep the session warm so a tune
+#                               never meets a token near its ~2 h activation-JWT expiry.
+_DRM_REAUTH_COOLDOWN = 120    # single-flight window for drm_reauth across the sticks' retries
 
 
 def _app_headers() -> dict:
@@ -140,6 +144,26 @@ def token_stale(config: dict | None) -> bool:
     if exp:
         return time.time() > (exp - _REFRESH_BUFFER)
     return False
+
+
+def background_refresh_due(config: dict | None) -> bool:
+    """True when a *usable* Android TV session is old enough to refresh proactively, the
+    way the app refreshes every ~55 min. Drives pre_run_setup's background refresh so the
+    DRM activation token is re-minted before any tune needs it — and so a container that
+    was off for days refreshes itself on the next scrape instead of meeting a dead token.
+    False when there is nothing to refresh with (no bearer/refresh/device id); the reactive
+    paths (resolve + drm_reauth) still cover a session that goes stale between scrapes."""
+    config = config or {}
+    if (config.get('auth_method') or '') != 'dtv_android':
+        return False
+    if not (config.get('bearer_token') and config.get('refresh_token')
+            and config.get('dtv_android_device_id')):
+        return False
+    exp = _num(config.get('dtv_android_expires_at'))
+    if exp:
+        return time.time() > (exp - _REFRESH_BUFFER)
+    captured = _num(config.get('token_captured_at')) or 0.0
+    return (time.time() - captured) >= _REFRESH_INTERVAL
 
 
 def _device_class_id() -> str:
@@ -246,11 +270,18 @@ def refresh_session(refresh_token: str, device_class_id: str, *, on_status=None)
     from . import directv  # lazy
 
     s = requests.Session()
-    # Verified shape: clientID in the query string; clientMake, clientModel and
-    # refresh_token (snake_case) in the form body.
+    # The Android TV app's own refresh builder (index.android.bundle, AuthenticationPath.
+    # Refresh) sets exactly clientMake, clientModel and refresh_token (snake_case) in the
+    # form body, PLUS reqParams=ACTIVATIONTOKEN; clientID stays in the query (verified
+    # live). That one reqParams is what makes authn-refreshgo return a FRESH activationToken
+    # in valuePairs — the app re-mints the DRM activation token on every refresh so DRM
+    # survives the activation JWT's ~2 h expiry without a re-login. (Login/token requests
+    # use reqParams=DEVICEID,AUTHGROUPS; the refresh sends exactly ['ACTIVATIONTOKEN'].
+    # extraParams → repeated urlencoded reqParams fields. The refresh builder sets no
+    # deviceClassID, so we send none either.)
     r = s.post(_REFRESH_URL, params={'clientID': _CLIENT_ID},
                data=[('clientMake', _CLIENT_MAKE), ('clientModel', _CLIENT_MODEL),
-                     ('refresh_token', refresh_token)],
+                     ('refresh_token', refresh_token), ('reqParams', 'ACTIVATIONTOKEN')],
                headers={**_app_headers(), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'}, timeout=30)
     if r.status_code < 200 or r.status_code >= 300:
         logger.warning('[dtv-android] refresh HTTP %s: %s', r.status_code, (r.text or '')[:300])
@@ -262,8 +293,9 @@ def refresh_session(refresh_token: str, device_class_id: str, *, on_status=None)
     if not bearer:
         raise _auth_error('token refresh returned no access token')
     new_refresh = (token_data.get('refresh_token') or token_data.get('refreshToken') or refresh_token).strip()
-    # activationToken may be absent on refresh; run_directv_auth keeps the stored one
-    # when this is empty, so the DRM identity survives a refresh.
+    # The refresh now re-mints activationToken (reqParams=ACTIVATIONTOKEN above), so this is
+    # normally present and fresh. If a response ever omits it, run_directv_auth keeps the
+    # stored one — so a refresh is never worse than before for DRM.
     activation = directv._normalize_activation_token(
         ((token_data.get('valuePairs') or {}).get('activationToken') or '').strip()
     )
@@ -344,78 +376,137 @@ def sign_in(source_id: int, username: str, password: str, *, app=None, on_status
     cfg = _load_source_config(source_id, app)
     refresh = (cfg.get('refresh_token') or '').strip()
     device_id = (cfg.get('dtv_android_device_id') or '').strip()
-    activation = (cfg.get('activation_token') or '').strip()
-    # A refresh never returns a new activationToken (it is absent from the refresh
-    # valuePairs — verified live), so when the DRM activation token is missing we must
-    # NOT refresh: that would hand back a fresh bearer but leave DRM dead. Fall through
-    # to a fresh device-code grant, which is the only thing that mints the token.
-    if refresh and device_id and activation and cfg.get('auth_method') == 'dtv_android':
+    # The refresh re-mints the DRM activation token (reqParams=ACTIVATIONTOKEN — see
+    # refresh_session), so a stored Android TV session recovers end to end by refreshing,
+    # even when the activation token is missing or expired. A real ATV client never
+    # re-logs-in. Fall through to the one-time device-code grant only when there is no
+    # refreshable session, or the refresh token itself is dead.
+    if refresh and device_id and cfg.get('auth_method') == 'dtv_android':
         try:
             if on_status:
                 on_status('running', 'Refreshing Android TV session…')
-            return refresh_session(refresh, device_id, on_status=on_status)
+            result = refresh_session(refresh, device_id, on_status=on_status)
+            # Accept the refresh only if DRM stays usable: it re-minted an activation token,
+            # or one is still stored (run_directv_auth keeps the stored one when the refresh
+            # omits it). If neither, the session can't play, so fall through to the grant.
+            # Testing "still stored" (not "the refresh omitted it") keeps a background
+            # refresh from launching a device-code grant nobody is there to approve.
+            if (result.get('activation_token') or '').strip() or (cfg.get('activation_token') or '').strip():
+                return result
+            logger.warning('[dtv-android] refresh returned no activation token and none is stored; '
+                           'running the one-time device-code grant')
         except Exception as exc:
             logger.warning('[dtv-android] refresh failed (%s); re-granting via device code', exc)
     return capture_android_auth(username, password, on_status=on_status)
 
 
 def drm_reauth(source, reason: str) -> bool:
-    """DRM-failure recovery for an Android TV session. The relay's upstream
+    """Self-healing DRM-failure recovery for an Android TV session. The relay's upstream
     _directv_trigger_reauth calls this first (a one-line hook); returning True means we
     handled it and the caller skips its old web-client recovery (wipe the tokens + a
-    background re-login), which cannot help an Android TV session and starved DRM into a
-    1001/1009 loop. Returns False for a non-Android-TV session so that old path still runs.
+    browser re-login), which can't help an Android TV session. Returns False for a
+    non-Android-TV session so that old path still runs.
 
-    How an Android TV session actually recovers:
-      * A bearer *refresh* never returns a new activationToken (absent from the refresh
-        valuePairs — verified live), so a refresh can't fix a DRM failure. We never queue one.
-      * The activation token is the durable root; the identityCookie minted from it is the
-        thing that expires or gets rejected. So on a rejected cookie (license 1009) we drop
-        the cached cookie and let the very next tune re-activate with the SAME stored token.
-      * We NEVER clear activation_token. Clearing it is unrecoverable without a fresh
-        device-code grant, which is exactly what produced the loop this replaces.
-      * If the activation token is already gone, retrying can't restore it: we log that the
-        user must re-authenticate (one-time grant in source settings) and stop — no storm.
+    How it heals, with no manual step:
+      * A DRM 403 is either a stale identity cookie (license 1009) or an expired activation
+        token (activation 1002). Both are cured by minting a FRESH activation token, which
+        a refresh now does (reqParams=ACTIVATIONTOKEN — see refresh_session).
+      * So we refresh the session in place (new bearer + fresh activation token), drop the
+        cached identity cookie, and let the player's next retry re-activate with the fresh
+        token. Single-flight behind a redis lock so the sticks' 2-3 s retries don't fire
+        concurrent refreshes (which rotate the refresh token and could trip reuse-detection).
+      * Only if the refresh itself fails (the refresh token is dead or absent) can we not
+        self-heal: we clear the dead activation token — safe here because we return True so
+        there is no re-login storm — and log that the user must re-authenticate once (the
+        one-time device-code grant in source settings), which mints a new token.
     """
     cfg = dict(source.config or {})
     if (cfg.get('auth_method') or '') != 'dtv_android':
         return False
 
-    # Drop the cached DRM identity cookie so the next license request re-activates
-    # (the cookie, not the token, is what gets rejected). Best-effort: if the relay's
-    # cache helpers move, degrade to "recovers once the cache TTL lapses", never crash.
+    from ..routes import directv_proxy, play
+    from ..extensions import db
     try:
-        from ..routes import directv_proxy, play
         rdb = play._amazon_sht_redis()
-        if rdb is not None:
-            sid, _ = directv_proxy._directv_device_session_id()
-            rdb.delete(directv_proxy._directv_identity_cache_key(source.id, sid))
     except Exception:
-        logger.debug('[dtv-android] could not flush cached DRM identity after %s', reason, exc_info=True)
+        rdb = None
 
-    # Also drop any identity cookie persisted on the source config (keep the activation
-    # token, bearer and refresh token). Never pop activation_token.
+    def _flush_redis_cookie() -> None:
+        # Drop the cached identity cookie so the next license request re-activates with the
+        # (now fresh) token. Best-effort; never crash the relay.
+        try:
+            if rdb is not None:
+                sid, _ = directv_proxy._directv_device_session_id()
+                rdb.delete(directv_proxy._directv_identity_cache_key(source.id, sid))
+        except Exception:
+            logger.debug('[dtv-android] could not flush cached DRM identity after %s', reason, exc_info=True)
+
+    # Single-flight: one refresh per source across the 2-3 s retry storm and both sticks.
+    # Share the key _start_background_reauth uses so a background refresh and a
+    # DRM-triggered refresh can't run concurrently with the same refresh token (which could
+    # trip DirecTV's refresh reuse-detection and revoke the session).
+    have_lock = True
+    if rdb is not None:
+        try:
+            have_lock = bool(rdb.set(f'directv:auth:refreshing:{source.name}', '1', nx=True, ex=_DRM_REAUTH_COOLDOWN))
+        except Exception:
+            have_lock = True  # redis down: don't wedge recovery, just proceed unlocked
+    if not have_lock:
+        logger.info('[dtv-android] %s — a DRM refresh is already in flight; dropping cached identity', reason)
+        _flush_redis_cookie()
+        return True
+
+    rt = (cfg.get('refresh_token') or '').strip()
+    did = (cfg.get('dtv_android_device_id') or '').strip()
+    result = None
+    if rt and did:
+        try:
+            result = refresh_session(rt, did)
+        except Exception as exc:
+            logger.warning('[dtv-android] DRM-recovery refresh failed after %s: %s', reason, exc)
+
+    # Healed only if the refresh actually returned a fresh activation token — that is what
+    # the next re-activation needs. The reqParams=ACTIVATIONTOKEN refresh is verified from
+    # the app bundle, not live, so degrade honestly if DirecTV ever omits it.
+    minted = bool(result and (result.get('activation_token') or '').strip())
     try:
-        from ..extensions import db
-        if 'identity_cookie' in cfg or 'identity_cookie_expires_at' in cfg:
-            cfg.pop('identity_cookie', None)
-            cfg.pop('identity_cookie_expires_at', None)
-            source.config = cfg
-            db.session.commit()
+        fresh = dict(source.config or {})
+        if result:
+            # Always persist the rotated bearer + refresh token so we never orphan the
+            # rotated refresh token, even when no activation token came back.
+            fresh['bearer_token'] = result['bearer_token']
+            fresh['refresh_token'] = result.get('refresh_token') or rt
+            fresh['token_captured_at'] = result['captured_at']
+            if result.get('token_expires_at'):
+                fresh['dtv_android_expires_at'] = result['token_expires_at']
+        if minted:
+            fresh['activation_token'] = result['activation_token']
+        else:
+            # No fresh token (refresh failed, or succeeded but returned none): the stored
+            # token is dead. Clear it so the "Authenticate" button runs a fresh device-code
+            # grant, which mints a new one. Safe here — we return True, so no re-login storm.
+            fresh.pop('activation_token', None)
+        fresh.pop('identity_cookie', None)
+        fresh.pop('identity_cookie_expires_at', None)
+        source.config = fresh
+        db.session.commit()
     except Exception:
         try:
-            from ..extensions import db
             db.session.rollback()
         except Exception:
             pass
-        logger.debug('[dtv-android] could not clear stored identity cookie after %s', reason, exc_info=True)
+        logger.debug('[dtv-android] could not persist DRM recovery after %s', reason, exc_info=True)
+    _flush_redis_cookie()
 
-    if not (cfg.get('activation_token') or '').strip():
-        logger.warning('[dtv-android] %s but no DRM activation token is stored — re-authenticate '
-                       '(one-time device-code grant) in source settings; a refresh cannot restore it', reason)
+    if minted:
+        logger.info('[dtv-android] %s — refreshed the Android TV session and re-minted the DRM '
+                    'activation token; the next tune re-activates automatically', reason)
+    elif result:
+        logger.warning('[dtv-android] %s — refresh succeeded but returned no DRM activation token; '
+                       're-authenticate once in source settings (Log out, then Authenticate)', reason)
     else:
-        logger.info('[dtv-android] %s — dropped cached DRM identity; the next tune re-activates with '
-                    'the stored token (no refresh storm)', reason)
+        logger.warning('[dtv-android] %s and no working refresh token — re-authenticate once in '
+                       'source settings (Log out, then Authenticate)', reason)
     return True
 
 

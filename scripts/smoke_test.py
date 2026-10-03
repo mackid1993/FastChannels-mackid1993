@@ -74,8 +74,10 @@ assert 'dtv_android.sign_in(' in inspect.getsource(directv.run_directv_auth), \
 assert 'dtv_android.license_headers(' in inspect.getsource(directv.DirectvScraper.license_request_headers), \
     'DRM license headers are no longer the Android TV headers (app UA, no stream.directv.com Origin/Referer)'
 
-# Token lifecycle logic (pure, no network): never refresh on a timer — "stale" means
-# only "no bearer"; a known expiry refreshes just before it; a tune recovers inline.
+# Token lifecycle logic (pure, no network): "stale" (-> must authenticate) means only
+# "no bearer", or past a known expiry. Separately, a warm Android TV session refreshes in
+# the background on the app's ~55-min cadence (background_refresh_due) — re-minting the DRM
+# activation token — while a tune recovers inline (refresh_in_place) and drm_reauth self-heals.
 import time as _t  # noqa: E402
 assert dtv_android.token_stale({}) is True, 'no bearer must be stale'
 assert dtv_android.token_stale({'bearer_token': 'x'}) is False, 'a bearer with no tracked expiry must not be timer-stale'
@@ -88,6 +90,29 @@ assert dtv_android.token_expires_at({}) is None, 'no expiry field -> None (ride 
 assert callable(getattr(dtv_android, 'refresh_in_place', None)), 'the inline tune-time refresh (refresh_in_place) is missing'
 assert 'dtv_android.refresh_in_place(' in inspect.getsource(directv.DirectvScraper.resolve), \
     'resolve() no longer refreshes inline + retries on an expired token, so a tune can fail instead of recovering'
+
+# Background refresh keeps the DRM session warm like the app (re-minting the activation
+# token) so a tune — even one right after the box was off for days — never meets a dead
+# token. A fresh capture is not due; an old one is; Android TV only.
+_warm = {'auth_method': 'dtv_android', 'bearer_token': 'x', 'refresh_token': 'r',
+         'dtv_android_device_id': 'd'}
+assert dtv_android.background_refresh_due({}) is False, 'nothing to refresh with -> not due'
+assert dtv_android.background_refresh_due({**_warm, 'token_captured_at': _t.time()}) is False, \
+    'a freshly-captured session is not due for a background refresh'
+assert dtv_android.background_refresh_due({**_warm, 'token_captured_at': _t.time() - 4000}) is True, \
+    'an old session must be due for a background refresh (keeps the DRM activation token warm)'
+assert dtv_android.background_refresh_due({**_warm, 'token_captured_at': _t.time() - 4000, 'auth_method': 'web'}) is False, \
+    'background refresh is Android-TV only'
+# The refresh actually re-mints the DRM activation token: it sends reqParams=ACTIVATIONTOKEN
+# (the app's own refresh param), without which authn-refreshgo returns no activation token.
+assert "'ACTIVATIONTOKEN'" in inspect.getsource(dtv_android.refresh_session), \
+    'refresh_session must send reqParams=ACTIVATIONTOKEN so the refresh re-mints the DRM activation token'
+# pre_run_setup drives the background refresh (warm the session on the scrape cadence).
+assert 'background_refresh_due(' in inspect.getsource(directv.DirectvScraper.pre_run_setup), \
+    'pre_run_setup no longer kicks the background refresh that keeps the DRM session warm'
+# drm_reauth self-heals by refreshing (re-minting the token), not by reusing a dead one.
+assert 'refresh_session(' in inspect.getsource(dtv_android.drm_reauth), \
+    'drm_reauth must refresh (re-mint the activation token) to recover, not reuse the expired token'
 
 # The Android-TV client logic (device reading, app UA, channel/v2 request) lives in
 # dtv_android so the Android login is portable; directv_dai (DAI) depends on it, never

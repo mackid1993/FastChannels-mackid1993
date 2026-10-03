@@ -74,6 +74,9 @@ check $d "directv_dai.cached_url_usable("
 # The Android TV client logic (channel/v2 request, app User-Agent, device reading) lives
 # in dtv_android so the Android login is portable; DAI depends on it, not the reverse.
 check $d "dtv_android.android_auth_request("
+# pre_run_setup keeps the DRM session warm on the app's ~55-min refresh cadence (re-minting
+# the activation token) so a tune never meets a dead token; logic lives in dtv_android.
+check $d "dtv_android.background_refresh_due("
 # Two callers pass dai=: resolve() and the license path.
 [ "$(grep -cE -- 'dai=directv_dai\.request_flags\(' $d)" -ge 2 ] \
     || { echo "::error file=$d::missing DAI hook: dai=directv_dai.request_flags(...) in resolve() and the license path"; missing=1; }
