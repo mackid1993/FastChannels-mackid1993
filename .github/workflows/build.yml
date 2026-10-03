@@ -207,8 +207,10 @@ jobs:
           build-args: |
             YTDLP_REFRESH=${{ github.run_id }}
             FC_PLAYER_APK_REFRESH=${{ steps.inputs.outputs.apk }}-${{ github.run_id }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # No GitHub Actions layer cache: the yt-dlp/Player-APK layers (and everything
+          # after) are busted every run by the run_id build-args above, so cache-from
+          # restored little while cache-to,mode=max spent ~3 min exporting every build.
+          # Removed 2026-10-02 to measure the cacheless time; re-add if a run proves slower.
 
       - name: Check the Player APK is bundled
         if: steps.skip.outputs.skip != 'true' && steps.inputs.outputs.drift != 'true'
@@ -432,7 +434,6 @@ jobs:
           build-args: |
             YTDLP_REFRESH=${{ github.run_id }}
             FC_PLAYER_APK_REFRESH=${{ needs.build.outputs.apk }}-${{ github.run_id }}
-          cache-from: type=gha
 
       - name: Test the image with the fix
         if: env.HAS_KEY == 'true'
