@@ -428,20 +428,17 @@ try:
     assert 'a-96' not in _mbody, 'the swap must not touch a master playlist'
     assert 'BANDWIDTH=6500000' in _mbody, 'the master STREAM-INF was mangled'
 
-    # (c) Codec-gated loudness: an inserted-ad audio segment reaches attenuate_ad_segment and
-    # the attenuated bytes reach the client — on a plain fetch AND on a byte-range request (the
-    # edit is length-preserving, so the range is served from the attenuated full segment, NOT
-    # bypassed). A large (video-sized) segment streams through untouched. The trigger is the
-    # audio codec via dtv_aac_gain, not the ad URL.
+    # (c) An inserted-ad AAC segment reaches attenuate_ad_segment and its output reaches the
+    # client; a Range request bypasses attenuation (never half-attenuate a partial fetch).
     _seg_url = 'https://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/u-6600-a-96-1-0.mp4'
     _raw = b'\xff\xf1raw-aac-ad-bytes-stand-in'
     directv_proxy._requests = _types.SimpleNamespace(
         get=lambda url, **kw: _Resp(content=_raw, ctype='video/mp4', url=_seg_url))
-    _seen, _SENT = [], b'ATTENUATED-SENTINEL-0123456789'
+    _seen, _SENT = [], b'ATTENUATED-SENTINEL'
     _real_att = dtv_aac_gain.attenuate_ad_segment
     dtv_aac_gain.attenuate_ad_segment = lambda data, *a, **k: (_seen.append(data) or _SENT)
     # The passthrough streamer is wired up by the app factory, which the smoke test doesn't
-    # run, so stub it to echo the upstream bytes (the large/video stream-through path).
+    # run, so stub it to echo the upstream bytes for the Range (non-attenuated) path.
     from flask import Response as _Response  # noqa: E402
     _real_stream = directv_proxy._stream_upstream_response
     directv_proxy._stream_upstream_response = lambda up, **kw: _Response(
@@ -451,25 +448,15 @@ try:
         assert _sr.get_data() == _SENT, 'the attenuated bytes did not reach the client (gain hook gutted?)'
         assert _seen == [_raw], 'attenuate_ad_segment was not called with the upstream segment bytes'
         _seen.clear()
-        _rr = _client.get(_ASSET + _quote(_seg_url, safe=''), headers={'Range': 'bytes=0-9'})
-        assert _seen == [_raw], 'a Range request must still be attenuated (fetch full, then slice)'
-        assert _rr.status_code == 206 and _rr.get_data() == _SENT[0:10], \
-            'a Range fetch must return the requested slice of the attenuated segment'
-        _seen.clear()
-        _big_url = 'https://yospace01-directv.akamaized.net/dtv-prd/x/video-seg.mp4'
-        directv_proxy._requests = _types.SimpleNamespace(
-            get=lambda url, **kw: _Resp(content=b'VIDEOBYTES', ctype='video/mp4', url=_big_url,
-                                        content_length=50_000_000))
-        _vr = _client.get(_ASSET + _quote(_big_url, safe=''))
-        assert _seen == [], 'a large (video) segment must stream through, never be attenuated'
-        assert _vr.get_data() == b'VIDEOBYTES', 'the video segment bytes were altered'
+        _rr = _client.get(_ASSET + _quote(_seg_url, safe=''), headers={'Range': 'bytes=0-15'})
+        assert _seen == [], 'attenuation must be skipped on a Range request'
+        assert _rr.get_data() == _raw, 'a Range fetch must stream the original bytes unchanged'
     finally:
         dtv_aac_gain.attenuate_ad_segment = _real_att
         directv_proxy._stream_upstream_response = _real_stream
-    # Codec-gated: attenuate_ad_segment no-ops (returns the bytes unchanged) on non-AAC input,
-    # so AC-3 content and national ads are never touched.
-    assert dtv_aac_gain.attenuate_ad_segment(b'\x00' * 256) == b'\x00' * 256, \
-        'attenuate_ad_segment must return non-AAC bytes unchanged (AC-3 content must pass through)'
+    assert dtv_aac_gain.is_ad_segment(_seg_url) and not dtv_aac_gain.is_ad_segment(
+        'https://dfwlive-v2-c0p7-ms.directv.fastly-edge.com/live/seg-1.mp4'), \
+        'is_ad_segment must match only the inserted-ad AAC twin, never live content'
 finally:
     directv_proxy._requests = _real_requests
     dtv_android._client_device = _real_client_device

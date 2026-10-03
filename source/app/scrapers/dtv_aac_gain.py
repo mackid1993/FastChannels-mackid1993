@@ -559,82 +559,17 @@ def _write_u8(buf, bitpos, val):
 def attenuate_ad_segment(data: bytes, steps: int = _DEFAULT_STEPS) -> bytes:
     """Return ``data`` with every AAC-LC global_gain lowered by ``steps`` (1.5 dB
     each), or the original bytes unchanged if it is not a cleanly-parseable AAC
-    fMP4 media fragment. Never raises; never returns a corrupted segment. The gain runs on
-    every audio segment the relay fetches, so successes and routine pass-throughs are logged
-    at DEBUG; INFO stays quiet and only a genuine parse error is surfaced (at WARNING)."""
+    fMP4 media fragment. Never raises; never returns a corrupted segment. A normal
+    cut logs at DEBUG; a no-op (an inserted ad that went out un-attenuated — e.g. a
+    creative that doesn't parse as clean AAC-LC) logs at INFO so it stays visible."""
     body, reason = _attenuate_impl(data, steps)
-    if reason.startswith('error:'):
-        logger.warning('[dtv-aac-gain] could not process an inserted-ad segment (%d bytes): %s',
-                       len(data or b''), reason)
+    if reason.startswith('attenuated'):
+        logger.debug('[dtv-aac-gain] inserted-ad AAC segment: %d bytes -> %s',
+                     len(data or b''), reason)
     else:
-        # Both a successful attenuation and the routine pass-throughs (content, other codecs,
-        # inits) are high-volume normal cases — DEBUG only. Nothing hits INFO unless a real
-        # parse error occurred (logged above at WARNING).
-        logger.debug('[dtv-aac-gain] %s (%d bytes)', reason, len(data or b''))
+        logger.info('[dtv-aac-gain] inserted-ad AAC segment left unchanged: %d bytes -> %s',
+                    len(data or b''), reason)
     return body
-
-
-# ── Relay hook: codec-gated attenuation for a browser-asset segment fetch ──────
-# All the relay's segment-loudness logic lives here so directv_proxy.py keeps only a one-line
-# hook. Inserted ads are AAC (~12 dB hotter than the AC-3 content and national ads, which are
-# already at the right level); attenuate_ad_segment lowers a segment iff it is clean AAC-LC and
-# no-ops on AC-3/DRM/video — so the audio CODEC triggers it, never the ad URL (which DirecTV
-# renames under us). Only audio-sized segments are buffered; video streams through (returns
-# None). The edit is length-preserving, so a byte-range request is served by attenuating the
-# full segment and slicing the result.
-_AD_AUDIO_MAX_BYTES = 1_000_000   # above any audio segment, below a 1080p video segment
-
-
-def _full_segment_size(status_code: int, headers) -> int | None:
-    """The segment's full size: Content-Range total on a 206 partial, else Content-Length.
-    None when unknown — the caller then streams rather than guess."""
-    if status_code == 206:
-        m = re.search(r'/\s*(\d+)\s*$', headers.get('Content-Range') or '')
-        return int(m.group(1)) if m else None
-    cl = headers.get('Content-Length')
-    return int(cl) if (cl and str(cl).isdigit()) else None
-
-
-def _range_response(body: bytes, range_header: str, content_type: str):
-    """A 206 slice of an already-attenuated full segment. Byte offsets are unchanged because
-    the attenuation is length-preserving."""
-    from flask import Response
-    total = len(body)
-    start, end = 0, (total - 1 if total else 0)
-    m = re.match(r'\s*bytes=(\d*)-(\d*)', range_header or '')
-    if m:
-        s, e = m.group(1), m.group(2)
-        if s == '' and e:
-            start = max(0, total - int(e))
-        else:
-            start = int(s) if s else 0
-            end = int(e) if e else (total - 1 if total else 0)
-    start = max(0, min(start, total - 1 if total else 0))
-    end = max(start, min(end, total - 1 if total else 0))
-    chunk = body[start:end + 1]
-    return Response(chunk, status=206, content_type=content_type,
-                    headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*',
-                             'Accept-Ranges': 'bytes', 'Content-Length': str(len(chunk)),
-                             'Content-Range': f'bytes {start}-{end}/{total}'})
-
-
-def browser_asset_response(r, raw_url: str, range_header, content_type: str, refetch_full):
-    """Relay hook for a DAI segment fetch. Returns a Flask Response with the inserted-ad AAC
-    attenuated 12 dB, or None to let the relay stream the segment unchanged (a large video
-    segment, or a non-ad/non-AAC segment). ``r`` is the upstream requests response and
-    ``refetch_full(url) -> bytes`` returns the whole segment (used when the player sent a
-    byte-range request, so attenuation sees whole AAC frames)."""
-    size = _full_segment_size(r.status_code, r.headers)
-    if size is None or size > _AD_AUDIO_MAX_BYTES:
-        return None   # unknown size or a large (video) segment: stream it through
-    data = r.content if r.status_code != 206 else refetch_full(raw_url)
-    body = attenuate_ad_segment(data)   # -12 dB iff clean AAC-LC, else the original bytes
-    if range_header:
-        return _range_response(body, range_header, content_type)
-    from flask import Response
-    return Response(body, status=200, content_type=content_type,
-                    headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*',
-                             'Accept-Ranges': 'bytes', 'Content-Length': str(len(body))})
 
 
 def _attenuate_impl(data: bytes, steps: int):
@@ -702,4 +637,4 @@ def _attenuate_impl(data: bytes, steps: int):
         return bytes(buf), ('attenuated %d frames @ %d Hz (-%.1f dB)'
                             % (len(collected), parsed_rate, steps * _STEP_DB))
     except Exception as exc:  # pragma: no cover - defensive
-        return data, 'error: %s' % type(exc).__name__
+        return data, 'no-op: %s' % type(exc).__name__
