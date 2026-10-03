@@ -86,7 +86,10 @@ check app/routes/directv_proxy.py "dtv_android.player_headers()"
 check app/routes/directv_proxy.py "dtv_android.drm_reauth("
 check app/routes/directv_proxy.py "dtv_aac_ads.swap_muffled_ads("
 # Inserted-ad AAC loudness attenuation (own module): the relay hook + the module itself.
-check app/routes/directv_proxy.py "dtv_aac_gain.attenuate_ad_segment("
+# The relay calls browser_asset_response (codec-gated); the actual -12 dB edit is
+# attenuate_ad_segment, which that function calls (all logic stays in dtv_aac_gain).
+check app/routes/directv_proxy.py "dtv_aac_gain.browser_asset_response("
+check app/scrapers/dtv_aac_gain.py "def browser_asset_response("
 check app/scrapers/dtv_aac_gain.py "def attenuate_ad_segment("
 check app/routes/directv_proxy.py "'yospace.com',  # DAI"
 check app/templates/admin/sources.html "toggleHtml('use_dai'"
