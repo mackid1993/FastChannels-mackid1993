@@ -1658,7 +1658,7 @@ index 0000000..79d622c
 +        return data, 'no-op: %s' % type(exc).__name__
 diff --git a/app/scrapers/dtv_android.py b/app/scrapers/dtv_android.py
 new file mode 100644
-index 0000000..743348d
+index 0000000..e414b57
 --- /dev/null
 +++ b/app/scrapers/dtv_android.py
 @@ -0,0 +1,867 @@
@@ -2451,7 +2451,7 @@ index 0000000..743348d
 +def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
 +    """Run FastChannels' DirecTV session as the given viewer profile: exchange the profile
 +    at the profiletoken endpoint, store its ``partnerProfileID1`` as the Yospace `profid`
-+    (read by directv_dai.build_query), and clear the cached Yospace playback so the next
++    (which the DAI query builder reads), and clear the cached Yospace playback so the next
 +    tune uses it. The account session (bearer/refresh/activation) is left as-is — the app
 +    itself keeps the account session and only swaps `profid` per profile. Single-flight
 +    behind the same redis lock as refresh/drm_reauth so a concurrent refresh can't race the

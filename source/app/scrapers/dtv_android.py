@@ -787,7 +787,7 @@ def profile_token_exchange(profile_id: str, refresh_token: str) -> dict:
 def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
     """Run FastChannels' DirecTV session as the given viewer profile: exchange the profile
     at the profiletoken endpoint, store its ``partnerProfileID1`` as the Yospace `profid`
-    (read by directv_dai.build_query), and clear the cached Yospace playback so the next
+    (which the DAI query builder reads), and clear the cached Yospace playback so the next
     tune uses it. The account session (bearer/refresh/activation) is left as-is — the app
     itself keeps the account session and only swaps `profid` per profile. Single-flight
     behind the same redis lock as refresh/drm_reauth so a concurrent refresh can't race the
