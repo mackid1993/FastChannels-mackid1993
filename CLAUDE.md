@@ -32,9 +32,11 @@ Before 2026-10-01 the relay sent python-requests' UA on the bridge master fetch 
 
 The patch now sends that real app string (A/B tested 2026-10-02: inserted ads in the same breaks as the old UAs, 8 each), built per bridge device from `getprop ro.build.version.release`, `ro.product.model` and `ro.product.board` (a Fire TV Stick 4K Max: `APP_PROJECT_NAME/5.0.136.2002113867 (Android 11; AFTKRT; karat)  PureRN/0.79.5`). Sources: `AnalyticsService::generateUserAgent()` (literals `APP_PROJECT_NAME`, `/`, ` (`, ` `, `; `, `) `, ` PureRN/`, then 0.79.5), `DeviceInformation::getDeviceOSName()` = `Android`, `getAppVersion()` = `JManifestInfoProvider::getVersionNumber()` = the package versionName, and `Java_com_clientapp_cronetservice_CronetHttpService_getUserAgent` = `AnalyticsService::getInstance()->getUserAgent()`, which Cronet sends because `CustomCronetDataSourceFactory` never sets its own UA.
 
-## Removed: the Surround sound toggle
+## Opt-in: stereo downmix (louder AC-3 audio) — `app/scrapers/dtv_stereo_downmix.py`
 
-Removed 2026-10-01 at the user's request (dead weight); bridge sticks always get DirecTV's full master, AC-3 included. Stereo would give full-range inserted ads (their AAC files are clean), but the user keeps AC-3.
+The "Downmix DirecTV audio to stereo" toggle (`stereo_downmix`, **off by default**, its own module) makes the proxied master declare DirecTV's AC-3 audio rendition `CHANNELS="2"` instead of `"6"`. On Android 11 the stick's media3 sets the AC-3 decoder's channel count from the master's CHANNELS attribute: with `"6"` the platform decoder does its own band-limited 5.1→2.0 downmix (muffled, and a few dB quieter after the fold-down), while `"2"` makes it emit AC-3's own full-range Lo/Ro stereo downmix — fuller and a few dB **louder**. The point now is loudness: it lifts the quiet AC-3 programming (~−34 LUFS) toward the hot inserted-ad level (the AAC ads measure ~−20 LUFS, ~5 dB over their AC-3 twins), so a bridge stick with a stereo-only (PCM) encoder can then raise the whole feed uniformly on the LinkPi/receiver without the ads blasting. Only the master's AC-3 `#EXT-X-MEDIA` CHANNELS attribute changes — the 384 kbps AC-3 segments, the codec, the STREAM-INF lines and the other renditions are untouched; media playlists pass through unchanged. Leave it off for an output that passes AC-3 through to an AV receiver (keep 5.1).
+
+Hooks (one line each): `*dtv_stereo_downmix.CONFIG_FIELDS` in directv.py's `config_schema`, and `dtv_stereo_downmix.stereo_downmix_master(r.text, channel.source.config)` wrapping the master in `directv_browser_manifest`. History: this is the old `keep_surround` stereo-downmix (added, then reverted 2026-10-02 because it didn't fix the muffle), brought back on 2026-10-02 as an opt-in **loudness** lever in its own file. The pre-DAI "Surround sound toggle" was a separate, unrelated setting removed 2026-10-01.
 
 ## Android TV sign-in (`app/scrapers/dtv_android.py`)
 
@@ -69,7 +71,7 @@ Every session uses the device's saved values from `/data/directv_dai_devices.jso
 
 ## Hooks
 
-See `AGENTS.md` for the full hook table: every one-line hook in upstream's files, what it does, and where to put it back if upstream moves the code. The Android TV hooks in `directv.py` are `dtv_android.sign_in` (in `run_directv_auth`), `dtv_android.license_headers` (DRM headers), `dtv_android.token_stale` (`_token_stale`), `dtv_android.android_auth_request` (the channel/v2 request, in `_fetch_channel_playback`), and `resolve()`'s inline `dtv_android.refresh_in_place` + retry; the relay (`directv_proxy.py`) uses `dtv_android.player_headers()` and `dtv_aac_ads.swap_muffled_ads()`. Everything else lives in `directv_dai.py`, `dtv_android.py` and `dtv_aac_ads.py`.
+See `AGENTS.md` for the full hook table: every one-line hook in upstream's files, what it does, and where to put it back if upstream moves the code. The Android TV hooks in `directv.py` are `dtv_android.sign_in` (in `run_directv_auth`), `dtv_android.license_headers` (DRM headers), `dtv_android.token_stale` (`_token_stale`), `dtv_android.android_auth_request` (the channel/v2 request, in `_fetch_channel_playback`), and `resolve()`'s inline `dtv_android.refresh_in_place` + retry; the relay (`directv_proxy.py`) uses `dtv_android.player_headers()`, `dtv_aac_ads.swap_muffled_ads()` (per media playlist) and `dtv_stereo_downmix.stereo_downmix_master()` (per master). Everything else lives in `directv_dai.py`, `dtv_android.py`, `dtv_aac_ads.py` and `dtv_stereo_downmix.py`.
 
 ## Removed: one DRM session through inserted ads (keep_drm_session)
 
@@ -81,7 +83,7 @@ Many inserted-ad creatives are band-limited (~7 kHz) in their AC-3 rendition whi
 
 ## The DAI patch in one paragraph
 
-The opt-in "Use DirecTV ad insertion (DAI)" toggle makes DirecTV playback use `streamURL` (a Yospace server-side ad-insertion session) instead of `fallbackStreamUrl`, adds `yospace.pool=livepause` (Yospace answers 503 without it), and adds the ad flags DirecTV's own Android TV app sends. The authorization request (`channel/v2`, app query, no browser headers) and the relay's User-Agent match the Android TV app too. The ad-insertion logic lives in `app/scrapers/directv_dai.py`, the Android-TV client in the portable `app/scrapers/dtv_android.py` (DAI depends on it, never the reverse), and the inserted-ad AAC swap in `app/scrapers/dtv_aac_ads.py`; upstream files get the one-line hooks in the table in `AGENTS.md`.
+The opt-in "Use DirecTV ad insertion (DAI)" toggle makes DirecTV playback use `streamURL` (a Yospace server-side ad-insertion session) instead of `fallbackStreamUrl`, adds `yospace.pool=livepause` (Yospace answers 503 without it), and adds the ad flags DirecTV's own Android TV app sends. The authorization request (`channel/v2`, app query, no browser headers) and the relay's User-Agent match the Android TV app too. The ad-insertion logic lives in `app/scrapers/directv_dai.py`, the Android-TV client in the portable `app/scrapers/dtv_android.py` (DAI depends on it, never the reverse), the inserted-ad AAC swap in `app/scrapers/dtv_aac_ads.py`, and the opt-in stereo-downmix in `app/scrapers/dtv_stereo_downmix.py`; upstream files get the one-line hooks in the table in `AGENTS.md`.
 
 ## The flags, and where each value comes from
 
