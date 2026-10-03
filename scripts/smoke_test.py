@@ -209,6 +209,12 @@ expected = {'hhid': 'hh-1', 'u': 'hh-1', 'profid': 'prof-1', 'dma_location': '99
 for key, value in expected.items():
     assert query.get(key) == value, f'{key}: expected {value!r}, got {query.get(key)!r}'
 
+# The Android TV login's chosen viewer profile (dtv_android_profid, set by the profile
+# picker's profiletoken exchange) is what the app sends as profid, and it wins over the old
+# web-login dai_profile_id. Guards the picker against a future drift fix silently dropping it.
+assert dai.build_query({**config, 'dtv_android_profid': 'pp1-android'}, {}, '123')['profid'] == 'pp1-android', \
+    'profid must come from dtv_android_profid (the chosen viewer profile) when present'
+
 # Consent from a different GPP section must not be decoded with the US-National layout.
 other = dai.build_query({**config, 'dai_gpp_sid': '8'}, {}, '123')
 assert 'is_lat' not in other, 'is_lat derived from a non-US-National GPP section'
