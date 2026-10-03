@@ -16,7 +16,10 @@ bytes are returned unchanged, so a mis-parse can never emit a corrupt segment.
 """
 from __future__ import annotations
 
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 # AAC Huffman + scalefactor-band tables, ISO/IEC 14496-3. Generated; do not hand-edit.
 _SCF_LENS = [
@@ -546,18 +549,37 @@ def _write_u8(buf, bitpos, val):
             buf[bi] &= ~mask
 
 
+def note_range_skip(url: str, range_header: str) -> None:
+    """Log that an inserted-ad AAC segment arrived with a Range header, so the loudness
+    cut was skipped (a partial fragment can't be edited). If this shows up on live ads,
+    that is why the cut isn't landing — the player fetches segments with ranged requests,
+    and the fix is to fetch the whole segment, attenuate, and re-slice the range."""
+    logger.info('[dtv-aac-gain] inserted-ad AAC segment requested with Range=%r — loudness '
+                'cut SKIPPED (partial fetch)', range_header)
+
+
 def attenuate_ad_segment(data: bytes, steps: int = 3) -> bytes:
     """Return ``data`` with every AAC-LC global_gain lowered by ``steps`` (1.5 dB
     each), or the original bytes unchanged if it is not a cleanly-parseable AAC
-    fMP4 media fragment. Never raises; never returns a corrupted segment."""
+    fMP4 media fragment. Never raises; never returns a corrupted segment. Logs one
+    INFO line per call with the outcome, so a live ad shows whether the cut landed
+    or why it no-op'd (e.g. HE-AAC/SBR would fail to parse as clean AAC-LC)."""
+    body, reason = _attenuate_impl(data, steps)
+    logger.info('[dtv-aac-gain] inserted-ad AAC segment: %d bytes -> %s',
+                len(data or b''), reason)
+    return body
+
+
+def _attenuate_impl(data: bytes, steps: int):
+    """Returns (bytes, reason). reason is a short human string for the log."""
     try:
         if steps <= 0 or not data:
-            return data
+            return data, 'skipped (no data)'
         buf = bytearray(data)
         moof = _find(buf, 0, len(buf), b'moof')
         mdat = _find(buf, 0, len(buf), b'mdat')
         if not moof or not mdat:
-            return data                      # init segment or not fragmented MP4
+            return data, 'no-op: not a fragmented MP4 (no moof/mdat — init segment?)'
         mdat_ds, mdat_de = mdat
         sizes = []
         for typ, ds, de in _boxes(buf, moof[0], moof[1]):
@@ -572,9 +594,9 @@ def attenuate_ad_segment(data: bytes, steps: int = 3) -> bytes:
                     for sz in _trun_sizes(buf, ds2, de2):
                         sizes.append(sz if sz is not None else default)
         if not sizes or any(s is None for s in sizes):
-            return data
+            return data, 'no-op: could not read trun sample sizes'
         if sum(sizes) != mdat_de - mdat_ds:
-            return data                      # unexpected mdat layout
+            return data, 'no-op: trun sizes != mdat length (unexpected layout)'
 
         frames = []
         cum = mdat_ds
@@ -582,6 +604,7 @@ def attenuate_ad_segment(data: bytes, steps: int = 3) -> bytes:
             frames.append((cum, sz))
             cum += sz
 
+        parsed_rate = None
         for rate in _RATES:
             bl, bs = _swb(rate)
             collected = []
@@ -597,9 +620,11 @@ def attenuate_ad_segment(data: bytes, steps: int = 3) -> bytes:
                     break
                 collected.append((start, gains))
             if ok:
+                parsed_rate = rate
                 break
         else:
-            return data                      # no sample rate parsed every frame
+            return data, ('no-op: no sample rate parsed every frame as clean AAC-LC '
+                          '(not AAC-LC? e.g. HE-AAC/SBR, or an unexpected element)')
 
         for start, gains in collected:
             for bitpos, old in gains:
@@ -607,6 +632,7 @@ def attenuate_ad_segment(data: bytes, steps: int = 3) -> bytes:
                 if new < 0:
                     new = 0
                 _write_u8(buf, start * 8 + bitpos, new)
-        return bytes(buf)
-    except Exception:
-        return data
+        return bytes(buf), ('attenuated %d frames @ %d Hz (-%.1f dB)'
+                            % (len(collected), parsed_rate, steps * _STEP_DB))
+    except Exception as exc:  # pragma: no cover - defensive
+        return data, 'no-op: %s' % type(exc).__name__
