@@ -12,11 +12,11 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/scrapers/directv.py          | 120 +++--
  app/scrapers/directv_dai.py      | 467 +++++++++++++++++
  app/scrapers/dtv_aac_ads.py      |  49 ++
- app/scrapers/dtv_aac_gain.py     | 702 +++++++++++++++++++++++++
+ app/scrapers/dtv_aac_gain.py     | 705 +++++++++++++++++++++++++
  app/scrapers/dtv_android.py      | 872 +++++++++++++++++++++++++++++++
  app/source_config.py             |   5 +
  app/templates/admin/sources.html | 130 ++++-
- 9 files changed, 2363 insertions(+), 87 deletions(-)
+ 9 files changed, 2366 insertions(+), 87 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_aac_gain.py
@@ -1007,10 +1007,10 @@ index 0000000..8d4dbac
 +    return _AD_AC3_FILE.sub(lambda m: _AC3_RENDITION.sub('-a-96-', m.group(0)), playlist)
 diff --git a/app/scrapers/dtv_aac_gain.py b/app/scrapers/dtv_aac_gain.py
 new file mode 100644
-index 0000000..028bdb0
+index 0000000..4f1c717
 --- /dev/null
 +++ b/app/scrapers/dtv_aac_gain.py
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,705 @@
 +"""DirecTV DAI: attenuate inserted AAC ads a fixed amount, losslessly.
 +
 +The inserted-ad AAC twins (see dtv_aac_ads) play a few dB hotter than the
@@ -1573,14 +1573,17 @@ index 0000000..028bdb0
 +    """Return ``data`` with every AAC-LC global_gain lowered by ``steps`` (1.5 dB
 +    each), or the original bytes unchanged if it is not a cleanly-parseable AAC
 +    fMP4 media fragment. Never raises; never returns a corrupted segment. The gain runs on
-+    every audio segment the relay fetches, so passing content/other codecs through is the
-+    normal case (logged at DEBUG); only a real attenuation is logged at INFO."""
++    every audio segment the relay fetches, so successes and routine pass-throughs are logged
++    at DEBUG; INFO stays quiet and only a genuine parse error is surfaced (at WARNING)."""
 +    body, reason = _attenuate_impl(data, steps)
-+    if reason.startswith('attenuated'):
-+        logger.info('[dtv-aac-gain] lowered an inserted ad: %s', reason)
++    if reason.startswith('error:'):
++        logger.warning('[dtv-aac-gain] could not process an inserted-ad segment (%d bytes): %s',
++                       len(data or b''), reason)
 +    else:
-+        logger.debug('[dtv-aac-gain] segment passed through unchanged (%d bytes): %s',
-+                     len(data or b''), reason)
++        # Both a successful attenuation and the routine pass-throughs (content, other codecs,
++        # inits) are high-volume normal cases — DEBUG only. Nothing hits INFO unless a real
++        # parse error occurred (logged above at WARNING).
++        logger.debug('[dtv-aac-gain] %s (%d bytes)', reason, len(data or b''))
 +    return body
 +
 +
@@ -1712,7 +1715,7 @@ index 0000000..028bdb0
 +        return bytes(buf), ('attenuated %d frames @ %d Hz (-%.1f dB)'
 +                            % (len(collected), parsed_rate, steps * _STEP_DB))
 +    except Exception as exc:  # pragma: no cover - defensive
-+        return data, 'no-op: %s' % type(exc).__name__
++        return data, 'error: %s' % type(exc).__name__
 diff --git a/app/scrapers/dtv_android.py b/app/scrapers/dtv_android.py
 new file mode 100644
 index 0000000..c771b6b

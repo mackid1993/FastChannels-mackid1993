@@ -560,14 +560,17 @@ def attenuate_ad_segment(data: bytes, steps: int = _DEFAULT_STEPS) -> bytes:
     """Return ``data`` with every AAC-LC global_gain lowered by ``steps`` (1.5 dB
     each), or the original bytes unchanged if it is not a cleanly-parseable AAC
     fMP4 media fragment. Never raises; never returns a corrupted segment. The gain runs on
-    every audio segment the relay fetches, so passing content/other codecs through is the
-    normal case (logged at DEBUG); only a real attenuation is logged at INFO."""
+    every audio segment the relay fetches, so successes and routine pass-throughs are logged
+    at DEBUG; INFO stays quiet and only a genuine parse error is surfaced (at WARNING)."""
     body, reason = _attenuate_impl(data, steps)
-    if reason.startswith('attenuated'):
-        logger.info('[dtv-aac-gain] lowered an inserted ad: %s', reason)
+    if reason.startswith('error:'):
+        logger.warning('[dtv-aac-gain] could not process an inserted-ad segment (%d bytes): %s',
+                       len(data or b''), reason)
     else:
-        logger.debug('[dtv-aac-gain] segment passed through unchanged (%d bytes): %s',
-                     len(data or b''), reason)
+        # Both a successful attenuation and the routine pass-throughs (content, other codecs,
+        # inits) are high-volume normal cases — DEBUG only. Nothing hits INFO unless a real
+        # parse error occurred (logged above at WARNING).
+        logger.debug('[dtv-aac-gain] %s (%d bytes)', reason, len(data or b''))
     return body
 
 
@@ -699,4 +702,4 @@ def _attenuate_impl(data: bytes, steps: int):
         return bytes(buf), ('attenuated %d frames @ %d Hz (-%.1f dB)'
                             % (len(collected), parsed_rate, steps * _STEP_DB))
     except Exception as exc:  # pragma: no cover - defensive
-        return data, 'no-op: %s' % type(exc).__name__
+        return data, 'error: %s' % type(exc).__name__
