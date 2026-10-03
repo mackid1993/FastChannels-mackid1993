@@ -50,11 +50,14 @@ _CLIENT_PARAMS = {
     'nielsen_platform': 'plt,OTT', 'nielsen_dev_group': 'devgrp,STV',
     'comscore_platform': 'android', 'comscore_impl_type': 'a',
     '_fw_nielsen_app_id': 'P7CFE36DB-A8D9-4801-95FE-51C29101342C',
-    # yo.lpa: live-pause behavior. The Android TV app does NOT send it (it's only in
-    # the Osprey's config); kept for now because an earlier test saw no ad fill without
-    # it, but that predated yospace.pool=livepause + channel/v2 (an A/B removal is
-    # warranted). yo.lp dropped 2026-10-03: no DirecTV client — app or Osprey — sends it.
-    'yo.fr': 'true', 'yo.lpa': 'true', 'yo.av': '5',
+    # yo.lpa: dropped 2026-10-03. It's an Osprey-config flag the Android TV app does NOT
+    # send, so sending it as the Android client was off-profile. It was only kept because
+    # an older run saw no ad fill without it, but that predated the Android-login +
+    # yospace.pool=livepause + channel/v2 path we run now, so that result no longer
+    # applies. Removed to match the app; verify ads still fill on the next live break (if
+    # a break ever comes back empty/503, this is the first thing to restore).
+    # yo.lp also dropped 2026-10-03: no DirecTV client — app or Osprey — sends it.
+    'yo.fr': 'true', 'yo.av': '5',
     # The Android TV app's own live Yospace params. Its com.att.tv config tree sets
     # YSLiveParams = {yo.d.cp, yo.vm}; it does NOT send yo.cps for a live tune. yo.cps
     # is a Content Playback Spec from the app's default/iOS config tree only

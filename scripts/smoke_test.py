@@ -223,7 +223,7 @@ assert 'us_privacy' not in query, 'the Android TV app omits us_privacy when it i
 assert query.get('nielsen_platform') == 'plt,OTT' and query.get('nielsen_dev_group') == 'devgrp,STV', \
     'must send the Android TV Nielsen values, never desktop (plt,DSK / devgrp,DSK)'
 assert query.get('m') == 'live' and query.get('yo.fr') == 'true', 'general client flags missing'
-assert query.get('yo.lpa') == 'true', 'yo.lpa live-pause flag missing'
+assert 'yo.lpa' not in query, 'yo.lpa must not be sent (Osprey-only flag the Android TV app omits; dropped 2026-10-03 — restore only if a live break comes back empty)'
 assert 'yo.lp' not in query, 'yo.lp must not be sent (no DirecTV client — app or Osprey — sends it; dropped 2026-10-03)'
 assert 'yo.po' not in query, "the web player's yo.po must not be sent"
 assert query.get('yo.sl') == '3' and query.get('yo.d.cp') == 'true', \
