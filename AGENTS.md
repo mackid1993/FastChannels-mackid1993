@@ -12,9 +12,10 @@ scripts/
   apply-patches.sh    git am --3way each patch onto an upstream checkout
   validate.sh         static checks on the patched tree
   ruff_diff.py        fail only on ruff findings upstream doesn't already have
-  smoke_test.py       exercises the DAI code inside the built image
+  smoke_test.py       exercises the DAI code inside the built image (incl. behavioral relay tests)
   boot_test.sh        starts the image and waits for the web UI
-  refresh-patches.sh  regenerates patches/ from commits on top of an upstream commit
+  reproduce.sh        re-runs the gauntlet to classify a build failure (drift vs infra) for the AI
+  refresh-patches.sh  regenerates patches/ and source/ from commits on top of an upstream commit
 .github/workflows/build.yml
 ```
 
@@ -32,7 +33,12 @@ Weekly (Mondays, 9 AM Eastern), on a manual run, or when `patches/`, `scripts/` 
 
 The other six days at 9 AM Eastern, a drift check runs steps 1-3 and 7 without building an image, so a conflict is caught and fixed the day upstream introduces it. While a "Build failed" issue is open, the drift check does a full build instead, so failures are retried daily. Step 6 pushes the exact image steps 4-5 tested.
 
-If step 2 conflicts, the `resolve` job asks an AI (Aider, with the model in the `AI_MODEL` variable) to resolve the conflict. The result must pass the static checks and a full image build, APK check, smoke test and boot test; only then does the `open-pr` job merge it and start the publishing build. If it fails, `ai-failed` comments on the conflict issue.
+The AI fix (Aider, with the model in the `AI_MODEL` variable — set to `openrouter/google/gemini-2.5-pro`) runs for two kinds of failure. It only ever edits files; CI does all git operations and runs the validation. Its result must pass the static checks **and** a full image build, APK check, smoke test and boot test before the `open-pr` job merges it and starts the publishing build. A bad fix never reaches `main`.
+
+- **Conflict** (step 2 fails): the `resolve` job recreates the conflict and asks the AI to resolve it, editing only the conflicted files.
+- **Drift** (step 2 applies cleanly but a later check fails — upstream renamed or moved something a hook or an added module depends on): the `resolve-drift` job runs, but **only on the unattended scheduled runs** (and test-run dispatches), never on a push or the post-merge dispatch. It reproduces the failing check with `scripts/reproduce.sh`; a clean reproduction (a transient hiccup, or a failure only in the publish/refresh steps) or a Docker/APK failure (infrastructure, not patch-fixable) stops without calling the AI. A real compile/validate/smoke/boot failure goes to the AI, whose edits are bounded to the files the patch touches (`git diff --name-only <sha> HEAD`) and checked afterwards. The overlay's own tests (`validate.sh`, `smoke_test.py`) are the spec and are not editable by the AI.
+
+If either path can't produce a passing fix, `ai-failed` comments on the matching status issue.
 
 ## The DAI patch
 

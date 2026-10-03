@@ -243,20 +243,23 @@ jobs:
         run: |
           overlay/scripts/refresh-patches.sh upstream "${{ steps.inputs.outputs.sha }}"
           cd overlay
-          [ -n "$(git status --porcelain patches)" ] || exit 0
+          # refresh-patches.sh rewrites both patches/ and source/ (the readable copies of the
+          # overlay's own modules), so commit both — otherwise an AI fix that adapted a module
+          # would leave source/ silently drifted from the patch.
+          [ -n "$(git status --porcelain patches source)" ] || exit 0
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A patches
+          git add -A patches source
           git commit -q -m "Refresh patches against upstream ${{ steps.inputs.outputs.short }}"
           if ! git push -q; then
             # main moved during this run. Rebase onto it only if nobody changed
-            # patches/ in the meantime; otherwise their version wins and this
+            # patches/ or source/ in the meantime; otherwise their version wins and this
             # refresh is simply redone on the next run.
             git fetch -q origin main
-            if git diff --quiet HEAD~1 origin/main -- patches; then
+            if git diff --quiet HEAD~1 origin/main -- patches source; then
               git rebase -q origin/main && git push -q
             else
-              echo "::notice::patches/ changed on main during this run; skipping this refresh."
+              echo "::notice::patches/ or source/ changed on main during this run; skipping this refresh."
               exit 0
             fi
           fi
@@ -277,7 +280,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > body.md <<BODY
-          Upstream \`${{ steps.inputs.outputs.short }}\` with the patches failed a check. No image was published; \`:latest\` still points at the last good build. The next daily run retries with a full build.
+          Upstream \`${{ steps.inputs.outputs.short }}\` with the patches failed a check (the patch applied cleanly — this isn't a merge conflict). No image was published; \`:latest\` still points at the last good build.
+
+          On the unattended scheduled runs an AI tries to fix this automatically: it reproduces the failing check, adapts the patch to upstream's current code (editing only the patch's own files), and must pass a full image build, Player APK check, DAI smoke test and boot test before anything is merged and published. If it can't, you'll get a comment here. (A failure from a manual run isn't auto-fixed — re-run on schedule or fix by hand.) Until this is resolved the daily drift check does a full build instead, so a one-off failure is retried daily.
 
           Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -353,8 +358,8 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           # Any OpenRouter model, as "openrouter/<model id>". Override with the
-          # AI_MODEL repo variable.
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3' }}
+          # AI_MODEL repo variable (set to openrouter/google/gemini-2.5-pro).
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}
         run: |
           # Pinned: a new Aider release can change or drop flags this step relies on.
           pip install --quiet aider-chat==0.86.2
@@ -452,11 +457,224 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ported-patches
-          path: overlay/patches/
+          # Both patches/ and source/ — refresh-patches.sh rewrites both, and open-pr
+          # commits both so source/ never drifts from the patch after an AI fix.
+          path: |
+            overlay/patches
+            overlay/source
 
+  # Runs only when the patch APPLIED cleanly but a later check failed — upstream drift broke
+  # a hook or an added module's dependency, not a merge conflict — and only on the unattended
+  # scheduled runs (or a test-run dispatch). Never on a push (that would "fix" our own
+  # deliberate changes) and never on the post-merge dispatch (which has no test inputs). It
+  # reproduces the failing check: a clean reproduction (a transient hiccup, or a failure that
+  # was only in the publish/refresh steps) sets failed=false and nothing else runs; a Docker
+  # or APK failure is infrastructure, not patch-fixable, so it also bails. A real drift in
+  # compile/validate/smoke/boot goes to the AI, whose fix is bounded to the patch-touched
+  # files and must pass the full gauntlet before open-pr merges it — same bar as the conflict
+  # path. A bad fix never reaches main, so the failure stays reproducible and is retried.
+  resolve-drift:
+    needs: build
+    if: >-
+      always() && needs.build.result == 'failure' &&
+      needs.build.outputs.conflict != 'true' && needs.build.outputs.sha != '' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' &&
+        ((inputs.upstream_repo || '') != '' || (inputs.upstream_branch || '') != '')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      fixed: ${{ steps.finish.outputs.fixed }}
+    env:
+      HAS_KEY: ${{ secrets.OPENROUTER_API_KEY != '' }}
+    steps:
+      - name: Check out this repo
+        if: env.HAS_KEY == 'true'
+        uses: actions/checkout@v5
+        with:
+          path: overlay
+          persist-credentials: false
+
+      - name: Check out upstream and apply the patches
+        if: env.HAS_KEY == 'true'
+        run: |
+          git clone --branch "$UPSTREAM_BRANCH" "https://github.com/$UPSTREAM_REPO.git" upstream
+          cd upstream
+          git checkout -q "${{ needs.build.outputs.sha }}"
+          git config user.name "fastchannels-ci"
+          git config user.email "fastchannels-ci@users.noreply.github.com"
+          # These applied cleanly in the build job (this job only runs with conflict=false),
+          # so a conflict here is unexpected — fail loudly rather than hand the AI a mess.
+          ../overlay/scripts/apply-patches.sh . \
+            || { echo "::error::patches did not apply cleanly in the drift job"; exit 1; }
+
+      - name: Set up Python
+        if: env.HAS_KEY == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Docker Buildx
+        if: env.HAS_KEY == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: env.HAS_KEY == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Reproduce the failing check
+        id: repro
+        if: env.HAS_KEY == 'true'
+        env:
+          UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
+          APK: ${{ needs.build.outputs.apk }}
+          CACHE_BUST: ${{ github.run_id }}
+        run: |
+          pip install --quiet ruff jinja2
+          set +e
+          out=$(overlay/scripts/reproduce.sh upstream); code=$?
+          echo "$out"
+          if [ "$code" = 10 ]; then
+            stage=$(printf '%s\n' "$out" | sed -n 's/^DRIFT_STAGE=//p' | tail -1)
+            echo "Reproduced a '$stage' drift the AI should try to fix."
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+          else
+            # 20 = infrastructure/upstream (Docker or APK), 0 = transient or publish/refresh-only.
+            echo "Nothing for the AI to fix (reproduce exit $code); leaving it to the next run."
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Snapshot before the AI edits
+        if: env.HAS_KEY == 'true' && steps.repro.outputs.failed == 'true'
+        run: |
+          cd upstream
+          # The editable set is exactly the files the patch touches. Everything the AI changes
+          # must stay inside it (checked after).
+          git diff --name-only "${{ needs.build.outputs.sha }}" HEAD > ../editable.txt
+          echo "Files the patch touches (the AI may edit only these):"; cat ../editable.txt
+          find . -path ./.git -prune -o -type f -print0 | xargs -0 sha1sum | sort -k2 > ../before.sha1
+
+      - name: Ask the AI to fix the drift
+        if: env.HAS_KEY == 'true' && steps.repro.outputs.failed == 'true'
+        timeout-minutes: 20
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}
+        run: |
+          pip install --quiet aider-chat==0.86.2
+          cd upstream
+          cat > ../prompt.txt <<'PROMPT'
+          The files you can edit are from the FastChannels repository with the DirecTV "DAI"
+          patch already applied cleanly. The patch adds its own modules (app/scrapers/
+          directv_dai.py, dtv_android.py, dtv_aac_ads.py, dtv_aac_gain.py) plus a few one-line
+          hooks in upstream's files. It applied without conflict, but a check then failed —
+          almost always because upstream renamed or moved something a hook or an added module
+          depends on. reproduce.log holds the failing check's output, and AGENTS.md explains
+          the patch, every hook, and where each one belongs.
+
+          Adapt the patch's code to upstream's current structure so the failing check passes.
+          Rules:
+          - The overlay's own tests (scripts/validate.sh, scripts/smoke_test.py) are the spec
+            for the behavior the patch must keep. You cannot edit them. Make the code satisfy
+            them; never try to defeat them.
+          - If upstream renamed or moved a name the patch uses, update the patch's reference to
+            the new name or location. That is the fix.
+          - Do NOT wrap imports in try/except, stub or shadow a missing name, delete a hook, or
+            skip real work just to make a check pass. Keep every bit of the patch's behavior.
+          - Change only what the failure requires. No refactoring, reformatting or unrelated edits.
+          - Keep the Python valid.
+          PROMPT
+          # Aider edits only the files named on the command line; reproduce.log and AGENTS.md
+          # are read-only context. The two self-contained audio modules import nothing from
+          # upstream (they can't drift), so keep their large bitstream tables out of the edit
+          # set unless the failure actually names one. CI does all git/validation; Aider's own
+          # git, lint, test, shell and URL features are off.
+          edit=()
+          while IFS= read -r f; do
+            case "$f" in
+              *dtv_aac_ads.py|*dtv_aac_gain.py)
+                grep -qF "$(basename "$f")" ../reproduce.log && edit+=("$f") ;;
+              *) edit+=("$f") ;;
+            esac
+          done < ../editable.txt
+          aider --model "$AI_MODEL" --edit-format diff --yes-always --no-git \
+                --no-auto-commits --no-auto-lint --no-auto-test --no-suggest-shell-commands \
+                --no-detect-urls --no-show-model-warnings --no-check-update --no-analytics \
+                --no-pretty --map-tokens 0 --read ../reproduce.log --read ../overlay/AGENTS.md \
+                --message-file ../prompt.txt "${edit[@]}"
+
+      - name: Check the AI only touched the patch's files
+        if: env.HAS_KEY == 'true' && steps.repro.outputs.failed == 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          # The overlay checkout (our tests/validate.sh/AGENTS.md) was read-only context and
+          # Aider edits only files under upstream/, but make sure — before refresh-patches.sh
+          # rewrites overlay/patches and overlay/source, which would mask a stray edit.
+          if [ -n "$(git -C overlay status --porcelain --untracked-files=no)" ]; then
+            echo "::error::the AI modified the overlay checkout (its tests are read-only)"; exit 1
+          fi
+          cd upstream
+          find . -path ./.git -prune -o -type f -print0 | xargs -0 sha1sum | sort -k2 > ../after.sha1
+          changed=$(diff ../before.sha1 ../after.sha1 | awk '/^[<>]/{print $3}' | sed 's|^\./||' | sort -u | grep -vE '^\.aider' || true)
+          echo "Files the AI changed:"; echo "${changed:-(none)}"
+          [ -n "$changed" ] || { echo "::error::the AI made no changes"; exit 1; }
+          stray=$(printf '%s\n' $changed | grep -vxF -f ../editable.txt || true)
+          [ -z "$stray" ] || { echo "::error::the AI changed files outside the patch: $stray"; exit 1; }
+          # Belt and braces: the key is never in the model's context, but make sure it can't
+          # end up in files that become a public PR.
+          if grep -qF -- "$OPENROUTER_API_KEY" $changed; then
+            echo "::error::the API key appeared in an edited file"; exit 1
+          fi
+          rm -rf .aider*
+          git add -- $(cat ../editable.txt)
+          GIT_EDITOR=true git commit -q --amend --no-edit
+
+      - name: Re-verify the fix against the full gauntlet
+        if: env.HAS_KEY == 'true' && steps.repro.outputs.failed == 'true'
+        env:
+          UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
+          APK: ${{ needs.build.outputs.apk }}
+          CACHE_BUST: ${{ github.run_id }}-fix
+        run: |
+          # The fix must pass EVERYTHING (not just the stage that failed), the same bar as a
+          # human patch change and the conflict path. reproduce.sh returns 0 only when
+          # compile, validate, build, APK, smoke and boot all pass.
+          overlay/scripts/reproduce.sh upstream \
+            || { echo "::error::the AI's fix did not pass the full gauntlet"; exit 1; }
+
+      - name: Export the ported patch
+        id: finish
+        if: env.HAS_KEY == 'true' && steps.repro.outputs.failed == 'true'
+        run: |
+          overlay/scripts/refresh-patches.sh upstream "${{ needs.build.outputs.sha }}"
+          echo "fixed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the ported patch
+        if: env.HAS_KEY == 'true' && steps.finish.outputs.fixed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ported-patches
+          path: |
+            overlay/patches
+            overlay/source
+
+  # Opens and auto-merges the AI's fix, from either path: a resolved conflict (resolve) or a
+  # resolved drift (resolve-drift). Both upload the same `ported-patches` artifact, and only
+  # one of the two can run per workflow (conflict is XOR drift), so the download is the same;
+  # the kind only changes the branch name, title and wording.
   open-pr:
-    needs: [build, resolve]
-    if: always() && needs.build.outputs.conflict == 'true' && needs.resolve.result == 'success'
+    needs: [build, resolve, resolve-drift]
+    if: >-
+      always() &&
+      ((needs.build.outputs.conflict == 'true' && needs.resolve.result == 'success') ||
+       (needs.build.result == 'failure' && needs.build.outputs.conflict != 'true' &&
+        needs.resolve-drift.outputs.fixed == 'true'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -466,6 +684,11 @@ jobs:
     steps:
       - name: Check out this repo
         uses: actions/checkout@v5
+        with:
+          # Always base the PR on main, never on a feature branch a test run was dispatched
+          # from — otherwise the PR would carry that branch's workflow changes and a
+          # GITHUB_TOKEN push touching .github/workflows/ can be refused.
+          ref: main
 
       - name: Download the ported patch
         id: download
@@ -481,19 +704,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SHORT: ${{ needs.build.outputs.short }}
           SHA: ${{ needs.build.outputs.sha }}
+          CONFLICT: ${{ needs.build.outputs.conflict }}
         run: |
-          branch="auto/port-$SHORT"
+          if [ "$CONFLICT" = "true" ]; then
+            branch="auto/port-$SHORT"; issue_title="$CONFLICT_TITLE"
+            title="Port patches to upstream $SHORT"
+            reason="the patch conflicted"
+            did="resolved the conflict, changing only the conflicted files"
+          else
+            branch="auto/drift-$SHORT"; issue_title="$FAILED_TITLE"
+            title="Fix patch drift against upstream $SHORT"
+            reason="the patch applied cleanly but a check then failed (upstream drift)"
+            did="adapted the patch to upstream's current code, changing only the patch's own files"
+          fi
           rm -f patches/*.patch
-          cp ported/*.patch patches/
+          cp ported/patches/*.patch patches/
+          # Keep source/ in step with the patch (the AI may have adapted an overlay module).
+          # Copy over, don't wipe — source/README.md isn't in the artifact.
+          [ -d ported/source ] && cp -R ported/source/. source/
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git add -A patches
-          git commit -q -m "Port patches to upstream $SHORT (conflict resolved by AI)"
+          git add -A patches source
+          git commit -q -m "$title (resolved by AI)"
           git push -f origin "$branch"
-          issue=$(gh issue list --state open --limit 100 --json number,title --jq ".[] | select(.title == \"$CONFLICT_TITLE\") | .number" | head -1)
+          issue=$(gh issue list --state open --limit 100 --json number,title --jq ".[] | select(.title == \"$issue_title\") | .number" | head -1)
           cat > body.md <<BODY
-          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and the patch conflicted. The AI (\`${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3' }}\` via Aider) resolved the conflict, changing only the conflicted files. The result passed the static checks and a full image build, Player APK check, DAI smoke test and boot test.
+          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and $reason. The AI (\`${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}\` via Aider) $did. The result passed the static checks and a full image build, Player APK check, DAI smoke test and boot test.
 
           This PR is merged automatically, which starts the publishing build. \`:latest\` only updates if that build passes too.
 
@@ -501,7 +738,6 @@ jobs:
 
           cc @${{ github.repository_owner }}
           BODY
-          title="Port patches to upstream $SHORT"
           [ "$TEST_RUN" != true ] || title="[test run, don't merge] $title"
           pr=$(gh pr list --head "$branch" --state open --json url --jq '.[0].url')
           [ -n "$pr" ] || pr=$(gh pr create --head "$branch" --base main --title "$title" --body-file body.md)
@@ -516,14 +752,20 @@ jobs:
           gh workflow run build.yml --ref main
           echo "Merged $pr and started the publishing build."
 
-  # If the AI couldn't produce a fix that passes every check, say so on the
-  # conflict issue (which pings you) instead of leaving it saying "resolving now".
+  # If the AI couldn't produce a fix that passes every check, say so on the matching status
+  # issue (which pings you) instead of leaving it saying a fix is being attempted. Covers both
+  # the conflict path (resolve/open-pr) and the drift path (resolve-drift/open-pr). A clean
+  # reproduction in resolve-drift is a success with fixed!=true, so it never reaches here —
+  # only a genuine inability to fix does. Never on test runs.
   ai-failed:
-    needs: [build, resolve, open-pr]
+    needs: [build, resolve, resolve-drift, open-pr]
     if: >-
-      always() && needs.build.outputs.conflict == 'true' &&
+      always() && needs.build.outputs.sha != '' &&
       (inputs.upstream_repo || '') == '' && (inputs.upstream_branch || '') == '' &&
-      (needs.resolve.result == 'failure' || needs.open-pr.result == 'failure')
+      ((needs.build.outputs.conflict == 'true' &&
+        (needs.resolve.result == 'failure' || needs.open-pr.result == 'failure')) ||
+       (needs.build.result == 'failure' && needs.build.outputs.conflict != 'true' &&
+        (needs.resolve-drift.result == 'failure' || needs.open-pr.result == 'failure')))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -532,15 +774,21 @@ jobs:
       - name: Check out this repo
         uses: actions/checkout@v5
 
-      - name: Comment on the conflict issue
+      - name: Comment on the status issue
         env:
           GH_TOKEN: ${{ github.token }}
+          CONFLICT: ${{ needs.build.outputs.conflict }}
         run: |
+          if [ "$CONFLICT" = "true" ]; then
+            title="$CONFLICT_TITLE"; what="the conflict"
+          else
+            title="$FAILED_TITLE"; what="this drift"
+          fi
           cat > body.md <<BODY
-          The AI could not produce a fix for upstream \`${{ needs.build.outputs.short }}\` that passes every check, so nothing was merged or published. It will try again on the next daily run; if upstream doesn't change, it will likely fail the same way, so this needs a manual fix (steps above).
+          The AI could not produce a fix for $what against upstream \`${{ needs.build.outputs.short }}\` that passes every check, so nothing was merged or published. It will try again on the next daily run; if upstream doesn't change, it will likely fail the same way, so this needs a manual fix (steps above).
 
           Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
           cc @${{ github.repository_owner }}
           BODY
-          scripts/issue.sh open "$CONFLICT_TITLE" body.md
+          scripts/issue.sh open "$title" body.md
