@@ -82,6 +82,9 @@ check app/routes/directv_proxy.py "dtv_android.player_headers()"
 # DRM-failure recovery for an Android TV session delegates to dtv_android (no token wipe, no storm).
 check app/routes/directv_proxy.py "dtv_android.drm_reauth("
 check app/routes/directv_proxy.py "dtv_aac_ads.swap_muffled_ads("
+# Inserted-ad AAC loudness attenuation (own module): the relay hook + the module itself.
+check app/routes/directv_proxy.py "dtv_aac_gain.attenuate_ad_segment("
+check app/scrapers/dtv_aac_gain.py "def attenuate_ad_segment("
 check app/routes/directv_proxy.py "'yospace.com',  # DAI"
 check app/templates/admin/sources.html "toggleHtml('use_dai'"
 # Opt-in stereo-downmix (its own module): the master-rewrite hook + the UI toggle.
