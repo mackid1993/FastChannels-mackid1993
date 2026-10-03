@@ -1,0 +1,42 @@
+name: Model preflight
+
+# One-off sanity check: does the configured AI_MODEL actually answer through
+# OpenRouter under THIS account's privacy/data policies, using the same secret the
+# conflict/drift resolver uses? Run it from the Actions tab (Run workflow) after
+# changing AI_MODEL, before trusting the auto-fix. Costs a few tokens.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call AI_MODEL through OpenRouter with the resolver's key
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3' }}
+        run: |
+          [ -n "$OPENROUTER_API_KEY" ] || { echo "::error::OPENROUTER_API_KEY secret is not set"; exit 1; }
+          # Aider routes with an "openrouter/" prefix; the raw API wants just the model id.
+          model="${AI_MODEL#openrouter/}"
+          echo "Testing model '$model' under this account's OpenRouter data policies..."
+          code=$(curl -sS -o resp.json -w '%{http_code}' https://openrouter.ai/api/v1/chat/completions \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}],\"max_tokens\":10}")
+          echo "HTTP $code"
+          content=$(jq -r '.choices[0].message.content // empty' resp.json 2>/dev/null)
+          provider=$(jq -r '.provider // empty' resp.json 2>/dev/null)
+          err=$(jq -r '(.error.message // .error) // empty' resp.json 2>/dev/null)
+          echo "provider routed: ${provider:-（none）}"
+          echo "content: ${content:-（none）}"
+          [ -n "$err" ] && echo "error: $err"
+          if [ "$code" != "200" ] || [ -z "$content" ]; then
+            echo "::error::'$model' did not return a usable completion (HTTP $code). Most likely your OpenRouter privacy/data policy blocks every provider for this model, or the id is wrong. Allow a provider for it, or pick a different model, then re-run."
+            exit 1
+          fi
+          echo "::notice::OK — '$model' answered through OpenRouter under the current privacy policies (provider: ${provider:-unknown})."
