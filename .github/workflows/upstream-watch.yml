@@ -1,0 +1,74 @@
+name: Upstream watch (development)
+
+# Early-warning watcher for kineticman/FastChannels' DEVELOPMENT branch.
+#
+# GitHub can't notify us when a repo we don't own gets a push, so we poll: every 6
+# hours, read development's HEAD. If it's a commit we haven't checked yet (deduped
+# via the Actions cache, so we never act on the same commit twice), dispatch the
+# build workflow in DRIFT-CHECK mode against development:
+#
+#     build.yml  upstream_branch=development  drift_only=true
+#
+# In that mode build.yml applies the patches to development and runs validate.sh —
+# cheap, no image, no OpenRouter — and ONLY if the patch drifts/conflicts does the
+# GLM 5.3 Flash resolver adapt it and open a PR that @mentions you (so you get an
+# email). Because upstream_branch is set, that run is a "test run": it never builds
+# an image, never publishes :latest, never pushes to patches/, and never merges the
+# PR. So this watcher can prepare a ready fix and warn you ahead of a release, but it
+# can NEVER touch your published image. The real build+publish happens only when the
+# change lands on main (see the schedule in build.yml).
+#
+# Cost: the poll and the drift check are free; Flash runs only on an actual, new
+# drift, and the dedup means once per commit — never in a loop.
+
+on:
+  schedule:
+    - cron: "30 */6 * * *"   # every 6h, offset 30 min from build.yml's main watch
+  workflow_dispatch:          # run it by hand from the Actions tab
+
+permissions:
+  actions: write              # to dispatch build.yml
+  contents: read
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: kineticman/FastChannels
+  UPSTREAM_BRANCH: development
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read development HEAD
+        id: head
+        run: |
+          sha=$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)
+          [ -n "$sha" ] || { echo "::error::could not read upstream $UPSTREAM_BRANCH"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Upstream $UPSTREAM_BRANCH HEAD: $sha"
+
+      - name: Have we already checked this commit?
+        id: seen
+        uses: actions/cache@v4
+        with:
+          path: .dev-watch-marker
+          key: dev-watch-${{ steps.head.outputs.sha }}
+
+      - name: Dispatch a drift check against development
+        if: steps.seen.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "New $UPSTREAM_BRANCH commit ${{ steps.head.outputs.sha }} — dispatching a drift check (no build/publish/merge)."
+          gh workflow run build.yml -f upstream_branch="$UPSTREAM_BRANCH" -f drift_only=true
+          # Mark this commit seen only after a successful dispatch, so a failed dispatch
+          # is retried next poll instead of being cached as done.
+          mkdir -p .dev-watch-marker
+          echo "${{ steps.head.outputs.sha }}" > .dev-watch-marker/sha
+
+      - name: Nothing new
+        if: steps.seen.outputs.cache-hit == 'true'
+        run: echo "$UPSTREAM_BRANCH unchanged since the last check (${{ steps.head.outputs.sha }}); nothing to do."
