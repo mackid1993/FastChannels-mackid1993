@@ -414,6 +414,19 @@ def _adb_shell(address: str, shell_cmd: str, timeout: int = 20) -> str:
         return ''
 
 
+def _reachable(address: str) -> bool:
+    """A fast adb reachability check (short timeouts) so a powered-off box fails quickly, and
+    so the capture result can tell 'couldn't reach the box' apart from 'reachable but no
+    advertising id'."""
+    try:
+        subprocess.run(['adb', 'connect', address], capture_output=True, timeout=5)
+        r = subprocess.run(['adb', '-s', address, 'shell', 'echo ok'],
+                           capture_output=True, text=True, timeout=5)
+        return 'ok' in (r.stdout or '')
+    except Exception:
+        return False
+
+
 # Sentinel: the GMS screen read was skipped because the box is playing (defer, don't
 # interrupt). Distinct from None (no advertising id) so callers can report it.
 _PLAYING = object()
@@ -508,12 +521,14 @@ def _capture_and_store(address: str) -> str:
             return 'none'
         _adid_inflight.add(address)
     try:
+        if not _reachable(address):
+            return 'unreachable'   # box off / adb down; kept pending so a re-run picks it up
         res = _capture_one(address)
         if res is _PLAYING:
             return 'playing'   # still pending: keep it, re-run when idle
         if res is None:
             with _adid_lock:
-                _adid_tried[address] = time.time()   # nothing readable: stop nagging a while
+                _adid_tried[address] = time.time()   # reachable but nothing readable: stop nagging a while
             return 'none'
         entry = {'advertising_id': res['advertising_id'], 'optout': res['optout'],
                  'source': res['source'], 'captured_at': int(time.time())}
@@ -558,7 +573,7 @@ def capture_registered_devices(addresses: list[str] | None = None) -> dict:
     an explicit action (DAI toggle-on, or the admin capture button) — never on a schedule
     and never at tune time. Must run inside a Flask app context (device list + store)."""
     addrs = addresses if addresses is not None else _bridge_addresses()
-    counts = {'captured': 0, 'playing': 0, 'none': 0}
+    counts = {'captured': 0, 'playing': 0, 'unreachable': 0, 'none': 0}
     for addr in addrs:
         counts[_capture_and_store(addr)] += 1
     if counts['captured']:

@@ -12,23 +12,23 @@ Fixes the inserted-ad audio: swaps each band-limited inserted AC-3 ad for its fu
 
 The logic lives in app/scrapers/directv_dai.py, dtv_android.py, dtv_aac_ads.py and dtv_aac_gain.py; upstream files only get one-line hooks.
 ---
- app/routes/api_sources.py        | 100 +++-
+ app/routes/api_sources.py        | 102 +++-
  app/routes/directv_proxy.py      |  41 +-
  app/scrapers/directv.py          | 120 +++--
- app/scrapers/directv_dai.py      | 866 ++++++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py      | 881 +++++++++++++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py      |  49 ++
  app/scrapers/dtv_aac_gain.py     | 663 +++++++++++++++++++++++
- app/scrapers/dtv_android.py      | 872 +++++++++++++++++++++++++++++++
+ app/scrapers/dtv_android.py      | 872 ++++++++++++++++++++++++++++++
  app/source_config.py             |   5 +
- app/templates/admin/sources.html | 202 ++++++-
- 9 files changed, 2829 insertions(+), 89 deletions(-)
+ app/templates/admin/sources.html | 186 ++++++-
+ 9 files changed, 2830 insertions(+), 89 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_aac_gain.py
  create mode 100644 app/scrapers/dtv_android.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
-index 8e46cf7..464a490 100644
+index 8e46cf7..a5fdaf9 100644
 --- a/app/routes/api_sources.py
 +++ b/app/routes/api_sources.py
 @@ -710,6 +710,8 @@ def save_source_config(source_id):
@@ -40,7 +40,7 @@ index 8e46cf7..464a490 100644
      full_scrape_queued = False
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
-@@ -1565,24 +1567,108 @@ def directv_auto_login(source_id):
+@@ -1565,24 +1567,110 @@ def directv_auto_login(source_id):
      if source.name != 'directv':
          return jsonify({'error': 'not a directv source'}), 400
  
@@ -146,11 +146,13 @@ index 8e46cf7..464a490 100644
 +        return jsonify({'enabled': False, 'ok': True, 'pending': 0})
 +    if request.method == 'GET':
 +        return jsonify({'enabled': True, 'pending': len(directv_dai.uncaptured_addresses())})
-+    # Capture in the background: a slow GMS box could otherwise exceed the web worker's
-+    # request timeout. Return how many it's visiting; the UI polls the GET above for the
-+    # result (the pending count dropping to 0).
-+    capturing = directv_dai.capture_in_background(directv_dai.uncaptured_addresses())
-+    return jsonify({'enabled': True, 'ok': True, 'capturing': capturing})
++    # Capture synchronously so the button can report the result (how many captured, and why
++    # the rest were skipped). The fast reachability probe fails a powered-off box quickly, so
++    # a handful of boxes stay well under the worker timeout.
++    counts = directv_dai.capture_registered_devices(directv_dai.uncaptured_addresses())
++    return jsonify({'enabled': True, 'ok': True, 'captured': counts['captured'],
++                    'playing': counts['playing'], 'unreachable': counts['unreachable'],
++                    'none': counts['none'], 'pending': len(directv_dai.uncaptured_addresses())})
 +
 +
  @sources_bp.route('/sources/<int:source_id>/directv-auth-status')
@@ -529,10 +531,10 @@ index e796bf3..9ccf86b 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..e2b9277
+index 0000000..b04c221
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,866 @@
+@@ -0,0 +1,881 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -949,6 +951,19 @@ index 0000000..e2b9277
 +        return ''
 +
 +
++def _reachable(address: str) -> bool:
++    """A fast adb reachability check (short timeouts) so a powered-off box fails quickly, and
++    so the capture result can tell 'couldn't reach the box' apart from 'reachable but no
++    advertising id'."""
++    try:
++        subprocess.run(['adb', 'connect', address], capture_output=True, timeout=5)
++        r = subprocess.run(['adb', '-s', address, 'shell', 'echo ok'],
++                           capture_output=True, text=True, timeout=5)
++        return 'ok' in (r.stdout or '')
++    except Exception:
++        return False
++
++
 +# Sentinel: the GMS screen read was skipped because the box is playing (defer, don't
 +# interrupt). Distinct from None (no advertising id) so callers can report it.
 +_PLAYING = object()
@@ -1043,12 +1058,14 @@ index 0000000..e2b9277
 +            return 'none'
 +        _adid_inflight.add(address)
 +    try:
++        if not _reachable(address):
++            return 'unreachable'   # box off / adb down; kept pending so a re-run picks it up
 +        res = _capture_one(address)
 +        if res is _PLAYING:
 +            return 'playing'   # still pending: keep it, re-run when idle
 +        if res is None:
 +            with _adid_lock:
-+                _adid_tried[address] = time.time()   # nothing readable: stop nagging a while
++                _adid_tried[address] = time.time()   # reachable but nothing readable: stop nagging a while
 +            return 'none'
 +        entry = {'advertising_id': res['advertising_id'], 'optout': res['optout'],
 +                 'source': res['source'], 'captured_at': int(time.time())}
@@ -1093,7 +1110,7 @@ index 0000000..e2b9277
 +    an explicit action (DAI toggle-on, or the admin capture button) — never on a schedule
 +    and never at tune time. Must run inside a Flask app context (device list + store)."""
 +    addrs = addresses if addresses is not None else _bridge_addresses()
-+    counts = {'captured': 0, 'playing': 0, 'none': 0}
++    counts = {'captured': 0, 'playing': 0, 'unreachable': 0, 'none': 0}
 +    for addr in addrs:
 +        counts[_capture_and_store(addr)] += 1
 +    if counts['captured']:
@@ -3018,7 +3035,7 @@ index 640deee..66b972d 100644
      # into login mode but hasn't supplied both credentials yet. Installs
      # from before 'auth_mode' existed (username/password used to be
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index b818ab0..3f7f709 100644
+index b818ab0..d8ee5d1 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
 @@ -2951,6 +2951,7 @@
@@ -3108,7 +3125,7 @@ index b818ab0..3f7f709 100644
            <button class="btn btn-run" type="button" onclick="saveSourceConfig(${sourceId})">Save Settings</button>
          </div>`;
      }
-@@ -3236,6 +3237,161 @@
+@@ -3236,6 +3237,145 @@
        directvPollStatus(sourceId);
      }
  
@@ -3142,43 +3159,27 @@ index b818ab0..3f7f709 100644
 +      try {
 +        const r = await fetch(`/api/sources/${sourceId}/directv-capture-adids`, {method: 'POST'});
 +        const d = await r.json().catch(() => ({}));
-+        if (d.enabled === false) { if (btn) btn.disabled = false; directvLoadAdidStatus(sourceId); return; }
++        if (d.enabled === false) { directvLoadAdidStatus(sourceId); return; }
 +        if (!r.ok || !d.ok) {
 +          if (statusEl) statusEl.innerHTML = `<span style="color:var(--danger)">${escapeHtml((d && d.error) || 'Capture failed')}</span>`;
-+          if (btn) btn.disabled = false;
 +          return;
++        }
++        const parts = [`Captured ${d.captured} device${d.captured === 1 ? '' : 's'}`];
++        if (d.playing) parts.push(`${d.playing} skipped — ${d.playing === 1 ? 'a box is' : 'boxes are'} playing (re-run when idle)`);
++        if (d.unreachable) parts.push(`${d.unreachable} couldn't be reached (check ${d.unreachable === 1 ? "it's" : "they're"} on and connected)`);
++        if (d.none) parts.push(`${d.none} with no advertising ID`);
++        if (statusEl) {
++          const ok = !d.playing && !d.unreachable && !d.none;
++          statusEl.innerHTML = ok
++            ? '<span style="color:var(--success-soft)">&#10003; ' + escapeHtml(parts.join('; ')) + '.</span>'
++            : escapeHtml(parts.join('; ')) + '.';
 +        }
 +      } catch (e) {
 +        if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">Network error</span>';
++      } finally {
 +        if (btn) btn.disabled = false;
-+        return;
++        directvLoadAdidStatus(sourceId);  // refresh the button (hide it if nothing is left)
 +      }
-+      // The capture runs in the background; poll the pending count until it settles, so the
-+      // user gets a plain result (all captured, or how many are still pending).
-+      let tries = 0;
-+      const poll = async () => {
-+        tries++;
-+        let pending = null;
-+        try {
-+          const r = await fetch(`/api/sources/${sourceId}/directv-capture-adids`);
-+          const d = await r.json().catch(() => ({}));
-+          pending = (d && d.enabled) ? d.pending : 0;
-+        } catch (e) { /* keep trying */ }
-+        if (pending === 0) {
-+          if (statusEl) statusEl.innerHTML = '<span style="color:var(--success-soft)">&#10003; Advertising IDs captured for all bridge devices.</span>';
-+          if (btn) { btn.disabled = false; btn.style.display = 'none'; }
-+          return;
-+        }
-+        if (tries >= 12) {
-+          if (statusEl && pending != null) statusEl.textContent = `${pending} box${pending === 1 ? '' : 'es'} still need an advertising ID (currently playing, or not reachable) — try again when idle.`;
-+          else if (statusEl) statusEl.textContent = 'Capture is still running… reopen this panel to see the result.';
-+          if (btn) btn.disabled = false;
-+          directvLoadAdidStatus(sourceId);
-+          return;
-+        }
-+        setTimeout(poll, 2500);
-+      };
-+      setTimeout(poll, 2500);
 +    }
 +
 +    async function directvLogout(sourceId) {
@@ -3270,7 +3271,7 @@ index b818ab0..3f7f709 100644
      function directvPollStatus(sourceId) {
        if (_directvPollTimer) clearInterval(_directvPollTimer);
        _directvPollTimer = setInterval(() => _directvCheckStatus(sourceId), 2000);
-@@ -3256,7 +3412,7 @@
+@@ -3256,7 +3396,7 @@
        const statusMap = {
          idle: null,
          starting: '<span style="color:var(--text-muted)">Starting browser...</span>',
