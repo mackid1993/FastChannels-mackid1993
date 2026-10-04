@@ -6,6 +6,12 @@
 # try each held PR's patches/ (newest first) against the CURRENT upstream, and return the first
 # that still applies and validates. A hit means we reuse prepared work; a miss means the AI runs.
 #
+# A candidate that applies + validates then gets a cautious, adversarial AI review of its actual
+# changes (scripts/review_fix.py) before it is accepted — a cheap second set of eyes that catches
+# a fix which is mechanically fine yet subtly wrong for this upstream. Reuse only on APPROVE;
+# otherwise move on (and the caller's AI fixes it properly). The review is skipped gracefully if
+# OPENROUTER_API_KEY is unset (deterministic checks only).
+#
 # Pure lookup — no side effects. It clones upstream into a temp dir and restores the overlay's
 # patches/ before returning, so the caller's tree is untouched. On a hit it prints the matching
 # PR number as the only stdout line and exits 0; on a miss it prints nothing and exits 1 (all
@@ -13,6 +19,7 @@
 # reconcile both merge it and kick a publish, which dedups by build key so it can't over-build).
 #
 #   GH_TOKEN=<token> GITHUB_REPOSITORY=<owner/repo> \
+#       [OPENROUTER_API_KEY=<key> AI_MODEL=<m>]   # enable the adversarial review \
 #       scripts/try_held_fixes.sh <overlay-checkout> <upstream-repo> <upstream-sha>
 set -uo pipefail
 
@@ -61,9 +68,24 @@ while IFS=$'\t' read -r num branch; do
   fi
 
   if [ "$ok" = true ]; then
-    log "cache HIT: PR #$num applies and validates against $sha — reuse it, no AI."
-    echo "$num"            # the only stdout line: the reusable PR number
-    exit 0
+    if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+      log "cache HIT: PR #$num applies and validates against $sha (no key for the review — deterministic reuse)."
+      echo "$num"
+      exit 0
+    fi
+    # Second set of eyes before release: a cautious, adversarial review of the ACTUAL changes
+    # the cached fix makes against this upstream (cheaper than regenerating, and catches a fix
+    # that applies+validates yet is subtly wrong -- what the static checks can't see). Reuse
+    # only if the reviewer approves; otherwise the AI will fix it properly.
+    verdict=$(git -C "$work/up" diff "$sha" HEAD 2>/dev/null | python3 "$ov/scripts/review_fix.py" "$ov/AGENTS.md" 2>/dev/null)
+    if printf '%s\n' "$verdict" | head -1 | grep -q '^APPROVE'; then
+      log "cache HIT: PR #$num applies, validates, and the adversarial review APPROVED it — reuse, no AI."
+      echo "$num"            # the only stdout line: the reusable PR number
+      exit 0
+    fi
+    log "  PR #$num applies+validates but the review flagged it [$(printf '%s' "$verdict" | head -1)] — not reusing; the AI will fix it properly."
+    git -C "$ov" checkout -q HEAD -- patches
+    continue
   fi
   log "  PR #$num does not fit $sha."
   git -C "$ov" checkout -q HEAD -- patches   # restore before the next candidate

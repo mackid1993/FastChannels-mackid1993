@@ -50,6 +50,8 @@ jobs:
       - name: Merge any held fix that's now valid against main
         env:
           GH_TOKEN: ${{ github.token }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
         run: |
           set -euo pipefail
           sha=$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)
