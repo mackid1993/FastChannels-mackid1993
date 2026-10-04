@@ -58,10 +58,12 @@ env:
   # A test run (against another repo/branch) builds and checks but never publishes,
   # refreshes the patches, or files issues.
   TEST_RUN: ${{ (inputs.upstream_repo != '' || inputs.upstream_branch != '') && 'true' || 'false' }}
-  # Drift-only (apply + validate + refresh the patches, no image) runs only when a dispatch
-  # asks for it — e.g. the development watcher (upstream-watch.yml). Scheduled and push runs
-  # against main do a full build, which the build-key dedup makes a no-op when nothing changed.
-  DRIFT_ONLY: ${{ inputs.drift_only && 'true' || 'false' }}
+  # Drift-only = apply + validate the patches, NO image, NO publish. A push to this repo (a
+  # CI/patch/doc change) runs a drift check — it reruns the tests but never rebuilds or
+  # republishes the image. A dispatch can ask for it too (the development watcher does). Only a
+  # SCHEDULED run does a full build, and the build-key dedup makes that a no-op unless upstream,
+  # the Player APK or the patch actually changed — so :latest is rebuilt only on a real change.
+  DRIFT_ONLY: ${{ (inputs.drift_only || github.event_name == 'push') && 'true' || 'false' }}
   # The Dockerfile always downloads the Player APK from kineticman's latest release.
   APK_REPO: kineticman/FastChannels
   IMAGE: ghcr.io/${{ github.repository_owner }}/fastchannels-mackid1993
@@ -96,10 +98,13 @@ jobs:
           # release must trigger a rebuild even when no code changed.
           apk=$(gh api "repos/$APK_REPO/releases/latest" \
                 --jq '.tag_name + "@" + ([.assets[] | select(.name == "FastChannelsPlayer.apk") | "\(.id)-\(.updated_at)"] | first // "none")')
-          # Only the patches' added/removed lines count, so the automatic context
-          # refresh below doesn't trigger a pointless rebuild of identical code.
-          overlay=$(cd overlay && { git ls-files -s scripts .github/workflows/build.yml; grep -hE '^[-+]' patches/*.patch; } | sha256sum | cut -c1-12)
-          key=$(printf '%s|%s|%s' "$sha" "$apk" "$overlay" | sha256sum | cut -c1-12)
+          # The build key is only what actually ends up IN the image: upstream, the Player
+          # APK, and the patch's applied lines (added/removed only, so a context-only refresh
+          # doesn't rebuild identical code). Scripts, workflows and docs are deliberately NOT
+          # in the key, so changing CI never rebuilds or republishes the image — a new image
+          # comes only from a new upstream commit, a new Player APK, or a real patch change.
+          patchlines=$(cd overlay && grep -hE '^[-+]' patches/*.patch | sha256sum | cut -c1-12)
+          key=$(printf '%s|%s|%s' "$sha" "$apk" "$patchlines" | sha256sum | cut -c1-12)
           # A drift day does a full build instead while the last build's failure is
           # unresolved, so a one-off failure is retried daily.
           drift=$DRIFT_ONLY
@@ -127,7 +132,7 @@ jobs:
       - name: Skip if this exact build already exists
         id: skip
         run: |
-          if [ "${{ inputs.force }}" != "true" ] && docker buildx imagetools inspect "$IMAGE:build-${{ steps.inputs.outputs.key }}" >/dev/null 2>&1; then
+          if [ "${{ inputs.force }}" != "true" ] && [ "${{ steps.inputs.outputs.drift }}" != "true" ] && docker buildx imagetools inspect "$IMAGE:build-${{ steps.inputs.outputs.key }}" >/dev/null 2>&1; then
             echo "Already built: upstream ${{ steps.inputs.outputs.short }}, APK ${{ steps.inputs.outputs.apk_tag }}, same patches."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -275,6 +280,26 @@ jobs:
           msg="Fixed: built, tested and published upstream ${{ steps.inputs.outputs.short }} with the patches."
           overlay/scripts/issue.sh close "$CONFLICT_TITLE" "$msg"
           overlay/scripts/issue.sh close "$FAILED_TITLE" "$msg"
+
+      - name: Ping that a new image was built and published
+        # Fires only on a real publish (a new upstream commit, a new Player APK, or an AI
+        # patch fix that landed — never on a CI-only change, which is drift-only and doesn't
+        # reach here). Opens a transient issue that @mentions you, so GitHub emails you, then
+        # closes it immediately — a success ping with no lingering issue.
+        if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true' && steps.inputs.outputs.drift != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > ping.md <<BODY
+          Built and published \`$IMAGE:latest\` for upstream [\`${{ steps.inputs.outputs.short }}\`](https://github.com/$UPSTREAM_REPO/commit/${{ steps.inputs.outputs.sha }}) (Player APK \`${{ steps.inputs.outputs.apk_tag }}\`). Every check passed: image build, Player APK, smoke test and boot test. If this followed an AI patch fix, the "$CONFLICT_TITLE"/"$FAILED_TITLE" status issue has the details.
+
+          Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          cc @${{ github.repository_owner }}
+          BODY
+          url=$(gh issue create --title "Built & published upstream ${{ steps.inputs.outputs.short }}" --body-file ping.md)
+          echo "Opened success ping: $url"
+          gh issue close "${url##*/}" --comment "Automated success notification — closing."
 
       - name: Report a failed build
         if: failure() && steps.apply.outcome != 'failure' && env.TEST_RUN != 'true'
