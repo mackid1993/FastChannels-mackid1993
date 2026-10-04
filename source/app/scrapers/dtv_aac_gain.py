@@ -1,8 +1,8 @@
 """DirecTV DAI: attenuate inserted AAC ads a fixed amount, losslessly.
 
 The inserted-ad AAC twins (see dtv_aac_ads) play a few dB hotter than the
-stereo-downmixed AC-3 programming, so breaks blast. This drops every inserted
-ad's loudness by editing the AAC-LC ``global_gain`` field of every channel of
+stock 5.1 AC-3 programming, so breaks blast. This drops every inserted
+ad's loudness by editing the HE-AAC ``global_gain`` field of every channel of
 every frame -- the same lossless lever mp3gain/aacgain use -- implemented here
 from the ISO/IEC 14496-3 bitstream syntax. 8 steps x 1.5 dB = -12 dB (calibrated to
 the bridge's actual feed -- see _DEFAULT_STEPS); no re-encoding, no dependencies.
@@ -107,7 +107,7 @@ ID_SCE, ID_CPE, ID_CCE, ID_LFE, ID_DSE, ID_PCE, ID_FIL, ID_END = range(8)
 # CDN host, with any segment numbering (e.g. u-6600-a-96-1-1.mp4 or u-6600-a-128-1-1-2.mp4).
 # Deliberately broad: the only thing it must NOT match is the -i init (no audio frames). It is
 # safe to over-match because attenuate_ad_segment is a no-op on anything that is not a clean
-# AAC-LC media fragment (AC-3 content, video, inits, live dfwlive-* segments all pass through
+# HE-AAC media fragment (AC-3 content, video, inits, live dfwlive-* segments all pass through
 # untouched). The old narrow u-\d+-a-96-\d+-\d+\.mp4 missed ads whose URL/numbering differed.
 _AD_SEG = re.compile(r'(?:^|/)u-\d+-a-\d+-[\d-]*\d\.mp4$')
 
@@ -118,7 +118,7 @@ _RATES = (48000, 32000, 24000, 16000, 8000)
 _STEP_DB = 1.5  # one global_gain step
 
 # How many steps to cut each inserted ad. Calibrated to the bridge's actual LinkPi feed:
-# the inserted AAC ads measure ~-20.6 LUFS, the stereo-downmixed AC-3 programming ~-32 LUFS
+# the inserted AAC ads measure ~-20.6 LUFS, the stock 5.1 AC-3 programming ~-32 LUFS
 # (box 16, 2026-10-03, integrated -32.2, never above -32.4 short-term over 4 min). 8 steps
 # = -12 dB lands a break at ~-32.6, matching the programming instead of ~7 dB over it. The
 # per-segment log line reports the actual dB, so this is easy to re-tune against a live ad.
@@ -243,11 +243,11 @@ def _swb(rate):
 
 
 # ---------------------------------------------------------------------------
-# AAC-LC bitstream syntax (ISO/IEC 14496-3, 4.4-4.5).
+# HE-AAC bitstream syntax (ISO/IEC 14496-3, 4.4-4.5).
 # ---------------------------------------------------------------------------
 
 def _skip_ltp(br, max_sfb):
-    # ltp_data() for a long window (AAC-LC long-term prediction): ltp_lag (11) +
+    # ltp_data() for a long window (HE-AAC long-term prediction): ltp_lag (11) +
     # ltp_coef (3) + ltp_long_used[min(max_sfb, MAX_LTP_LONG_SFB=40)] (1 bit each).
     br.skip(14)
     br.skip(max_sfb if max_sfb < 40 else 40)
@@ -262,7 +262,7 @@ def _parse_ics_info(br):
         max_sfb = br.read_bits(6)
         pred = br.read_bit()            # predictor_data_present
         if pred:
-            # AAC-LC signals LTP here (not AAC-MAIN prediction): skip this channel's
+            # HE-AAC signals LTP here (not AAC-MAIN prediction): skip this channel's
             # ltp_data when present. DirecTV's HE-AAC uses LTP, so this must be parsed,
             # not rejected.
             if br.read_bit():           # ltp_data_present
@@ -568,11 +568,11 @@ def _write_u8(buf, bitpos, val):
 
 
 def attenuate_ad_segment(data: bytes, steps: int = _DEFAULT_STEPS) -> bytes:
-    """Return ``data`` with every AAC-LC global_gain lowered by ``steps`` (1.5 dB
+    """Return ``data`` with every HE-AAC global_gain lowered by ``steps`` (1.5 dB
     each), or the original bytes unchanged if it is not a cleanly-parseable AAC
     fMP4 media fragment. Never raises; never returns a corrupted segment. Both the
     normal cut and a no-op (an inserted ad that went out un-attenuated — e.g. a
-    creative that doesn't parse as clean AAC-LC) log at DEBUG, so a running relay
+    creative that doesn't parse as clean HE-AAC) log at DEBUG, so a running relay
     stays quiet; turn on DEBUG to see per-segment detail."""
     body, reason = _attenuate_impl(data, steps)
     if reason.startswith('attenuated'):
@@ -648,8 +648,8 @@ def _attenuate_impl(data: bytes, steps: int):
                 parsed_rate = rate
                 break
         else:
-            return data, ('no-op: no sample rate parsed every frame as clean AAC-LC '
-                          '(not AAC-LC? e.g. HE-AAC/SBR, or an unexpected element)')
+            return data, ('no-op: no sample rate parsed every frame as clean HE-AAC '
+                          '(an unexpected element or signaling we do not handle)')
 
         for start, gains in collected:
             for bitpos, old in gains:

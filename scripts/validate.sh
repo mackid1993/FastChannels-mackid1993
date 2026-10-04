@@ -77,10 +77,21 @@ check $d "dtv_android.android_auth_request("
 # pre_run_setup keeps the DRM session warm on the app's ~55-min refresh cadence (re-minting
 # the activation token) so a tune never meets a dead token; logic lives in dtv_android.
 check $d "dtv_android.background_refresh_due("
+# The Android TV session is the playback identity: sign-in/refresh (run_directv_auth), the
+# DRM license headers, the staleness check, and the inline tune-time refresh all route
+# through dtv_android.
+check $d "dtv_android.sign_in("
+check $d "dtv_android.license_headers("
+check $d "dtv_android.token_stale("
+check $d "dtv_android.refresh_in_place("
 # Two callers pass dai=: resolve() and the license path.
 [ "$(grep -cE -- 'dai=directv_dai\.request_flags\(' $d)" -ge 2 ] \
     || { echo "::error file=$d::missing DAI hook: dai=directv_dai.request_flags(...) in resolve() and the license path"; missing=1; }
 check app/routes/api_sources.py "directv_dai.clear_cache_if_toggled("
+# The viewer-profile picker: the directv-profile route lists/selects DirecTV viewer profiles.
+check app/routes/api_sources.py "directv-profile"
+check app/routes/api_sources.py "dtv_android.list_profiles("
+check app/routes/api_sources.py "dtv_android.select_profile("
 check app/routes/directv_proxy.py "dtv_android.player_headers()"
 # DRM-failure recovery for an Android TV session delegates to dtv_android (no token wipe, no storm).
 check app/routes/directv_proxy.py "dtv_android.drm_reauth("

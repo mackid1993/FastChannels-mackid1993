@@ -182,6 +182,20 @@ assert not any(getattr(f, 'key', None) == 'stereo_downmix' for f in directv.Dire
     'the removed stereo_downmix toggle is back'
 assert 'stereo_downmix' not in inspect.getsource(directv_proxy.directv_browser_manifest), \
     'the removed stereo-downmix master hook is back in the relay'
+
+# Inserted-ad codec is HE-AAC, not AAC-LC. The ad twins the swap targets, and the bitstream
+# the gain module parses, are HE-AAC; an earlier "AAC-LC" relabel was wrong. Guard the label
+# (and the removed stereo-downmix framing) in the overlay's own audio modules so a merge or an
+# AI conflict fix can't quietly reintroduce either into the comments the CI AI reads.
+from app.scrapers import dtv_aac_ads, dtv_aac_gain  # noqa: E402
+for _mod in (dtv_aac_ads, dtv_aac_gain):
+    _src = inspect.getsource(_mod)
+    assert 'AAC-LC' not in _src, \
+        f'{_mod.__name__}: inserted-ad twins are HE-AAC, not AAC-LC (the AAC-LC relabel was a hallucination)'
+    assert 'HE-AAC' in _src, f'{_mod.__name__}: the HE-AAC codec label went missing'
+    assert 'stereo-downmix' not in _src.lower(), \
+        f'{_mod.__name__}: stereo-downmix was removed 2026-10-03 and must not describe current behavior'
+
 # channel/v2's streamUrls groups map to the stream (DAI) and fallback (Data Center) URLs.
 v2pb = {'streamUrls': [{'groupName': 'DAI', 'URLs': ['https://x.yospace.com/csm/a.m3u8?a=1', 'https://y.yospace.com/b']},
                        {'groupName': 'Data Center', 'URLs': ['https://cdn.example/c.m3u8']}]}

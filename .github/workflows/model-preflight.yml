@@ -18,7 +18,7 @@ jobs:
       - name: Call AI_MODEL through OpenRouter with the resolver's key
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3' }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}
         run: |
           [ -n "$OPENROUTER_API_KEY" ] || { echo "::error::OPENROUTER_API_KEY secret is not set"; exit 1; }
           # Aider routes with an "openrouter/" prefix; the raw API wants just the model id.
