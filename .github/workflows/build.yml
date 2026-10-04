@@ -300,7 +300,8 @@ jobs:
           BODY
           url=$(gh issue create -R "$GITHUB_REPOSITORY" --title "Built & published upstream ${{ steps.inputs.outputs.short }}" --body-file ping.md)
           echo "Opened success ping: $url"
-          gh issue close -R "$GITHUB_REPOSITORY" "${url##*/}" --comment "Automated success notification — closing."
+          # Close silently — a closing comment is a third notification email with no new info.
+          gh issue close -R "$GITHUB_REPOSITORY" "${url##*/}"
 
       - name: Report a failed build
         if: failure() && steps.apply.outcome != 'failure' && env.TEST_RUN != 'true'
