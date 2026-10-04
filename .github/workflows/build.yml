@@ -343,7 +343,9 @@ jobs:
   # cache (opens held PRs), it doesn't spend it, and must never merge/publish.
   try-cache:
     needs: build
-    if: always() && env.TEST_RUN != 'true' && needs.build.outputs.conflict == 'true' && needs.build.outputs.sha != ''
+    if: >-
+      always() && (inputs.upstream_repo || '') == '' && (inputs.upstream_branch || '') == '' &&
+      needs.build.outputs.conflict == 'true' && needs.build.outputs.sha != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
