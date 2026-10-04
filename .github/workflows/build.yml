@@ -282,6 +282,7 @@ jobs:
           overlay/scripts/issue.sh close "$FAILED_TITLE" "$msg"
 
       - name: Ping that a new image was built and published
+        continue-on-error: true  # a notification hiccup must never fail a successful publish
         # Fires only on a real publish (a new upstream commit, a new Player APK, or an AI
         # patch fix that landed — never on a CI-only change, which is drift-only and doesn't
         # reach here). Opens a transient issue that @mentions you, so GitHub emails you, then
@@ -297,9 +298,9 @@ jobs:
 
           cc @${{ github.repository_owner }}
           BODY
-          url=$(gh issue create --title "Built & published upstream ${{ steps.inputs.outputs.short }}" --body-file ping.md)
+          url=$(gh issue create -R "$GITHUB_REPOSITORY" --title "Built & published upstream ${{ steps.inputs.outputs.short }}" --body-file ping.md)
           echo "Opened success ping: $url"
-          gh issue close "${url##*/}" --comment "Automated success notification — closing."
+          gh issue close -R "$GITHUB_REPOSITORY" "${url##*/}" --comment "Automated success notification — closing."
 
       - name: Report a failed build
         if: failure() && steps.apply.outcome != 'failure' && env.TEST_RUN != 'true'
