@@ -62,14 +62,18 @@ jobs:
           # whose patches still apply + validate against main is the one to promote. Each held PR
           # is a full patch set, so newest = most cumulative.
           pip install --quiet ruff jinja2
-          num=$(overlay/scripts/try_held_fixes.sh overlay "$UPSTREAM_REPO" "$sha" | tail -1)
-          if [ -n "$num" ]; then
-            echo "Held fix PR #$num is valid against main $sha — merging and publishing (the publish build re-runs the full gauntlet, and dedups by build key so it can't over-build)."
-            gh pr merge "$num" -R "$GITHUB_REPOSITORY" --squash --delete-branch
-            # Pushes with GITHUB_TOKEN don't trigger workflows, so kick the publish build.
-            gh workflow run build.yml --repo "$GITHUB_REPOSITORY"
+          # `|| true`: the script exits 1 on no match, and this step is `set -eo pipefail`.
+          num=$(overlay/scripts/try_held_fixes.sh overlay "$UPSTREAM_REPO" "$sha" | tail -1) || true
+          if [ -n "$num" ] && overlay/scripts/adopt_held_fix.sh overlay "$num"; then
+            # Adopt the held PR's files onto main rather than `gh pr merge` (the PR is usually
+            # CONFLICTING once main's patch file was refreshed). Pushes with GITHUB_TOKEN don't
+            # trigger workflows, so kick the publish build (re-runs the full gauntlet, dedups).
+            echo "Adopted held fix PR #$num onto main $sha; kicking the publish build."
+            gh workflow run build.yml --repo "$GITHUB_REPOSITORY" || true
+          elif [ -n "$num" ]; then
+            echo "::warning::found held fix PR #$num but could not adopt it; leaving it for the next run."
           else
-            echo "No held fix is valid against main yet; nothing merged."
+            echo "No held fix is valid against main yet; nothing adopted."
           fi
 
       - name: Delete auto-fix branches with no open PR

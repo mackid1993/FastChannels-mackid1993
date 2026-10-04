@@ -9,8 +9,8 @@
 # A candidate that applies + validates then gets a cautious, adversarial AI review of its actual
 # changes (scripts/review_fix.py) before it is accepted — a cheap second set of eyes that catches
 # a fix which is mechanically fine yet subtly wrong for this upstream. Reuse only on APPROVE;
-# otherwise move on (and the caller's AI fixes it properly). The review is skipped gracefully if
-# OPENROUTER_API_KEY is unset (deterministic checks only).
+# otherwise move on (and the caller's AI fixes it properly). With no OPENROUTER_API_KEY the
+# reviewer returns CONCERNS, so nothing is ever reused unreviewed (fail-closed).
 #
 # Pure lookup — no side effects. It clones upstream into a temp dir and restores the overlay's
 # patches/ before returning, so the caller's tree is untouched. On a hit it prints the matching
@@ -68,17 +68,13 @@ while IFS=$'\t' read -r num branch; do
   fi
 
   if [ "$ok" = true ]; then
-    if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-      log "cache HIT: PR #$num applies and validates against $sha (no key for the review — deterministic reuse)."
-      echo "$num"
-      exit 0
-    fi
-    # Second set of eyes before release: a cautious, adversarial review of the ACTUAL changes
-    # the cached fix makes against this upstream (cheaper than regenerating, and catches a fix
-    # that applies+validates yet is subtly wrong -- what the static checks can't see). Reuse
-    # only if the reviewer approves; otherwise the AI will fix it properly.
-    verdict=$(git -C "$work/up" diff "$sha" HEAD 2>/dev/null | python3 "$ov/scripts/review_fix.py" "$ov/AGENTS.md" 2>/dev/null)
-    if printf '%s\n' "$verdict" | head -1 | grep -q '^APPROVE'; then
+    # Second set of eyes before release: a cautious, adversarial review of just THIS held fix's
+    # delta vs main (patches/ + source/) -- small and exactly what needs scrutiny, far cheaper
+    # than regenerating, and it catches a fix that applies+validates yet is subtly wrong. Reuse
+    # only if the reviewer approves; otherwise move on and the AI fixes it properly. With no key
+    # the reviewer returns CONCERNS, so we fail closed (never an unreviewed reuse).
+    verdict=$(git -C "$ov" diff HEAD "origin/$branch" -- patches source 2>/dev/null | python3 "$ov/scripts/review_fix.py" "$ov/AGENTS.md" 2>/dev/null)
+    if printf '%s\n' "$verdict" | head -1 | grep -qi '^approve'; then
       log "cache HIT: PR #$num applies, validates, and the adversarial review APPROVED it — reuse, no AI."
       echo "$num"            # the only stdout line: the reusable PR number
       exit 0

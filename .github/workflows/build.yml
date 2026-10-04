@@ -375,12 +375,15 @@ jobs:
           AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
         run: |
           pip install --quiet ruff jinja2
-          num=$(overlay/scripts/try_held_fixes.sh overlay "$UPSTREAM_REPO" "${{ needs.build.outputs.sha }}" | tail -1)
-          if [ -n "$num" ]; then
-            echo "Cache hit: reusing held fix PR #$num — merging and publishing, no AI."
-            gh pr merge "$num" -R "$GITHUB_REPOSITORY" --squash --delete-branch
-            gh workflow run build.yml --repo "$GITHUB_REPOSITORY"
+          # `|| true`: the script exits 1 on a cache miss and the default shell is -eo pipefail,
+          # so without it the step would abort on a miss instead of taking the else branch.
+          num=$(overlay/scripts/try_held_fixes.sh overlay "$UPSTREAM_REPO" "${{ needs.build.outputs.sha }}" | tail -1) || true
+          if [ -n "$num" ] && overlay/scripts/adopt_held_fix.sh overlay "$num" && gh workflow run build.yml --repo "$GITHUB_REPOSITORY"; then
+            echo "Cache hit: reused held fix PR #$num (no AI) — adopted onto main and kicked the publish build."
             echo "hit=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$num" ]; then
+            echo "::warning::found held fix PR #$num but adopt/publish failed — falling through to the AI."
+            echo "hit=false" >> "$GITHUB_OUTPUT"
           else
             echo "hit=false" >> "$GITHUB_OUTPUT"
           fi
@@ -650,12 +653,15 @@ jobs:
           # so it can't over-build. Real runs only; a test run builds the cache, it doesn't spend
           # it (and must never merge/publish).
           pip install --quiet ruff jinja2
-          num=$(overlay/scripts/try_held_fixes.sh overlay "$UPSTREAM_REPO" "${{ needs.build.outputs.sha }}" | tail -1)
-          if [ -n "$num" ]; then
-            echo "Cache hit: reusing held fix PR #$num (no AI) — merging and publishing."
-            gh pr merge "$num" -R "$GITHUB_REPOSITORY" --squash --delete-branch
-            gh workflow run build.yml --repo "$GITHUB_REPOSITORY"
+          # `|| true`: the script exits 1 on a cache miss under the default -eo pipefail shell;
+          # without it the step aborts on a miss and the AI drift-repair below would be skipped.
+          num=$(overlay/scripts/try_held_fixes.sh overlay "$UPSTREAM_REPO" "${{ needs.build.outputs.sha }}" | tail -1) || true
+          if [ -n "$num" ] && overlay/scripts/adopt_held_fix.sh overlay "$num" && gh workflow run build.yml --repo "$GITHUB_REPOSITORY"; then
+            echo "Cache hit: reused held fix PR #$num (no AI) — adopted onto main and kicked the publish build."
             echo "hit=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$num" ]; then
+            echo "::warning::found held fix PR #$num but adopt/publish failed — falling through to the AI."
+            echo "hit=false" >> "$GITHUB_OUTPUT"
           else
             echo "hit=false" >> "$GITHUB_OUTPUT"
           fi

@@ -26,10 +26,11 @@ SYSTEM = (
     "is wrong: a hook wired into a plausible-but-wrong place, upstream changing the meaning of "
     "a name a hook uses, a backported re-implementation reading the wrong real source or "
     "returning the wrong shape, a dropped or no-op'd hook, or invented/fake data. AGENTS.md "
-    "(the overlay's intent and full hook table) and the fix's diff are provided. Reply with "
-    "exactly 'APPROVE' on the first line if it is correct and safe to merge and release; "
-    "otherwise 'CONCERNS:' and one specific reason. If you are unsure or lack the context to be "
-    "confident, reply CONCERNS — be cautious about what gets released."
+    "(the overlay's intent and full hook table) and the fix's diff are provided. Think it "
+    "through, then END your reply with a FINAL line that is exactly 'APPROVE' (nothing else) if "
+    "it is correct and safe to merge and release, or 'CONCERNS: <one specific reason>'. If you "
+    "are unsure or lack the context to be confident, end with CONCERNS — be cautious about what "
+    "gets released."
 )
 
 
@@ -41,7 +42,12 @@ def main() -> None:
     model = os.environ.get("AI_MODEL", "openrouter/z-ai/glm-5.3-flash")
     if model.startswith("openrouter/"):
         model = model[len("openrouter/"):]
-    diff = sys.stdin.read()[:120000]
+    diff = sys.stdin.read()
+    if len(diff) > 120000:
+        # Fail-closed: if the change is too big to show the reviewer in full, don't let a
+        # partial view approve it — make it a concern so the caller regenerates instead.
+        print("CONCERNS: change too large to review in full (" + str(len(diff)) + " chars)")
+        return
     agents = ""
     if len(sys.argv) > 1:
         try:
@@ -53,10 +59,13 @@ def main() -> None:
         "=== AGENTS.md (overlay intent + hook table) ===\n" + agents
         + "\n\n=== FIX DIFF (the cached fix about to be merged + released) ===\n" + diff
     )
+    # Generous max_tokens: GLM 5.3 Flash is a reasoning model and spends tokens thinking before
+    # it answers (same reason model-preflight uses 2048) — too small a budget truncates the
+    # verdict and it reads as CONCERNS, so the cache would never be reused. No temperature:
+    # some reasoning models reject a non-default value.
     body = json.dumps({
         "model": model,
-        "max_tokens": 300,
-        "temperature": 0,
+        "max_tokens": 4096,
         "messages": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": user},
@@ -67,9 +76,20 @@ def main() -> None:
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
     )
     try:
-        resp = json.load(urllib.request.urlopen(req, timeout=120))
-        out = (resp["choices"][0]["message"]["content"] or "").strip()
-        print(out or "CONCERNS: empty review response")
+        resp = json.load(urllib.request.urlopen(req, timeout=180))
+        content = (resp["choices"][0]["message"]["content"] or "").strip()
+        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+        verdict = lines[-1] if lines else ""
+        # Fail-closed: APPROVE only when the final line is unambiguously APPROVE AND nothing in
+        # the reply raised a concern. A reasoning model may object and then end on a hedged line
+        # like "Approve only if that's intentional" — that must NOT read as approval.
+        final = verdict.upper().rstrip(" .!,:;-")
+        raised_concern = any("CONCERN" in ln.upper() for ln in lines)
+        if final == "APPROVE" and not raised_concern:
+            print("APPROVE")
+        else:
+            concern = next((ln for ln in lines if "CONCERN" in ln.upper()), "")
+            print(concern or ("CONCERNS: ambiguous verdict (" + (verdict[:100] or "empty response") + ")"))
     except Exception as exc:  # noqa: BLE001 — any failure must fail safe to CONCERNS
         print("CONCERNS: review call failed (" + str(exc)[:120] + ")")
 
