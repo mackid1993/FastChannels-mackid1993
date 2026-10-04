@@ -87,10 +87,10 @@ CONFIG_FIELD = ConfigField(
         'inserted ads. Requires the AH4C bridge (an Android device) — it '
         'does not work with Prismcast, which has no Android device to read. '
         'Turning this on captures each bridge device\'s advertising ID: a Fire '
-        'TV is read silently; a Google TV box briefly shows its Ads settings '
-        'screen for a few seconds while it\'s read, and is skipped if it\'s '
-        'playing. The ID is saved and reused. When you add a new box later, a '
-        '"Capture advertising IDs" button appears to pull its ID.'
+        'TV is read silently; a Google TV/Android TV device briefly shows its Ads '
+        'settings screen for a few seconds while it\'s read, and is skipped if '
+        'it\'s playing. The ID is saved and reused. When you add a new device '
+        'later, a "Capture advertising IDs" button appears to pull its ID.'
     ),
 )
 

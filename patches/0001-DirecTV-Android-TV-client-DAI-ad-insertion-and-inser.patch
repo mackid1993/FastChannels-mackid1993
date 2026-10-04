@@ -20,8 +20,8 @@ The logic lives in app/scrapers/directv_dai.py, dtv_android.py, dtv_aac_ads.py a
  app/scrapers/dtv_aac_gain.py     | 663 +++++++++++++++++++++++
  app/scrapers/dtv_android.py      | 872 ++++++++++++++++++++++++++++++
  app/source_config.py             |   5 +
- app/templates/admin/sources.html | 186 ++++++-
- 9 files changed, 2830 insertions(+), 89 deletions(-)
+ app/templates/admin/sources.html | 187 ++++++-
+ 9 files changed, 2831 insertions(+), 89 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_aac_gain.py
@@ -531,7 +531,7 @@ index e796bf3..9ccf86b 100644
                  logger.warning(
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..b04c221
+index 0000000..a3ce0a2
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
 @@ -0,0 +1,881 @@
@@ -624,10 +624,10 @@ index 0000000..b04c221
 +        'inserted ads. Requires the AH4C bridge (an Android device) — it '
 +        'does not work with Prismcast, which has no Android device to read. '
 +        'Turning this on captures each bridge device\'s advertising ID: a Fire '
-+        'TV is read silently; a Google TV box briefly shows its Ads settings '
-+        'screen for a few seconds while it\'s read, and is skipped if it\'s '
-+        'playing. The ID is saved and reused. When you add a new box later, a '
-+        '"Capture advertising IDs" button appears to pull its ID.'
++        'TV is read silently; a Google TV/Android TV device briefly shows its Ads '
++        'settings screen for a few seconds while it\'s read, and is skipped if '
++        'it\'s playing. The ID is saved and reused. When you add a new device '
++        'later, a "Capture advertising IDs" button appears to pull its ID.'
 +    ),
 +)
 +
@@ -3035,7 +3035,7 @@ index 640deee..66b972d 100644
      # into login mode but hasn't supplied both credentials yet. Installs
      # from before 'auth_mode' existed (username/password used to be
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index b818ab0..d8ee5d1 100644
+index b818ab0..59739a1 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
 @@ -2951,6 +2951,7 @@
@@ -3095,7 +3095,7 @@ index b818ab0..d8ee5d1 100644
            ${toggleHtml('use_provider_numbers', 'Use DirecTV channel numbers',
              'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). Channels that share a number get subchannels, like 213.1.')}
 +          ${toggleHtml('use_dai', 'Use DirecTV ad insertion (DAI)',
-+            'On = play the stream DirecTV\'s own apps use, with DirecTV\'s local ads in commercial breaks. Off = the national feed without DirecTV\'s inserted ads. Needs the AH4C bridge (an Android device) — it does not work with Prismcast. Each bridge device\'s advertising ID is captured once (a Fire TV silently; a Google TV briefly shows its Ads screen, and is skipped while it\'s playing) and reused. Added a new box? Use the Capture advertising IDs button below.')}
++            'On = play the stream DirecTV\'s own apps use, with DirecTV\'s local ads in commercial breaks. Off = the national feed without DirecTV\'s inserted ads. Needs the AH4C bridge (an Android device) — it does not work with Prismcast. Each bridge device\'s advertising ID is captured once (a Fire TV silently; a Google TV/Android TV device briefly shows its Ads screen, and is skipped while it\'s playing) and reused. Added a new device? Use the Capture advertising IDs button below.')}
          </div>
  
 -        <details class="amazon-account-details" ${hasCreds ? '' : 'open'}>
@@ -3125,7 +3125,7 @@ index b818ab0..d8ee5d1 100644
            <button class="btn btn-run" type="button" onclick="saveSourceConfig(${sourceId})">Save Settings</button>
          </div>`;
      }
-@@ -3236,6 +3237,145 @@
+@@ -3236,6 +3237,146 @@
        directvPollStatus(sourceId);
      }
  
@@ -3140,9 +3140,10 @@ index b818ab0..d8ee5d1 100644
 +        const r = await fetch(`/api/sources/${sourceId}/directv-capture-adids`);
 +        const d = await r.json().catch(() => ({}));
 +        if (d.enabled && d.pending > 0) {
-+          btn.textContent = `Capture advertising IDs (${d.pending} new box${d.pending > 1 ? 'es' : ''})`;
++          btn.textContent = `Capture advertising IDs (${d.pending} new device${d.pending > 1 ? 's' : ''})`;
 +          btn.style.display = '';
-+          if (statusEl) statusEl.textContent = '';
++          // Do NOT clear statusEl here: it may hold the result of the capture that just ran
++          // (e.g. "2 couldn't be reached"); clearing it would wipe that message.
 +        } else {
 +          btn.style.display = 'none';
 +        }
@@ -3155,7 +3156,7 @@ index b818ab0..d8ee5d1 100644
 +      const btn = document.getElementById(`directv-adid-btn-${sourceId}`);
 +      const statusEl = document.getElementById(`directv-adid-status-${sourceId}`);
 +      if (btn) btn.disabled = true;
-+      if (statusEl) statusEl.textContent = 'Capturing… (a Google TV box briefly shows its Ads screen; a playing box is skipped)';
++      if (statusEl) statusEl.textContent = 'Capturing… (a Google TV/Android TV device briefly shows its Ads screen; a playing device is skipped)';
 +      try {
 +        const r = await fetch(`/api/sources/${sourceId}/directv-capture-adids`, {method: 'POST'});
 +        const d = await r.json().catch(() => ({}));
@@ -3165,7 +3166,7 @@ index b818ab0..d8ee5d1 100644
 +          return;
 +        }
 +        const parts = [`Captured ${d.captured} device${d.captured === 1 ? '' : 's'}`];
-+        if (d.playing) parts.push(`${d.playing} skipped — ${d.playing === 1 ? 'a box is' : 'boxes are'} playing (re-run when idle)`);
++        if (d.playing) parts.push(`${d.playing} skipped — ${d.playing === 1 ? 'a device is' : 'devices are'} playing (re-run when idle)`);
 +        if (d.unreachable) parts.push(`${d.unreachable} couldn't be reached (check ${d.unreachable === 1 ? "it's" : "they're"} on and connected)`);
 +        if (d.none) parts.push(`${d.none} with no advertising ID`);
 +        if (statusEl) {
@@ -3271,7 +3272,7 @@ index b818ab0..d8ee5d1 100644
      function directvPollStatus(sourceId) {
        if (_directvPollTimer) clearInterval(_directvPollTimer);
        _directvPollTimer = setInterval(() => _directvCheckStatus(sourceId), 2000);
-@@ -3256,7 +3396,7 @@
+@@ -3256,7 +3397,7 @@
        const statusMap = {
          idle: null,
          starting: '<span style="color:var(--text-muted)">Starting browser...</span>',
