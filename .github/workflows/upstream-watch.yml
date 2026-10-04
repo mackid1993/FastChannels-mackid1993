@@ -63,7 +63,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "New $UPSTREAM_BRANCH commit ${{ steps.head.outputs.sha }} — dispatching a drift check (no build/publish/merge)."
-          gh workflow run build.yml -f upstream_branch="$UPSTREAM_BRANCH" -f drift_only=true
+          gh workflow run build.yml --repo "$GITHUB_REPOSITORY" -f upstream_branch="$UPSTREAM_BRANCH" -f drift_only=true
           # Mark this commit seen only after a successful dispatch, so a failed dispatch
           # is retried next poll instead of being cached as done.
           mkdir -p .dev-watch-marker
