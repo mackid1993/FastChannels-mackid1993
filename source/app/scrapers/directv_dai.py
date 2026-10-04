@@ -12,6 +12,7 @@ the sources page stay one-liners.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -362,12 +363,37 @@ def _save_adids(adids: dict) -> None:
             pass
 
 
+@contextlib.contextmanager
+def _adids_file_lock():
+    """Exclusive cross-process lock for the store's read-modify-write. The app runs several
+    gunicorn workers, so the thread lock alone can't stop two workers interleaving a
+    read-modify-write and losing an entry. Best-effort: if the OS lock can't be taken, the
+    thread lock still serializes writes within a worker."""
+    f = None
+    try:
+        f = open(_adids_file() + '.lock', 'w')
+        try:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            pass
+        yield
+    finally:
+        if f is not None:
+            try:
+                f.close()   # closing the fd releases the flock
+            except Exception:
+                pass
+
+
 def _store_adid(address: str, entry: dict) -> bool:
-    """Merge one device's captured id into the store under the lock (read-modify-write, so
-    concurrent captures can't clobber each other's entry). Returns True if it actually
-    changed, ignoring the capture timestamp."""
+    """Merge one device's captured id into the store (read-modify-write), so a capture adds
+    to the file and never overwrites the other devices' entries. Returns True if it actually
+    changed, ignoring the capture timestamp. Guarded by the thread lock AND a cross-process
+    file lock, because the app runs multiple gunicorn workers: without the file lock two
+    workers capturing at once could interleave their read-modify-writes and lose an entry."""
     keys = ('advertising_id', 'optout', 'source')
-    with _adid_lock:
+    with _adid_lock, _adids_file_lock():
         adids = _saved_adids()
         prev = adids.get(address)
         changed = not prev or any(prev.get(k) != entry.get(k) for k in keys)
@@ -511,6 +537,21 @@ def _bridge_addresses() -> list[str]:
         return []
 
 
+def _bust_playback_cache() -> None:
+    """Drop the DirecTV source's cached Yospace stream URLs so the next tune refetches with
+    the just-captured advertising id (a cached URL carries whatever id was current when it
+    was built). cached_url_usable already refetches on an id mismatch; this makes it
+    explicit so there's no window where a stale URL is served after a capture."""
+    try:
+        from ..config_store import persist_source_cache_updates
+        from ..models import Source
+        src = Source.query.filter_by(name='directv').first()
+        if src:
+            persist_source_cache_updates(src.id, {'directv_playback': {}})
+    except Exception as exc:
+        logger.debug('[directv-dai] could not clear playback cache after capture: %s', exc)
+
+
 def capture_registered_devices(addresses: list[str] | None = None) -> dict:
     """Capture + persist the advertising id for every registered bridge device (or the
     given ones), serially. Returns counts {'captured', 'playing', 'none'}. Runs ONLY from
@@ -520,6 +561,9 @@ def capture_registered_devices(addresses: list[str] | None = None) -> dict:
     counts = {'captured': 0, 'playing': 0, 'none': 0}
     for addr in addrs:
         counts[_capture_and_store(addr)] += 1
+    if counts['captured']:
+        # A new advertising id was stored; clear cached stream URLs so the next tune uses it.
+        _bust_playback_cache()
     return counts
 
 
