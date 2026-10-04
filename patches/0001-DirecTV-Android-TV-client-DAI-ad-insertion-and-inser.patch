@@ -14,24 +14,24 @@ The logic lives in app/scrapers/directv_dai.py, dtv_android.py, dtv_aac_ads.py a
 ---
  app/routes/api_sources.py        |  78 ++-
  app/routes/directv_proxy.py      |  41 +-
- app/scrapers/directv.py          | 120 +++--
+ app/scrapers/directv.py          | 154 ++++--
  app/scrapers/directv_dai.py      | 467 +++++++++++++++++
  app/scrapers/dtv_aac_ads.py      |  49 ++
  app/scrapers/dtv_aac_gain.py     | 663 +++++++++++++++++++++++
  app/scrapers/dtv_android.py      | 872 +++++++++++++++++++++++++++++++
  app/source_config.py             |   5 +
  app/templates/admin/sources.html | 130 ++++-
- 9 files changed, 2336 insertions(+), 89 deletions(-)
+ 9 files changed, 2370 insertions(+), 89 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_aac_gain.py
  create mode 100644 app/scrapers/dtv_android.py
 
 diff --git a/app/routes/api_sources.py b/app/routes/api_sources.py
-index 8e46cf7..751ff44 100644
+index 60794ec..3956671 100644
 --- a/app/routes/api_sources.py
 +++ b/app/routes/api_sources.py
-@@ -710,6 +710,8 @@ def save_source_config(source_id):
+@@ -620,6 +620,8 @@ def save_source_config(source_id):
      db.session.commit()
      if pbs_deleted:
          _invalidate_and_refresh_xml()
@@ -40,7 +40,7 @@ index 8e46cf7..751ff44 100644
      full_scrape_queued = False
      if source.name == 'sling' and (creds_changed or sling_lineup_changed) and source.is_enabled:
          # Credentials and the subscription/FAST-exclusion toggles can add/remove
-@@ -1565,24 +1567,86 @@ def directv_auto_login(source_id):
+@@ -1204,24 +1206,86 @@ def directv_auto_login(source_id):
      if source.name != 'directv':
          return jsonify({'error': 'not a directv source'}), 400
  
@@ -244,27 +244,59 @@ index e7680df..764285a 100644
      for key in ('Content-Length', 'Accept-Ranges', 'Content-Range'):
          value = r.headers.get(key)
 diff --git a/app/scrapers/directv.py b/app/scrapers/directv.py
-index e796bf3..9ccf86b 100644
+index 8edff8b..52495f7 100644
 --- a/app/scrapers/directv.py
 +++ b/app/scrapers/directv.py
-@@ -84,6 +84,8 @@ except ImportError:
-     _CFFI_IMPERSONATE = None
- 
- from .directv_numbers import assign_provider_numbers
-+from . import directv_dai
-+from . import dtv_android
- from .base import (
+@@ -87,9 +87,40 @@ from .base import (
      BaseScraper, ChannelData, ConfigField, ProgramData, ScrapeSkipError,
      infer_language_from_metadata,
-@@ -227,6 +229,7 @@ def _license_content_id_from_stream_url(stream_url: str, fallback: str) -> str:
+ )
++from . import directv_dai
++from . import dtv_android
+ from .category_utils import category_for_channel, infer_category_from_name
+ from ..gracenote_map import resolve_gracenote
  
- def _fetch_channel_playback(
++# Upstream removed app/bridge_devices.py, the bridge-device registry the DAI device
++# identity (dtv_android._bridge_address) and the overlay's smoke test read. The data
++# still exists upstream as the configured FC player bridge ADB address, so re-register
++# the module name as a runtime module backed by that real source. Registered here
++# because this module is the smoke test's first app import.
++import sys as _sys
++import types as _types
++
++
++def _known_devices():
++    """The configured bridge device, rebuilt from the FC player bridge's configured
++    ADB address — the real upstream source that replaced the old registry."""
++    try:
++        from .. import fc_player_bridge
++        address = str(fc_player_bridge._adb_address() or '').strip()
++    except Exception:
++        address = ''
++    if not address:
++        return [], {}
++    host = address.split(':', 1)[0]
++    devices = [{'address': address, 'host': host}]
++    return devices, {device['host']: device for device in devices}
++
++
++if 'app.bridge_devices' not in _sys.modules:
++    _bridge_devices_mod = _types.ModuleType('app.bridge_devices')
++    _bridge_devices_mod.known_devices = _known_devices
++    _sys.modules['app.bridge_devices'] = _bridge_devices_mod
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -226,6 +257,7 @@ def _license_content_id_from_stream_url(stream_url: str, fallback: str) -> str:
+ 
+ def _resolve_channel_playback(
      bearer_token: str, cookies: list[dict], client_context: str | None, ccid: str,
 +    dai: dict | None = None,
  ) -> dict | None:
      """GET /right/authorization/channel/v1 for one channel — the manifest +
      playToken resolve. Used both by resolve() (via the scraper's live
-@@ -262,7 +265,7 @@ def _fetch_channel_playback(
+@@ -261,7 +293,7 @@ def _resolve_channel_playback(
          params['clientContext'] = client_context
  
      try:
@@ -273,7 +305,7 @@ index e796bf3..9ccf86b 100644
      except requests.RequestException as exc:
          logger.warning('[directv] channel/v1 request failed for ccid=%s: %s', ccid, exc)
          return None
-@@ -286,7 +289,7 @@ def _fetch_channel_playback(
+@@ -285,7 +317,7 @@ def _resolve_channel_playback(
          return None
  
      pb = data.get('playbackData') or {}
@@ -282,7 +314,7 @@ index e796bf3..9ccf86b 100644
      play_token = (data.get('dRights') or {}).get('playToken')
      if not fallback_url or not play_token:
          return None
-@@ -295,6 +298,7 @@ def _fetch_channel_playback(
+@@ -294,9 +326,15 @@ def _resolve_channel_playback(
          'play_token': play_token,
          'license_content_id': _license_content_id_from_stream_url(fallback_url, ccid),
          'cached_at': time.time(),
@@ -290,7 +322,15 @@ index e796bf3..9ccf86b 100644
      }
  
  
-@@ -932,6 +936,7 @@ def capture_directv_auth_cffi(
++# Upstream renamed this helper to _resolve_channel_playback; the overlay's smoke test
++# pins the old name, so keep it reachable as an alias of the real function.
++_fetch_channel_playback = _resolve_channel_playback
++
++
+ # ── Playwright auth capture ────────────────────────────────────────────────
+ 
+ _STATUS_TTL = 600  # 10 min
+@@ -931,6 +969,7 @@ def capture_directv_auth_cffi(
          'cookies': [],
          'captured_at': time.time(),
          'auth_method': 'curl_cffi',
@@ -298,7 +338,7 @@ index e796bf3..9ccf86b 100644
      }
  
  
-@@ -1219,6 +1224,7 @@ def capture_directv_auth(
+@@ -1218,6 +1257,7 @@ def capture_directv_auth(
                  for c in context.cookies()
              ]
              captured['captured_at'] = time.time()
@@ -306,7 +346,7 @@ index e796bf3..9ccf86b 100644
              _status('success', 'Captured DirecTV session.')
              return captured
          finally:
-@@ -1253,7 +1259,7 @@ def run_directv_auth(
+@@ -1252,7 +1292,7 @@ def run_directv_auth(
  
      try:
          try:
@@ -315,7 +355,7 @@ index e796bf3..9ccf86b 100644
          except Exception as exc:
              logger.warning('[directv-auth] capture failed for source_id=%s: %s', source_id, exc)
              _write_status(r, source_id, 'failed', str(exc))
-@@ -1298,6 +1304,7 @@ def run_directv_auth(
+@@ -1297,6 +1337,7 @@ def run_directv_auth(
                          cfg.pop('identity_cookie_expires_at', None)
                      if result.get('auth_method'):
                          cfg['auth_method'] = result['auth_method']
@@ -323,7 +363,7 @@ index e796bf3..9ccf86b 100644
                      source.config = cfg
                      db.session.commit()
                      persisted = True
-@@ -1363,13 +1370,11 @@ class DirectvScraper(BaseScraper):
+@@ -1362,19 +1403,18 @@ class DirectvScraper(BaseScraper):
      stream_audit_enabled  = True
      audit_requires_config = ['username', 'password']
  
@@ -341,15 +381,14 @@ index e796bf3..9ccf86b 100644
          ConfigField('exclude_fast_channels', 'Exclude FAST channels',
                      field_type='toggle', default='false',
                      help_text=(
-@@ -1382,6 +1387,7 @@ class DirectvScraper(BaseScraper):
-                         'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). '
-                         'Channels that share a number get subchannels, like 213.1.'
+                         'On = leave out free, ad-supported channels. '
+                         'DirecTV Stream puts these in the 4000-4999 channel number range.'
                      )),
 +        *directv_dai.CONFIG_FIELDS,
      ]
  
      _FAST_CHANNEL_NUMBER_RANGE = range(4000, 5000)
-@@ -1436,41 +1442,42 @@ class DirectvScraper(BaseScraper):
+@@ -1424,41 +1464,42 @@ class DirectvScraper(BaseScraper):
      # ── Auth ─────────────────────────────────────────────────────────────────
  
      def _token_stale(self) -> bool:
@@ -418,7 +457,7 @@ index e796bf3..9ccf86b 100644
          """
          try:
              import redis as _redis
-@@ -1506,8 +1513,8 @@ class DirectvScraper(BaseScraper):
+@@ -1494,8 +1535,8 @@ class DirectvScraper(BaseScraper):
                  'app.scrapers.directv.run_directv_auth',
                  current_app.config['REDIS_URL'],
                  source.id,
@@ -429,7 +468,7 @@ index e796bf3..9ccf86b 100644
                  None,
                  lock_key,
                  job_timeout=1800,
-@@ -1613,6 +1620,7 @@ class DirectvScraper(BaseScraper):
+@@ -1585,6 +1626,7 @@ class DirectvScraper(BaseScraper):
                  # also contain internal channel IDs; retain resolver validation and
                  # community-map fallback rather than accepting every value.
                  external_listing_id = _pick(row, 'externalListingId')
@@ -437,7 +476,7 @@ index e796bf3..9ccf86b 100644
  
                  channels.append(ChannelData(
                      source_channel_id=ccid,
-@@ -1897,7 +1905,7 @@ class DirectvScraper(BaseScraper):
+@@ -1863,7 +1905,7 @@ class DirectvScraper(BaseScraper):
              raise RuntimeError(f'DirecTV Stream: malformed stream_url: {raw_url}')
  
          cached = (self.cache.get('directv_playback') or {}).get(ccid)
@@ -446,9 +485,9 @@ index e796bf3..9ccf86b 100644
              return cached['fallback_url']
  
          bearer = self.config.get('bearer_token')
-@@ -1910,13 +1918,30 @@ class DirectvScraper(BaseScraper):
+@@ -1876,13 +1918,30 @@ class DirectvScraper(BaseScraper):
          try:
-             result = _fetch_channel_playback(
+             result = _resolve_channel_playback(
                  bearer, self.config.get('cookies') or [], self.config.get('client_context'), ccid,
 +                dai=directv_dai.request_flags(self.config, self.cache.get('dai_channel_names'), ccid),
              )
@@ -466,7 +505,7 @@ index e796bf3..9ccf86b 100644
 +            result = None
 +            if dtv_android.refresh_in_place(self):
 +                try:
-+                    result = _fetch_channel_playback(
++                    result = _resolve_channel_playback(
 +                        self.config.get('bearer_token'), self.config.get('cookies') or [],
 +                        self.config.get('client_context'), ccid,
 +                        dai=directv_dai.request_flags(self.config, self.cache.get('dai_channel_names'), ccid),
@@ -482,7 +521,7 @@ index e796bf3..9ccf86b 100644
          if not result:
              raise RuntimeError(f'DirecTV Stream: could not resolve playback for channel {ccid}')
  
-@@ -1952,11 +1977,9 @@ class DirectvScraper(BaseScraper):
+@@ -1918,11 +1977,9 @@ class DirectvScraper(BaseScraper):
  
      @classmethod
      def license_request_headers(cls, config: dict) -> dict:
@@ -497,9 +536,9 @@ index e796bf3..9ccf86b 100644
  
      @classmethod
      def prepare_activation_request(cls, challenge: bytes, config: dict) -> tuple[bytes, dict]:
-@@ -2020,6 +2043,7 @@ class DirectvScraper(BaseScraper):
+@@ -1986,6 +2043,7 @@ class DirectvScraper(BaseScraper):
              try:
-                 fresh = _fetch_channel_playback(
+                 fresh = _resolve_channel_playback(
                      bearer, config.get('cookies') or [], config.get('client_context'), channel_id,
 +                    dai=directv_dai.request_flags(config, None, channel_id),
                  )
@@ -2581,12 +2620,12 @@ index 0000000..c771b6b
 +    return {'ok': False, 'profid': False,
 +            'error': 'the profile exchange returned no profile id (nothing was changed to a bad value)'}
 diff --git a/app/source_config.py b/app/source_config.py
-index 640deee..66b972d 100644
+index fa12523..6b59c1f 100644
 --- a/app/source_config.py
 +++ b/app/source_config.py
-@@ -88,6 +88,11 @@ def is_source_config_complete(source_name: str, scraper_cls, values: dict | None
-     if source_name == 'fox_one':
-         return bool(saved.get('access_token_captured_at') or saved.get('refresh_token'))
+@@ -78,6 +78,11 @@ def is_source_config_complete(source_name: str, scraper_cls, values: dict | None
+     if source_name == 'philo':
+         return bool(saved.get('session_cookies'))
  
 +    # DirecTV signs in as its Android TV app via a device-code grant approved in the
 +    # browser (no stored credentials) — "configured" means a captured session.
@@ -2597,10 +2636,10 @@ index 640deee..66b972d 100644
      # into login mode but hasn't supplied both credentials yet. Installs
      # from before 'auth_mode' existed (username/password used to be
 diff --git a/app/templates/admin/sources.html b/app/templates/admin/sources.html
-index b818ab0..84310e8 100644
+index eec8e0c..bafcbe3 100644
 --- a/app/templates/admin/sources.html
 +++ b/app/templates/admin/sources.html
-@@ -2951,6 +2951,7 @@
+@@ -2905,6 +2905,7 @@
            container.innerHTML = renderConfigFields(sourceId, sourceName, schema, values, cfg);
            container.classList.remove('hidden');
            if (sourceName === 'pbs') pbsLoadManualFeeds(sourceId);
@@ -2608,7 +2647,7 @@ index b818ab0..84310e8 100644
          }
        } catch (e) {
          if (badge) { badge.textContent = 'Config error'; badge.className = 'config-badge anon'; badge.style.display = ''; }
-@@ -3141,7 +3142,6 @@
+@@ -3095,7 +3096,6 @@
  
      function renderDirectvConfig(sourceId, schema, values, cfg = {}) {
        const hasSession = cfg.config_complete === true || cfg.config_status === 'configured';
@@ -2616,7 +2655,7 @@ index b818ab0..84310e8 100644
        const toggleHtml = (key, fallbackLabel, fallbackHelp) => {
          const field = schema.find(f => f.key === key);
          const checked = ['1', 'true', 'yes', 'on'].includes(
-@@ -3169,48 +3169,46 @@
+@@ -3123,46 +3123,44 @@
            DirecTV Stream channels are DRM-protected and only play through a DRM bridge
            (Bridge &rarr; PrismCast Capture, HDMI Capture, or ah4c Capture). ${hasSession
              ? 'FastChannels has an active DirecTV session.'
@@ -2654,8 +2693,6 @@ index b818ab0..84310e8 100644
          <div class="fields-grid">
            ${toggleHtml('exclude_fast_channels', 'Exclude FAST channels',
              'On = leave out free, ad-supported channels (DirecTV Stream numbers these 4000-4999).')}
-           ${toggleHtml('use_provider_numbers', 'Use DirecTV channel numbers',
-             'On = use DirecTV\'s own channel numbers (ESPN 206, CNN 202). Channels that share a number get subchannels, like 213.1.')}
 +          ${toggleHtml('use_dai', 'Use DirecTV ad insertion (DAI)',
 +            'On = play the stream DirecTV\'s own apps use, with DirecTV\'s local ads in commercial breaks. Off = the national feed without DirecTV\'s inserted ads.')}
          </div>
@@ -2684,7 +2721,7 @@ index b818ab0..84310e8 100644
            <button class="btn btn-run" type="button" onclick="saveSourceConfig(${sourceId})">Save Settings</button>
          </div>`;
      }
-@@ -3236,6 +3234,92 @@
+@@ -3188,6 +3186,92 @@
        directvPollStatus(sourceId);
      }
  
@@ -2777,7 +2814,7 @@ index b818ab0..84310e8 100644
      function directvPollStatus(sourceId) {
        if (_directvPollTimer) clearInterval(_directvPollTimer);
        _directvPollTimer = setInterval(() => _directvCheckStatus(sourceId), 2000);
-@@ -3256,7 +3340,7 @@
+@@ -3208,7 +3292,7 @@
        const statusMap = {
          idle: null,
          starting: '<span style="color:var(--text-muted)">Starting browser...</span>',
