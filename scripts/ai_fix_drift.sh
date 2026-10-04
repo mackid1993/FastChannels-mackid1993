@@ -67,6 +67,15 @@ ai_edit() {  # $1 = attempt number
   local pass=$1
   pip install --quiet aider-chat==0.86.2
   cat > "$prompt" <<'PROMPT'
+You are running FULLY AUTONOMOUSLY in CI. No human will read your reply or answer anything
+-- there is nobody to ask. Never ask a question, request clarification, or wait for
+confirmation: decide from the rules below and act. You are given upstream_index.txt -- a map
+of upstream's CURRENT files and every def/class in them. Use it to find where upstream moved
+the code a hook needs. This can be a large adaptation (effectively backporting the patch onto
+a different upstream): re-wire every hook to upstream's current structure. If the real code a
+hook needs exists NOWHERE in that index, make no edit and say why in one sentence -- that is
+the correct result, not a failure; stop only after confirming its absence in the index.
+
 The files you can edit are the FastChannels DirecTV overlay: a PATCH on upstream
 kineticman/FastChannels. The patch is exactly two things:
   OURS (whole files, change freely): app/scrapers/directv_dai.py, dtv_android.py,
@@ -94,19 +103,28 @@ Keep every hook correctly wired into upstream's CURRENT code. Rules, highest pri
 3. A HOOK FOLLOWS UPSTREAM. When upstream renamed or moved a name a hook calls or sits in,
    update the hook's reference -- anywhere in the files you edit -- to the new name or
    location. This is the normal fix.
-4. ALIAS -- the tiebreaker that wins a test pinning a renamed name. If a test refers to an
-   upstream name by its OLD name and upstream renamed it, add ONE plain alias line next to
-   upstream's renamed definition: `old_name = new_name`. It is the real, fully-hooked object
-   under both names, so inspect.signature and inspect.getsource resolve through it. Add it
-   only to keep a test's reference resolving, only as a bare alias (no wrapper, no new logic),
-   and in no file but the one holding the renamed definition. This settles rule 2's "can't
-   edit the test" against "don't restore old code": you keep one name reachable, you do not
-   restore upstream's old code.
-5. Otherwise never add non-hook code to an upstream file -- no stubs, shims, try/except around
-   an import, deleted or no-op'd hooks, or hardcoded test values. Your own modules you may
-   change as needed.
-6. Minimal diff, valid Python, the patch still applies. No refactoring or reformatting.
-7. Never write a secret (API key, bearer, token) into any file.
+4. KEEP A TEST-PINNED NAME REACHABLE. A test may reference, by its OLD name, an upstream name
+   that upstream renamed or MOVED. Point that old name at the REAL relocated code (find it in
+   upstream_index.txt), by the narrowest mechanism that fits:
+     - a renamed function/attribute in a file you edit -> a module-level alias next to it,
+       `old_name = new_name` (the real object under both names; inspect.signature/getsource
+       resolve through it);
+     - a module the patch does not own that moved -> from one of our own modules (imported
+       before the test uses the name) register it, e.g.
+       `import sys, app.<newpkg>.<newmod> as _m; sys.modules['app.<oldname>'] = _m`,
+       so the pinned import resolves to the REAL relocated module.
+   No wrapper, no new logic -- just make the old name resolve to real upstream code. This
+   settles rule 2's "can't edit the test" against "don't restore old code": you keep one name
+   reachable, pointing at real code.
+5. NEVER FABRICATE. Never create a module, function, class or file to stand in for missing
+   upstream code, and never write fake data or hardcode a value to satisfy a test. An alias
+   must point at REAL, existing upstream code. If a capability a hook needs is gone from
+   upstream entirely (confirm it is absent in upstream_index.txt), make no edit and say so --
+   do not invent a replacement.
+6. Never add other non-hook code to an upstream file -- no stubs, no try/except around an
+   import to swallow it, no deleted or no-op'd hooks. Your own modules you may change as needed.
+7. Minimal diff, valid Python, the patch still applies. No refactoring or reformatting.
+8. Never write a secret (API key, bearer, token) into any file.
 PROMPT
   # Name the exact files the AI may edit, in the prompt itself.
   { printf '\nThe patch files -- the ONLY files you may edit (editing any other file ends the run):\n'
@@ -132,12 +150,21 @@ PROMPT
   # Aider edits only the files named here; the log, AGENTS.md, the overlay's two tests (the
   # spec) and -- on a retry -- its own prior chat history are read-only context. CI does all
   # git/validation, so Aider's own git, lint, test, shell and URL features are off.
+  # Map of upstream's CURRENT tree (files + every def/class) so the AI can find where code
+  # moved: it edits only the patch's files, but must see the rest to re-wire the hooks.
+  { echo "# upstream files:"
+    ( cd "$up" && find app -type f \( -name '*.py' -o -name '*.html' \) | sort )
+    echo; echo "# definitions (path:line: def/class):"
+    ( cd "$up" && find app -name '*.py' -type f -print0 | sort -z \
+        | xargs -0 grep -nHE '^[[:space:]]*(async def|def|class) ' 2>/dev/null )
+  } > "$work/upstream_index.txt"
   local hist=()
   [ "$pass" -gt 1 ] && [ -f "$up/.aider.chat.history.md" ] && hist=(--read "$up/.aider.chat.history.md")
   ( cd "$up" && aider --model "$model" --edit-format diff --yes-always --no-git \
         --no-auto-commits --no-auto-lint --no-auto-test --no-suggest-shell-commands \
         --no-detect-urls --no-show-model-warnings --no-check-update --no-analytics \
         --no-pretty --map-tokens 0 --read "$log" --read "$root/AGENTS.md" \
+        --read "$work/upstream_index.txt" \
         --read "$root/scripts/smoke_test.py" --read "$root/scripts/validate.sh" \
         "${hist[@]}" --message-file "$prompt" "${edit[@]}" )
 }

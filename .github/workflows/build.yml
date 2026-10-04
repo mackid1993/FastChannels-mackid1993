@@ -80,12 +80,26 @@ jobs:
       short: ${{ steps.inputs.outputs.short }}
       apk: ${{ steps.inputs.outputs.apk }}
       apk_tag: ${{ steps.inputs.outputs.apk_tag }}
+      or_before: ${{ steps.or_before.outputs.v }}
     steps:
       - name: Check out this repo
         uses: actions/checkout@v5
         with:
           path: overlay
           fetch-depth: 0
+
+      - name: Record OpenRouter spend baseline (for the AI-cost ping)
+        id: or_before
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          # Cumulative usage on the key now, before any AI runs. The ai-cost job reads it again
+          # at the end; the delta is this run's AI spend. Only the number is captured — never
+          # the key or the raw response.
+          v=$(curl -s --max-time 20 -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+                https://openrouter.ai/api/v1/key \
+                | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('usage',''))" 2>/dev/null || true)
+          echo "v=$v" >> "$GITHUB_OUTPUT"
 
       - name: Resolve upstream commit, Player APK release and run mode
         id: inputs
@@ -392,6 +406,12 @@ jobs:
           pip install --quiet aider-chat==0.86.2
           cd upstream
           cat > ../prompt.txt <<'PROMPT'
+          You are running FULLY AUTONOMOUSLY in CI. Nobody will read your reply or answer
+          anything -- never ask a question or wait for confirmation; decide and act. You are
+          given upstream_index.txt, a map of upstream's CURRENT files and every def/class in
+          them; use it to find where upstream moved the code a hook needs (this can be a large
+          adaptation -- effectively backporting the patch onto a different upstream).
+
           The files you can edit are the FastChannels DirecTV overlay: a PATCH on upstream
           kineticman/FastChannels. The patch is our own modules (directv_dai.py, dtv_android.py,
           dtv_aac_ads.py, dtv_aac_gain.py) plus one-line HOOKS injected into upstream files. A
@@ -411,16 +431,27 @@ jobs:
           - Edit only the conflicted files you were given; the tests and every other file are
             read-only.
           - Keep every upstream change. A HOOK FOLLOWS UPSTREAM: if upstream renamed or moved a
-            name a hook calls or sits in, update that reference to the new name -- anywhere in the
-            files you're editing, not only inside a conflict block (a stale reference elsewhere
-            would fail the build).
-          - If one of the overlay's tests references an upstream name by its OLD name and upstream
-            renamed it, add ONE plain alias line next to upstream's renamed definition (`old_name =
-            new_name`) -- the real object under both names, no wrapper, no new logic. Only to keep
-            a test's reference resolving; add no other non-hook code to an upstream file.
+            name a hook calls or sits in, update that reference (found via upstream_index.txt) to
+            upstream's current name/location -- anywhere in the files you're editing, not only
+            inside a conflict block.
+          - If a test references an upstream name by its OLD name and upstream renamed or MOVED it,
+            point that name at the REAL relocated code: a module-level alias next to a renamed
+            function in a file you edit (`old = new`), or -- for a moved module the patch does not
+            own -- a `sys.modules['app.<oldname>'] = <real new module>` registered from one of our
+            own modules. No wrapper, no new logic.
+          - NEVER FABRICATE: never create a module, function or file to stand in for missing
+            upstream code, and never write fake data to pass a test. An alias must point at real
+            existing upstream code; if a capability is gone from upstream entirely, leave it and
+            say so.
           - Don't refactor, reformat or touch anything the conflict doesn't require. Keep the
             Python valid.
           PROMPT
+          # Map of upstream's CURRENT tree so the AI can find where moved code went.
+          { echo "# upstream files:"; find app -type f \( -name '*.py' -o -name '*.html' \) | sort
+            echo; echo "# definitions (path:line: def/class):"
+            find app -name '*.py' -type f -print0 | sort -z \
+              | xargs -0 grep -nHE '^[[:space:]]*(async def|def|class) ' 2>/dev/null
+          } > ../upstream_index.txt
           # Aider can edit only the files named on the command line; the brief, the
           # patch and AGENTS.md are read-only context. CI does all git operations and
           # validation, so Aider's own git, lint, test, shell and URL features are off.
@@ -428,8 +459,9 @@ jobs:
                 --no-auto-commits --no-auto-lint --no-auto-test --no-suggest-shell-commands \
                 --no-detect-urls --no-show-model-warnings --no-check-update --no-analytics \
                 --no-pretty --map-tokens 0 --read ../conflicts.md --read ../conflict.patch \
-                --read ../overlay/AGENTS.md --read ../overlay/scripts/smoke_test.py \
-                --read ../overlay/scripts/validate.sh --message-file ../prompt.txt \
+                --read ../upstream_index.txt --read ../overlay/AGENTS.md \
+                --read ../overlay/scripts/smoke_test.py --read ../overlay/scripts/validate.sh \
+                --message-file ../prompt.txt \
                 $(cat ../conflicted.txt)
 
       - name: Check the result and finish the merge
@@ -729,3 +761,43 @@ jobs:
           cc @${{ github.repository_owner }}
           BODY
           scripts/issue.sh open "$title" body.md
+
+  # Fire-and-forget cost ping. The AI steps are the only thing that spends on OpenRouter, so
+  # (usage now) - (the baseline the build job recorded) is this run's AI cost. If the AI ran,
+  # open an issue with the figure that @mentions the owner (so GitHub emails it) and close it
+  # at once. Runs on every run that recorded a baseline (test runs included); never fails the
+  # workflow, and stays silent when no AI ran (cost ~ 0).
+  ai-cost:
+    needs: [build, resolve, resolve-drift]
+    if: always() && needs.build.outputs.or_before != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Report this run's AI spend in an issue (emails you, then closes)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+          OR_BEFORE: ${{ needs.build.outputs.or_before }}
+        run: |
+          # OpenRouter usage can post a few seconds after a generation; give it a moment.
+          sleep 20
+          after=$(curl -s --max-time 20 -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+                    https://openrouter.ai/api/v1/key \
+                    | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('usage',''))" 2>/dev/null || true)
+          # Single-line python: non-numeric input raises and `|| true` leaves cost empty.
+          cost=$(python3 -c "import sys; d=float(sys.argv[2])-float(sys.argv[1]); print('%.4f'%d if d>=0.0001 else 'ZERO')" "$OR_BEFORE" "$after" 2>/dev/null || true)
+          [ -n "$cost" ] || { echo "OpenRouter usage unavailable; no cost issue opened."; exit 0; }
+          [ "$cost" != "ZERO" ] || { echo "No AI spend this run; no cost issue opened."; exit 0; }
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          { echo "Approximate OpenRouter spend for AI repair [run ${{ github.run_id }}]($run_url): **\$$cost** (model \`$AI_MODEL\`)."
+            echo
+            echo "_Approximate — OpenRouter usage can post with a short lag._"
+            echo
+            echo "cc @${{ github.repository_owner }}"
+          } > cost.md
+          url=$(gh issue create --title "AI repair cost: ~\$$cost (run ${{ github.run_id }})" --body-file cost.md) \
+            || { echo "issue create failed (non-fatal)."; exit 0; }
+          gh issue close "${url##*/}" --comment "Automated cost notification — closing." || true
