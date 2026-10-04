@@ -281,12 +281,13 @@ jobs:
           overlay/scripts/issue.sh close "$CONFLICT_TITLE" "$msg"
           overlay/scripts/issue.sh close "$FAILED_TITLE" "$msg"
 
-      - name: Ping that a new image was built and published
+      - name: Post a build-published notification
         continue-on-error: true  # a notification hiccup must never fail a successful publish
         # Fires only on a real publish (a new upstream commit, a new Player APK, or an AI
         # patch fix that landed — never on a CI-only change, which is drift-only and doesn't
-        # reach here). Opens a transient issue that @mentions you, so GitHub emails you, then
-        # closes it immediately — a success ping with no lingering issue.
+        # reach here). Posts to a SINGLE persistent "Build notifications" issue (created once,
+        # then commented on each publish), so you get one email per publish via the @mention
+        # and the notifications never pile up as separate issues.
         if: steps.skip.outputs.skip != 'true' && env.TEST_RUN != 'true' && steps.inputs.outputs.drift != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -298,13 +299,10 @@ jobs:
 
           cc @${{ github.repository_owner }}
           BODY
-          # Open only, and do NOT close: the @mention auto-subscribes you to the thread, so a
-          # close (or comment) would be a second/third notification email. Leaving it open means
-          # exactly one email (the @mention). These FYI issues can be bulk-closed any time with:
-          #   gh issue list -R <repo> --search 'Built & published in:title' --json number \
-          #     --jq '.[].number' | xargs -I{} gh issue close -R <repo> {}
-          url=$(gh issue create -R "$GITHUB_REPOSITORY" --title "Built & published upstream ${{ steps.inputs.outputs.short }}" --body-file ping.md)
-          echo "Opened success ping (left open so you get exactly one email): $url"
+          # One persistent issue titled "Build notifications": issue.sh comments on it when it
+          # exists, else creates it. The cc @mention emails you once per publish; nothing piles up.
+          overlay/scripts/issue.sh open "Build notifications" ping.md
+          echo "Posted to the persistent 'Build notifications' issue."
 
       - name: Report a failed build
         if: failure() && steps.apply.outcome != 'failure' && env.TEST_RUN != 'true'
