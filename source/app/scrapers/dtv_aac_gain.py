@@ -590,33 +590,44 @@ def _attenuate_impl(data: bytes, steps: int):
         if steps <= 0 or not data:
             return data, 'skipped (no data)'
         buf = bytearray(data)
-        moof = _find(buf, 0, len(buf), b'moof')
-        mdat = _find(buf, 0, len(buf), b'mdat')
-        if not moof or not mdat:
+        # A segment may carry more than one fragment (moof+mdat). Pair each moof with the
+        # mdat that follows it and attenuate EVERY fragment. The old code edited only the
+        # first moof/mdat, so the rest of a multi-fragment ad played at full volume — that
+        # was the "some ads are still a little loud" bug (a single-fragment segment, the
+        # common case, behaves exactly as before: one pair).
+        pairs = []
+        pending = None
+        for typ, ds, de in _boxes(buf, 0, len(buf)):
+            if typ == b'moof':
+                pending = (ds, de)
+            elif typ == b'mdat' and pending is not None:
+                pairs.append((pending, (ds, de)))
+                pending = None
+        if not pairs:
             return data, 'no-op: not a fragmented MP4 (no moof/mdat — init segment?)'
-        mdat_ds, mdat_de = mdat
-        sizes = []
-        for typ, ds, de in _boxes(buf, moof[0], moof[1]):
-            if typ != b'traf':
-                continue
-            default = None
-            tf = _find(buf, ds, de, b'tfhd')
-            if tf:
-                default = _tfhd_default_size(buf, tf[0])
-            for t2, ds2, de2 in _boxes(buf, ds, de):
-                if t2 == b'trun':
-                    for sz in _trun_sizes(buf, ds2, de2):
-                        sizes.append(sz if sz is not None else default)
-        if not sizes or any(s is None for s in sizes):
-            return data, 'no-op: could not read trun sample sizes'
-        if sum(sizes) != mdat_de - mdat_ds:
-            return data, 'no-op: trun sizes != mdat length (unexpected layout)'
 
         frames = []
-        cum = mdat_ds
-        for sz in sizes:
-            frames.append((cum, sz))
-            cum += sz
+        for (moof_ds, moof_de), (mdat_ds, mdat_de) in pairs:
+            sizes = []
+            for typ, ds, de in _boxes(buf, moof_ds, moof_de):
+                if typ != b'traf':
+                    continue
+                default = None
+                tf = _find(buf, ds, de, b'tfhd')
+                if tf:
+                    default = _tfhd_default_size(buf, tf[0])
+                for t2, ds2, de2 in _boxes(buf, ds, de):
+                    if t2 == b'trun':
+                        for sz in _trun_sizes(buf, ds2, de2):
+                            sizes.append(sz if sz is not None else default)
+            if not sizes or any(s is None for s in sizes):
+                return data, 'no-op: could not read trun sample sizes'
+            if sum(sizes) != mdat_de - mdat_ds:
+                return data, 'no-op: trun sizes != mdat length (unexpected layout)'
+            cum = mdat_ds
+            for sz in sizes:
+                frames.append((cum, sz))
+                cum += sz
 
         parsed_rate = None
         for rate in _RATES:

@@ -12,11 +12,11 @@ The logic lives in app/scrapers/directv_dai.py; upstream files only get one-line
  app/scrapers/directv.py          | 120 +++--
  app/scrapers/directv_dai.py      | 467 +++++++++++++++++
  app/scrapers/dtv_aac_ads.py      |  49 ++
- app/scrapers/dtv_aac_gain.py     | 652 +++++++++++++++++++++++
+ app/scrapers/dtv_aac_gain.py     | 663 +++++++++++++++++++++++
  app/scrapers/dtv_android.py      | 872 +++++++++++++++++++++++++++++++
  app/source_config.py             |   5 +
  app/templates/admin/sources.html | 130 ++++-
- 9 files changed, 2325 insertions(+), 89 deletions(-)
+ 9 files changed, 2336 insertions(+), 89 deletions(-)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/dtv_aac_ads.py
  create mode 100644 app/scrapers/dtv_aac_gain.py
@@ -1030,10 +1030,10 @@ index 0000000..8d4dbac
 +    return _AD_AC3_FILE.sub(lambda m: _AC3_RENDITION.sub('-a-96-', m.group(0)), playlist)
 diff --git a/app/scrapers/dtv_aac_gain.py b/app/scrapers/dtv_aac_gain.py
 new file mode 100644
-index 0000000..830a4e4
+index 0000000..f12a908
 --- /dev/null
 +++ b/app/scrapers/dtv_aac_gain.py
-@@ -0,0 +1,652 @@
+@@ -0,0 +1,663 @@
 +"""DirecTV DAI: attenuate inserted AAC ads a fixed amount, losslessly.
 +
 +The inserted-ad AAC twins (see dtv_aac_ads) play a few dB hotter than the
@@ -1626,33 +1626,44 @@ index 0000000..830a4e4
 +        if steps <= 0 or not data:
 +            return data, 'skipped (no data)'
 +        buf = bytearray(data)
-+        moof = _find(buf, 0, len(buf), b'moof')
-+        mdat = _find(buf, 0, len(buf), b'mdat')
-+        if not moof or not mdat:
++        # A segment may carry more than one fragment (moof+mdat). Pair each moof with the
++        # mdat that follows it and attenuate EVERY fragment. The old code edited only the
++        # first moof/mdat, so the rest of a multi-fragment ad played at full volume — that
++        # was the "some ads are still a little loud" bug (a single-fragment segment, the
++        # common case, behaves exactly as before: one pair).
++        pairs = []
++        pending = None
++        for typ, ds, de in _boxes(buf, 0, len(buf)):
++            if typ == b'moof':
++                pending = (ds, de)
++            elif typ == b'mdat' and pending is not None:
++                pairs.append((pending, (ds, de)))
++                pending = None
++        if not pairs:
 +            return data, 'no-op: not a fragmented MP4 (no moof/mdat — init segment?)'
-+        mdat_ds, mdat_de = mdat
-+        sizes = []
-+        for typ, ds, de in _boxes(buf, moof[0], moof[1]):
-+            if typ != b'traf':
-+                continue
-+            default = None
-+            tf = _find(buf, ds, de, b'tfhd')
-+            if tf:
-+                default = _tfhd_default_size(buf, tf[0])
-+            for t2, ds2, de2 in _boxes(buf, ds, de):
-+                if t2 == b'trun':
-+                    for sz in _trun_sizes(buf, ds2, de2):
-+                        sizes.append(sz if sz is not None else default)
-+        if not sizes or any(s is None for s in sizes):
-+            return data, 'no-op: could not read trun sample sizes'
-+        if sum(sizes) != mdat_de - mdat_ds:
-+            return data, 'no-op: trun sizes != mdat length (unexpected layout)'
 +
 +        frames = []
-+        cum = mdat_ds
-+        for sz in sizes:
-+            frames.append((cum, sz))
-+            cum += sz
++        for (moof_ds, moof_de), (mdat_ds, mdat_de) in pairs:
++            sizes = []
++            for typ, ds, de in _boxes(buf, moof_ds, moof_de):
++                if typ != b'traf':
++                    continue
++                default = None
++                tf = _find(buf, ds, de, b'tfhd')
++                if tf:
++                    default = _tfhd_default_size(buf, tf[0])
++                for t2, ds2, de2 in _boxes(buf, ds, de):
++                    if t2 == b'trun':
++                        for sz in _trun_sizes(buf, ds2, de2):
++                            sizes.append(sz if sz is not None else default)
++            if not sizes or any(s is None for s in sizes):
++                return data, 'no-op: could not read trun sample sizes'
++            if sum(sizes) != mdat_de - mdat_ds:
++                return data, 'no-op: trun sizes != mdat length (unexpected layout)'
++            cum = mdat_ds
++            for sz in sizes:
++                frames.append((cum, sz))
++                cum += sz
 +
 +        parsed_rate = None
 +        for rate in _RATES:
