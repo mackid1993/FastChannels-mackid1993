@@ -819,6 +819,7 @@ jobs:
             echo
             echo "cc @${{ github.repository_owner }}"
           } > cost.md
-          url=$(gh issue create --title "$title" --body-file cost.md) \
+          # No checkout in this job, so gh can't infer the repo from git -- pass it explicitly.
+          url=$(gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body-file cost.md) \
             || { echo "issue create failed (non-fatal)."; exit 0; }
-          gh issue close "${url##*/}" --comment "Automated cost notification — closing." || true
+          gh issue close -R "$GITHUB_REPOSITORY" "${url##*/}" --comment "Automated cost notification — closing." || true
