@@ -63,27 +63,60 @@ reproduce() {  # full gauntlet; prints DRIFT_STAGE on a drift; 0 pass / 10 drift
       "$root/scripts/reproduce.sh" "$dir"
 }
 
-ai_edit() {
+ai_edit() {  # $1 = attempt number
+  local pass=$1
   pip install --quiet aider-chat==0.86.2
   cat > "$prompt" <<'PROMPT'
-The files you can edit are from the FastChannels repository with the DirecTV "DAI" patch
-already applied. The patch adds its own modules (app/scrapers/directv_dai.py, dtv_android.py,
-dtv_aac_ads.py, dtv_aac_gain.py) plus a few one-line hooks in upstream's files. A build check
-is failing — almost always because upstream renamed or moved something a hook or an added
-module depends on. reproduce.log holds the failing check's output, and AGENTS.md explains the
-patch, every hook, and where each one belongs.
+The files you can edit are the FastChannels DirecTV overlay: a PATCH on upstream
+kineticman/FastChannels. The patch is exactly two things:
+  OURS (whole files, change freely): app/scrapers/directv_dai.py, dtv_android.py,
+    dtv_aac_ads.py, dtv_aac_gain.py
+  HOOKS (one-line injections into UPSTREAM files: api_sources.py, directv_proxy.py,
+    directv.py, source_config.py, templates/admin/sources.html). A hook is one line that
+    wires our code in -- `from . import dtv_android`, a `dai=directv_dai.request_flags(...)`
+    argument, a `dtv_android.sign_in(...)` call, or the `dai: dict | None = None` parameter
+    we add to an upstream function. Every other line in those files, every function name
+    included, is UPSTREAM's.
 
-Adapt the patch's code to upstream's current structure so the failing check passes. Rules:
-- The overlay's own tests (scripts/validate.sh, scripts/smoke_test.py) are the spec for the
-  behavior the patch must keep. You cannot edit them. Make the code satisfy them; never try to
-  defeat them.
-- If upstream renamed or moved a name the patch uses, update the patch's reference to the new
-  name or location. That is the fix.
-- Do NOT wrap imports in try/except, stub or shadow a missing name, delete a hook, or skip real
-  work just to make a check pass. Keep every bit of the patch's behavior.
-- Change only what the failure requires. No refactoring, reformatting or unrelated edits.
-- Keep the Python valid.
+A build check is failing, almost always because upstream renamed or moved something a hook
+sits in or calls. reproduce.log holds the failing output. AGENTS.md explains every hook.
+smoke_test.py and validate.sh are the overlay's own tests -- the exact spec your fix must
+satisfy; both are given to you to read. Satisfy them honestly; you cannot edit them.
+
+Keep every hook correctly wired into upstream's CURRENT code. Rules, highest priority first
+(an earlier rule wins any conflict between them):
+
+1. SCOPE. Edit only the patch files listed at the end of this message. The tests and every
+   other file are read-only; editing any file not in that list ENDS the run as a failure.
+   Never edit another file, never ask to add one.
+2. HONESTY. Keep all the patch's behavior; the tests are its spec. Never weaken, bypass or
+   fake a check.
+3. A HOOK FOLLOWS UPSTREAM. When upstream renamed or moved a name a hook calls or sits in,
+   update the hook's reference -- anywhere in the files you edit -- to the new name or
+   location. This is the normal fix.
+4. ALIAS -- the tiebreaker that wins a test pinning a renamed name. If a test refers to an
+   upstream name by its OLD name and upstream renamed it, add ONE plain alias line next to
+   upstream's renamed definition: `old_name = new_name`. It is the real, fully-hooked object
+   under both names, so inspect.signature and inspect.getsource resolve through it. Add it
+   only to keep a test's reference resolving, only as a bare alias (no wrapper, no new logic),
+   and in no file but the one holding the renamed definition. This settles rule 2's "can't
+   edit the test" against "don't restore old code": you keep one name reachable, you do not
+   restore upstream's old code.
+5. Otherwise never add non-hook code to an upstream file -- no stubs, shims, try/except around
+   an import, deleted or no-op'd hooks, or hardcoded test values. Your own modules you may
+   change as needed.
+6. Minimal diff, valid Python, the patch still applies. No refactoring or reformatting.
+7. Never write a secret (API key, bearer, token) into any file.
 PROMPT
+  # Name the exact files the AI may edit, in the prompt itself.
+  { printf '\nThe patch files -- the ONLY files you may edit (editing any other file ends the run):\n'
+    sed 's|^|  - |' "$editable"; } >> "$prompt"
+  # On a retry, hand Aider its own previous cycle: its chat history (.aider.chat.history.md,
+  # passed with --read below) carries what it already tried, its reasoning, and the edits it
+  # made -- so it continues instead of restarting cold and repeating a dead end.
+  if [ "$pass" -gt 1 ]; then
+    printf '\nThis is attempt %s of %s. Your earlier attempt(s) are in the chat history you were given, and the gauntlet STILL failed (the latest failure is in reproduce.log). Do not repeat an approach that already failed -- commit to the fix the rules point to.\n' "$pass" "$max_passes" >> "$prompt"
+  fi
   # The two self-contained audio modules import nothing from upstream (they can't drift), so
   # keep their large bitstream tables out of the edit set unless the failure names one.
   local edit=() f
@@ -96,13 +129,17 @@ PROMPT
     esac
   done < "$editable"
   [ ${#edit[@]} -gt 0 ] || { echo "::error::no editable files to offer the AI"; return 1; }
-  # Aider edits only the files named here; the log and AGENTS.md are read-only context. CI does
-  # all git/validation, so Aider's own git, lint, test, shell and URL features are off.
+  # Aider edits only the files named here; the log, AGENTS.md, the overlay's two tests (the
+  # spec) and -- on a retry -- its own prior chat history are read-only context. CI does all
+  # git/validation, so Aider's own git, lint, test, shell and URL features are off.
+  local hist=()
+  [ "$pass" -gt 1 ] && [ -f "$up/.aider.chat.history.md" ] && hist=(--read "$up/.aider.chat.history.md")
   ( cd "$up" && aider --model "$model" --edit-format diff --yes-always --no-git \
         --no-auto-commits --no-auto-lint --no-auto-test --no-suggest-shell-commands \
         --no-detect-urls --no-show-model-warnings --no-check-update --no-analytics \
         --no-pretty --map-tokens 0 --read "$log" --read "$root/AGENTS.md" \
-        --message-file "$prompt" "${edit[@]}" )
+        --read "$root/scripts/smoke_test.py" --read "$root/scripts/validate.sh" \
+        "${hist[@]}" --message-file "$prompt" "${edit[@]}" )
 }
 
 verify_scope_and_commit() {  # 0 if the AI's edits are in-scope, key-free and committed; else 1
@@ -121,7 +158,10 @@ verify_scope_and_commit() {  # 0 if the AI's edits are in-scope, key-free and co
   if ( cd "$up" && grep -qF -- "$OPENROUTER_API_KEY" $changed ); then
     echo "::error::the API key appeared in an edited file"; return 1
   fi
-  ( cd "$up" && rm -rf .aider* && git add -- $(cat "$editable") && GIT_EDITOR=true git commit -q --amend --no-edit )
+  # Keep Aider's chat history (the per-cycle handoff for the next attempt); drop its other
+  # scratch files. Neither is ever staged -- only the patch's files are added and amended.
+  ( cd "$up" && find . -maxdepth 1 -name '.aider*' ! -name '.aider.chat.history.md' -exec rm -rf {} + \
+      && git add -- $(cat "$editable") && GIT_EDITOR=true git commit -q --amend --no-edit )
 }
 
 # 1. Classify the current state of the applied patch.
@@ -146,7 +186,7 @@ while [ "$code" = 10 ]; do
   fi
   echo "== AI repair attempt $pass =="
   snapshot "$before"
-  ai_edit || exit 1
+  ai_edit "$pass" || exit 1
   verify_scope_and_commit || exit 1
   out=$(reproduce); code=$?
   printf '%s\n' "$out"

@@ -392,20 +392,34 @@ jobs:
           pip install --quiet aider-chat==0.86.2
           cd upstream
           cat > ../prompt.txt <<'PROMPT'
-          The files you can edit are from the FastChannels repository. A patch that
-          adds an opt-in "DirecTV ad insertion (DAI)" feature no longer applied cleanly.
-          Every part of the patch that applied cleanly is already in these files. Where
-          it conflicted, the files currently contain upstream's code, and conflicts.md
-          shows each spot: upstream's code, and what the patch wanted that code to be
-          (written against an older upstream). The full patch is in conflict.patch, and
-          AGENTS.md explains the repo, what the patch does, and the invariants it must keep.
+          The files you can edit are the FastChannels DirecTV overlay: a PATCH on upstream
+          kineticman/FastChannels. The patch is our own modules (directv_dai.py, dtv_android.py,
+          dtv_aac_ads.py, dtv_aac_gain.py) plus one-line HOOKS injected into upstream files. A
+          hook is one line that wires our code into an upstream file (an import, a
+          `dai=directv_dai.request_flags(...)` argument, a `dtv_android.sign_in(...)` call, a
+          `dai: dict | None = None` parameter we add); every other line in those files, function
+          names included, is UPSTREAM's. The patch adds an opt-in "DirecTV ad insertion (DAI)"
+          feature and no longer applied cleanly. Every part that applied cleanly is already in
+          these files; where it conflicted the files hold upstream's code, and conflicts.md shows
+          each spot: upstream's code, and what the patch wanted (written against an older
+          upstream). The full patch is in conflict.patch; AGENTS.md explains the hooks; and
+          smoke_test.py and validate.sh are the overlay's own tests -- the spec your result must
+          later pass, given to you to read (you cannot edit them).
 
-          For each conflict in conflicts.md, change the code at that spot so it keeps
-          upstream's current behavior AND does what the patch intended. Rules:
-          - Keep every upstream change. If upstream renamed or restructured something,
-            adapt the patch's code to the new structure.
-          - Change only those spots. Don't refactor, reformat or touch anything else.
-          - Keep the Python valid.
+          For each conflict in conflicts.md, write code that keeps upstream's current behavior
+          AND re-wires the patch's hook. Rules:
+          - Edit only the conflicted files you were given; the tests and every other file are
+            read-only.
+          - Keep every upstream change. A HOOK FOLLOWS UPSTREAM: if upstream renamed or moved a
+            name a hook calls or sits in, update that reference to the new name -- anywhere in the
+            files you're editing, not only inside a conflict block (a stale reference elsewhere
+            would fail the build).
+          - If one of the overlay's tests references an upstream name by its OLD name and upstream
+            renamed it, add ONE plain alias line next to upstream's renamed definition (`old_name =
+            new_name`) -- the real object under both names, no wrapper, no new logic. Only to keep
+            a test's reference resolving; add no other non-hook code to an upstream file.
+          - Don't refactor, reformat or touch anything the conflict doesn't require. Keep the
+            Python valid.
           PROMPT
           # Aider can edit only the files named on the command line; the brief, the
           # patch and AGENTS.md are read-only context. CI does all git operations and
@@ -414,7 +428,8 @@ jobs:
                 --no-auto-commits --no-auto-lint --no-auto-test --no-suggest-shell-commands \
                 --no-detect-urls --no-show-model-warnings --no-check-update --no-analytics \
                 --no-pretty --map-tokens 0 --read ../conflicts.md --read ../conflict.patch \
-                --read ../overlay/AGENTS.md --message-file ../prompt.txt \
+                --read ../overlay/AGENTS.md --read ../overlay/scripts/smoke_test.py \
+                --read ../overlay/scripts/validate.sh --message-file ../prompt.txt \
                 $(cat ../conflicted.txt)
 
       - name: Check the result and finish the merge

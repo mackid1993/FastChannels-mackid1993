@@ -146,13 +146,17 @@ Invariants a port must keep:
 - Changing the toggle must clear the cached playback URLs.
 - Never log token values or account values. Field names only.
 
-## Resolving a conflict
+## Resolving a conflict (and repairing drift)
+
+The patch is two things: **our own modules** (`app/scrapers/directv_dai.py`, `dtv_android.py`, `dtv_aac_ads.py`, `dtv_aac_gain.py`), which we own outright, and one-line **hooks** injected into upstream's files (`api_sources.py`, `directv_proxy.py`, `directv.py`, `source_config.py`, `templates/admin/sources.html`). A hook is a single line that wires our code in — `from . import dtv_android`, a `dai=directv_dai.request_flags(...)` argument, a `dtv_android.sign_in(...)` call, the `dai: dict | None = None` parameter we add to an upstream function. Every other line in those upstream files — including every function name — is upstream's. The job is to keep the hooks wired as upstream moves.
 
 - The result must be upstream's current code plus exactly the patch's behavior.
-- Keep every upstream change. If upstream renamed or restructured something the patch uses, adapt the patch's code to the new structure; don't restore the old code.
-- Touch only what the conflict requires. No refactoring, reformatting or unrelated fixes.
+- Keep every upstream change. **A hook follows upstream:** if upstream renamed or moved a name a hook calls or sits in, adapt the hook's reference (anywhere in the files being edited, not only inside a conflict block) to the new name or location; don't restore the old code.
+- **Alias exception — the tiebreaker that wins a test pinning a renamed name.** The overlay's own tests (`validate.sh`, `smoke_test.py`) are the spec and can't be edited; some reference an upstream name a hook depends on. If upstream renamed such a name, add a single plain alias line next to upstream's renamed definition so the old name resolves to it — `old_name = new_name`, the real fully-hooked object under both names (so `inspect.signature`/`inspect.getsource` resolve through it). Only to keep a test's reference resolving, only as a bare alias (no wrapper, no new logic), and in no file but the one holding the renamed definition. This settles "the test can't change" vs "don't restore old code": you keep one name reachable, you do not restore upstream's old code.
+- Otherwise never add non-hook code to an upstream file: no stubs, shims, `try/except` around an import, deleted or no-op'd hooks, or hardcoded test values. Our own modules are free to change as the fix needs.
+- Touch only what the failure requires. No refactoring, reformatting or unrelated fixes. Keep the Python valid.
 - Verify with `python3 -m compileall -q app` in the checkout. CI then runs `scripts/validate.sh`, and after the merge, `scripts/smoke_test.py` inside the built image.
-- In CI, only edit files. The workflow does the git operations.
+- In CI, only edit the patch's files (the four modules and the hooked upstream files listed above); editing any other file fails the run. The workflow does the git operations.
 
 ## Changing the patch by hand
 
