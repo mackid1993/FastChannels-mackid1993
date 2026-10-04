@@ -56,40 +56,19 @@ jobs:
           [ -n "$sha" ] || { echo "::error::could not read upstream $UPSTREAM_BRANCH"; exit 1; }
           echo "Upstream $UPSTREAM_BRANCH HEAD: $sha"
 
-          mapfile -t held < <(gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 100 \
-            --json number,headRefName --jq '.[] | select(.headRefName | startswith("auto/drift-")) | "\(.number) \(.headRefName)"')
-          if [ "${#held[@]}" -eq 0 ]; then
-            echo "No held drift PRs to reconcile."
-            exit 0
-          fi
-          echo "Held drift PRs: ${held[*]}"
-
+          # Check the cache of held fixes (shared with the build's cache step): the first held PR
+          # whose patches still apply + validate against main is the one to promote. Each held PR
+          # is a full patch set, so newest = most cumulative.
           pip install --quiet ruff jinja2
-          git -C overlay fetch -q origin
-
-          for entry in "${held[@]}"; do
-            num=${entry%% *}; branch=${entry#* }
-            echo "::group::Testing PR #$num ($branch) against main $sha"
-            # Use this PR's patches/ instead of main's, then restore.
-            git -C overlay checkout -q "origin/$branch" -- patches
-            rm -rf up && git clone -q --branch "$UPSTREAM_BRANCH" "https://github.com/$UPSTREAM_REPO.git" up
-            git -C up checkout -q "$sha"
-            ok=true
-            UPSTREAM_SHA="$sha" overlay/scripts/apply-patches.sh up || ok=false
-            if [ "$ok" = true ]; then UPSTREAM_SHA="$sha" overlay/scripts/validate.sh up || ok=false; fi
-            git -C overlay checkout -q HEAD -- patches   # restore main's patches
-            echo "::endgroup::"
-            if [ "$ok" = true ]; then
-              echo "PR #$num is valid against main — merging and publishing (the publish build re-runs the full gauntlet)."
-              gh pr merge "$num" -R "$GITHUB_REPOSITORY" --squash --delete-branch
-              # Pushes with GITHUB_TOKEN don't trigger workflows, so kick the publish build.
-              gh workflow run build.yml --repo "$GITHUB_REPOSITORY"
-              echo "Merged PR #$num and started the publishing build; leaving any other held PRs for the next run."
-              exit 0
-            fi
-            echo "PR #$num is not yet valid against main (his release hasn't caught up); leaving it held."
-          done
-          echo "No held fix is valid against main yet; nothing merged."
+          num=$(overlay/scripts/try_held_fixes.sh overlay "$UPSTREAM_REPO" "$sha" | tail -1)
+          if [ -n "$num" ]; then
+            echo "Held fix PR #$num is valid against main $sha — merging and publishing (the publish build re-runs the full gauntlet, and dedups by build key so it can't over-build)."
+            gh pr merge "$num" -R "$GITHUB_REPOSITORY" --squash --delete-branch
+            # Pushes with GITHUB_TOKEN don't trigger workflows, so kick the publish build.
+            gh workflow run build.yml --repo "$GITHUB_REPOSITORY"
+          else
+            echo "No held fix is valid against main yet; nothing merged."
+          fi
 
       - name: Delete auto-fix branches with no open PR
         env:
