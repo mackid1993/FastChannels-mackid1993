@@ -22,7 +22,7 @@ scripts/
 
 ## Build lifecycle
 
-Weekly (Mondays, 9 AM Eastern), on a manual run, or when `patches/`, `scripts/` or the workflow change:
+Every 6 hours, on a manual run, or on a push to `patches/`, `scripts/` or the build workflow, the build job runs these steps — building and publishing only when there's a real change:
 
 1. Read upstream `main`'s newest commit and the newest Player APK release. Skip if that exact combination with these patches was already built.
 2. `git am --3way` the patches onto a fresh upstream checkout.
@@ -32,7 +32,7 @@ Weekly (Mondays, 9 AM Eastern), on a manual run, or when `patches/`, `scripts/` 
 6. Publish `:latest`, `:upstream-<sha>`, `:build-<key>`.
 7. Regenerate `patches/` against that upstream and commit it, so the patch context stays current.
 
-The other six days at 9 AM Eastern, a drift check runs steps 1-3 and 7 without building an image, so a conflict is caught and fixed the day upstream introduces it. While a "Build failed" issue is open, the drift check does a full build instead, so failures are retried daily. Step 6 pushes the exact image steps 4-5 tested.
+Step 1's dedup (the build key is just upstream sha + Player APK + the patch's added/removed lines) means a scheduled run builds + publishes only when upstream `main`, the APK, or the patch actually changed; otherwise it's a no-op. A **push** to this repo runs a drift check instead (steps 2-3: apply + validate, no image, no publish), so a CI/patch/doc change reruns the tests without rebuilding `:latest`. Step 6 publishes the exact image steps 4-5 tested, and a successful publish opens-and-closes a status issue that @mentions you — a success ping. A "Build failed" issue @mentions you and is retried on the next scheduled run.
 
 The AI fix (Aider, with the model in the `AI_MODEL` variable — set to `openrouter/z-ai/glm-5.3-flash`) runs for two kinds of failure. It only ever edits files; CI does all git operations and runs the validation. Both paths converge on one shared repair script, **`scripts/ai_fix_drift.sh`**: it runs the whole gauntlet (`reproduce.sh`), hands the AI the failing log plus the files the patch touches (`git diff --name-only <sha> HEAD`), verifies the AI changed only those files and leaked no key, amends the fix into the patch commit, and re-checks everything — up to three attempts, each shown the latest failure. A fix must pass the static checks **and** a full image build, APK check, smoke test and boot test before the `open-pr` job merges it and starts the publishing build. A bad fix never reaches `main`.
 
@@ -40,6 +40,15 @@ The AI fix (Aider, with the model in the `AI_MODEL` variable — set to `openrou
 - **Drift** (step 2 applies cleanly but a later check fails — upstream renamed or moved something a hook or an added module depends on): the `resolve-drift` job runs `ai_fix_drift.sh`, but **only on the unattended scheduled runs** (and test-run dispatches), never on a push or the post-merge dispatch. A clean reproduction (a transient hiccup, or a failure only in the publish/refresh steps) or a Docker/APK failure (infrastructure, not patch-fixable) stops without calling the AI and exports nothing. The overlay's own tests (`validate.sh`, `smoke_test.py`) are the spec and are not editable by the AI.
 
 If either path can't produce a passing fix, `ai-failed` comments on the matching status issue.
+
+## Watching upstream development (early fixes) + reconcile
+
+Two more workflows keep the whole thing hands-off by fixing drift *before* it reaches a release:
+
+- **`upstream-watch.yml`** polls kineticman's `development` branch every 6 hours. On a new commit (deduped via the Actions cache) it dispatches `build.yml` in drift-check mode against development (`upstream_branch=development`, `drift_only=true`). Because `upstream_branch` is set that run is a test run: it never builds an image, publishes, refreshes the patch, or merges. If the patch drifts there, the AI adapts it and `open-pr` opens a **held** PR (branch `auto/drift-*`) — the agent's prepared fix, left open (worded as FYI, not "merge me").
+- **`reconcile-drift.yml`** polls every 6 hours. For each open `auto/drift-*` PR it re-tests that PR's patch against the *current* upstream `main`; the moment a fix is proven valid for production it merges the PR and dispatches the publishing build (which re-runs the full gauntlet, so a wrong fix can't reach `:latest`). It merges at most one per run and shares the `build` concurrency group so it can't race a publish.
+
+So upstream drift is fixed and queued as a held PR before a release lands, then merged and published automatically once it's proven against `main` — you only ever get FYI notifications.
 
 ## The DAI patch
 
