@@ -439,13 +439,15 @@ jobs:
             function in a file you edit (`old = new`), or -- for a moved module the patch does not
             own -- a `sys.modules['app.<oldname>'] = <real new module>` registered from one of our
             own modules. No wrapper, no new logic.
-          - NEVER FABRICATE / RECOGNIZE REMOVAL: an alias must point at real, existing upstream
-            code; never create a module/function/file or write fake data to pass a test.
-            upstream_index.txt lists every def/class in upstream, so if the capability a test
-            needs (e.g. a `known_devices` whose source returns `address`/`host` entries) is not
-            there -- a single-purpose partial match does NOT count -- it was removed: leave that
-            hook, say which capability is gone in one sentence, and do not re-implement or keep
-            retrying it (a removed dependency means the patch can't pass on this upstream).
+          - BACKPORT, DON'T FABRICATE: a capability may be gone as a named function/module yet
+            still be rebuildable from real upstream data that's still present (a registry is gone
+            but the thing(s) it listed remain -- a settings field, a single-item accessor). Then
+            re-implement it in one of OUR modules reading that REAL source and expose it under
+            the pinned name (a module alias, or a sys.modules runtime module carrying your real
+            function). That is a real port, NOT fabrication, and it's the correct fix -- the code
+            must read real data so the feature works. Forbidden only: inventing/hardcoding data,
+            or a hollow stub. Make no edit (say what's gone in one sentence) only when no real
+            source exists to rebuild from.
           - Don't refactor, reformat or touch anything the conflict doesn't require. Keep the
             Python valid.
           PROMPT
@@ -784,23 +786,39 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
           OR_BEFORE: ${{ needs.build.outputs.or_before }}
+          RESOLVE_RESULT: ${{ needs.resolve.result }}
+          DRIFT_RESULT: ${{ needs.resolve-drift.result }}
         run: |
-          # OpenRouter usage can post a few seconds after a generation; give it a moment.
-          sleep 20
-          after=$(curl -s --max-time 20 -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-                    https://openrouter.ai/api/v1/key \
-                    | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('usage',''))" 2>/dev/null || true)
-          # Single-line python: non-numeric input raises and `|| true` leaves cost empty.
-          cost=$(python3 -c "import sys; d=float(sys.argv[2])-float(sys.argv[1]); print('%.4f'%d if d>=0.0001 else 'ZERO')" "$OR_BEFORE" "$after" 2>/dev/null || true)
-          [ -n "$cost" ] || { echo "OpenRouter usage unavailable; no cost issue opened."; exit 0; }
-          [ "$cost" != "ZERO" ] || { echo "No AI spend this run; no cost issue opened."; exit 0; }
+          # Only the AI jobs spend on OpenRouter. If neither ran, stay silent.
+          if [ "$RESOLVE_RESULT" = "skipped" ] && [ "$DRIFT_RESULT" = "skipped" ]; then
+            echo "No AI job ran; no cost issue."; exit 0
+          fi
+          usage() { curl -s --max-time 20 -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+                      https://openrouter.ai/api/v1/key \
+                      | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('usage',''))" 2>/dev/null || true; }
+          # OpenRouter usage posts with a lag (sometimes minutes); poll up to ~2.5 min for the
+          # spend to catch up to the baseline the build job recorded.
+          cost=""
+          for _ in $(seq 1 10); do
+            sleep 15
+            cost=$(python3 -c "import sys; d=float(sys.argv[2])-float(sys.argv[1]); print('%.4f'%d if d>=0.0001 else '')" "$OR_BEFORE" "$(usage)" 2>/dev/null || true)
+            [ -n "$cost" ] && break
+          done
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          { echo "Approximate OpenRouter spend for AI repair [run ${{ github.run_id }}]($run_url): **\$$cost** (model \`$AI_MODEL\`)."
+          # The AI ran, so always open the issue (that's the email) -- even if usage hasn't
+          # posted yet, say so rather than stay silent.
+          if [ -n "$cost" ]; then
+            title="AI repair cost: ~\$$cost (run ${{ github.run_id }})"; amount="**\$$cost**"
+          else
+            title="AI repair cost: pending (run ${{ github.run_id }})"
+            amount="**pending** — OpenRouter hadn't posted the usage yet; check your OpenRouter dashboard"
+          fi
+          { echo "OpenRouter spend for AI repair [run ${{ github.run_id }}]($run_url): $amount (model \`$AI_MODEL\`)."
             echo
-            echo "_Approximate — OpenRouter usage can post with a short lag._"
+            echo "_Approximate — OpenRouter usage can post with a lag._"
             echo
             echo "cc @${{ github.repository_owner }}"
           } > cost.md
-          url=$(gh issue create --title "AI repair cost: ~\$$cost (run ${{ github.run_id }})" --body-file cost.md) \
+          url=$(gh issue create --title "$title" --body-file cost.md) \
             || { echo "issue create failed (non-fatal)."; exit 0; }
           gh issue close "${url##*/}" --comment "Automated cost notification — closing." || true
