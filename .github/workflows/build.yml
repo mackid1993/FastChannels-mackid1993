@@ -640,7 +640,7 @@ jobs:
   open-pr:
     needs: [build, resolve, resolve-drift]
     if: >-
-      always() &&
+      always() && (inputs.upstream_repo || '') == '' &&
       ((needs.build.outputs.conflict == 'true' && needs.resolve.result == 'success') ||
        (needs.build.result == 'failure' && needs.build.outputs.conflict != 'true' &&
         needs.resolve-drift.outputs.fixed == 'true'))
@@ -782,40 +782,33 @@ jobs:
     steps:
       - name: Report this run's AI spend in an issue (emails you, then closes)
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GH_TOKEN: ${{ github.token }}
           AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
-          OR_BEFORE: ${{ needs.build.outputs.or_before }}
           RESOLVE_RESULT: ${{ needs.resolve.result }}
           DRIFT_RESULT: ${{ needs.resolve-drift.result }}
         run: |
-          # Only the AI jobs spend on OpenRouter. If neither ran, stay silent.
+          # Only the AI jobs spend. If neither ran, stay silent.
           if [ "$RESOLVE_RESULT" = "skipped" ] && [ "$DRIFT_RESULT" = "skipped" ]; then
             echo "No AI job ran; no cost issue."; exit 0
           fi
-          usage() { curl -s --max-time 20 -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-                      https://openrouter.ai/api/v1/key \
-                      | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('usage',''))" 2>/dev/null || true; }
-          # OpenRouter usage posts with a lag (sometimes minutes); poll up to ~2.5 min for the
-          # spend to catch up to the baseline the build job recorded.
-          cost=""
-          for _ in $(seq 1 10); do
-            sleep 15
-            cost=$(python3 -c "import sys; d=float(sys.argv[2])-float(sys.argv[1]); print('%.4f'%d if d>=0.0001 else '')" "$OR_BEFORE" "$(usage)" 2>/dev/null || true)
-            [ -n "$cost" ] && break
-          done
+          # Sum Aider's own per-call cost ("Cost: $X message") from the completed AI job logs.
+          # This is immediate and per-run accurate; the OpenRouter usage API lags minutes and
+          # smears spend across overlapping runs, so it under-reported. The resolve /
+          # resolve-drift jobs are finished by now, so their logs are available mid-run.
+          cost=$(for jid in $(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" \
+                     --jq '.jobs[] | select(.name=="resolve" or .name=="resolve-drift") | .id' 2>/dev/null); do
+                   gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$jid/logs" 2>/dev/null
+                 done | grep -oiE 'Cost: \$[0-9.]+ message' | sed -E 's/[^0-9.]//g' \
+                 | awk '{s+=$1} END{if (NR>0) printf "%.4f", s}')
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          # The AI ran, so always open the issue (that's the email) -- even if usage hasn't
-          # posted yet, say so rather than stay silent.
           if [ -n "$cost" ]; then
-            title="AI repair cost: ~\$$cost (run ${{ github.run_id }})"; amount="**\$$cost**"
+            title="AI repair cost: ~\$$cost (run ${{ github.run_id }})"
+            amount="**\$$cost**"
           else
-            title="AI repair cost: pending (run ${{ github.run_id }})"
-            amount="**pending** — OpenRouter hadn't posted the usage yet; check your OpenRouter dashboard"
+            title="AI repair cost: see run log (run ${{ github.run_id }})"
+            amount="**see the run log** — Aider printed no cost line"
           fi
-          { echo "OpenRouter spend for AI repair [run ${{ github.run_id }}]($run_url): $amount (model \`$AI_MODEL\`)."
-            echo
-            echo "_Approximate — OpenRouter usage can post with a lag._"
+          { echo "AI repair spend for [run ${{ github.run_id }}]($run_url): $amount (model \`$AI_MODEL\`, as reported by Aider)."
             echo
             echo "cc @${{ github.repository_owner }}"
           } > cost.md
