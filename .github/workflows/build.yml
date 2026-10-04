@@ -80,26 +80,12 @@ jobs:
       short: ${{ steps.inputs.outputs.short }}
       apk: ${{ steps.inputs.outputs.apk }}
       apk_tag: ${{ steps.inputs.outputs.apk_tag }}
-      or_before: ${{ steps.or_before.outputs.v }}
     steps:
       - name: Check out this repo
         uses: actions/checkout@v5
         with:
           path: overlay
           fetch-depth: 0
-
-      - name: Record OpenRouter spend baseline (for the AI-cost ping)
-        id: or_before
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: |
-          # Cumulative usage on the key now, before any AI runs. The ai-cost job reads it again
-          # at the end; the delta is this run's AI spend. Only the number is captured — never
-          # the key or the raw response.
-          v=$(curl -s --max-time 20 -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-                https://openrouter.ai/api/v1/key \
-                | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('usage',''))" 2>/dev/null || true)
-          echo "v=$v" >> "$GITHUB_OUTPUT"
 
       - name: Resolve upstream commit, Player APK release and run mode
         id: inputs
@@ -766,53 +752,3 @@ jobs:
           cc @${{ github.repository_owner }}
           BODY
           scripts/issue.sh open "$title" body.md
-
-  # Fire-and-forget cost ping. The AI steps are the only thing that spends on OpenRouter, so
-  # (usage now) - (the baseline the build job recorded) is this run's AI cost. If the AI ran,
-  # open an issue with the figure that @mentions the owner (so GitHub emails it) and close it
-  # at once. Runs on every run that recorded a baseline (test runs included); never fails the
-  # workflow, and stays silent when no AI ran (cost ~ 0).
-  ai-cost:
-    needs: [build, resolve, resolve-drift]
-    if: always() && needs.build.outputs.or_before != ''
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - name: Report this run's AI spend in an issue (emails you, then closes)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
-          RESOLVE_RESULT: ${{ needs.resolve.result }}
-          DRIFT_RESULT: ${{ needs.resolve-drift.result }}
-        run: |
-          # Only the AI jobs spend. If neither ran, stay silent.
-          if [ "$RESOLVE_RESULT" = "skipped" ] && [ "$DRIFT_RESULT" = "skipped" ]; then
-            echo "No AI job ran; no cost issue."; exit 0
-          fi
-          # Sum Aider's own per-call cost ("Cost: $X message") from the completed AI job logs.
-          # This is immediate and per-run accurate; the OpenRouter usage API lags minutes and
-          # smears spend across overlapping runs, so it under-reported. The resolve /
-          # resolve-drift jobs are finished by now, so their logs are available mid-run.
-          cost=$(for jid in $(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" \
-                     --jq '.jobs[] | select(.name=="resolve" or .name=="resolve-drift") | .id' 2>/dev/null); do
-                   gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$jid/logs" 2>/dev/null
-                 done | grep -oiE 'Cost: \$[0-9.]+ message' | sed -E 's/[^0-9.]//g' \
-                 | awk '{s+=$1} END{if (NR>0) printf "%.4f", s}')
-          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          if [ -n "$cost" ]; then
-            title="AI repair cost: ~\$$cost (run ${{ github.run_id }})"
-            amount="**\$$cost**"
-          else
-            title="AI repair cost: see run log (run ${{ github.run_id }})"
-            amount="**see the run log** — Aider printed no cost line"
-          fi
-          { echo "AI repair spend for [run ${{ github.run_id }}]($run_url): $amount (model \`$AI_MODEL\`, as reported by Aider)."
-            echo
-            echo "cc @${{ github.repository_owner }}"
-          } > cost.md
-          # No checkout in this job, so gh can't infer the repo from git -- pass it explicitly.
-          url=$(gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body-file cost.md) \
-            || { echo "issue create failed (non-fatal)."; exit 0; }
-          gh issue close -R "$GITHUB_REPOSITORY" "${url##*/}" --comment "Automated cost notification — closing." || true

@@ -90,3 +90,17 @@ jobs:
             echo "PR #$num is not yet valid against main (his release hasn't caught up); leaving it held."
           done
           echo "No held fix is valid against main yet; nothing merged."
+
+      - name: Delete auto-fix branches with no open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The AI paths create auto/drift-* and auto/port-* branches; once their PR is merged
+          # or closed the branch lingers. Sweep any auto/* branch that has no open PR so the
+          # repo stays tidy without manual cleanup.
+          open=$(gh pr list -R "$GITHUB_REPOSITORY" --state open --json headRefName --jq '.[].headRefName')
+          for b in $(gh api "repos/$GITHUB_REPOSITORY/branches?per_page=100" --jq '.[].name' | grep -E '^auto/' || true); do
+            printf '%s\n' "$open" | grep -qxF "$b" && continue
+            echo "deleting orphan branch $b"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$b" >/dev/null 2>&1 || true
+          done
