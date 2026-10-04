@@ -20,7 +20,7 @@ Use it anywhere you'd use upstream's image; the data volume and settings are the
 
 ## How it stays current
 
-This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` and a workflow that rebuilds on top of upstream once a week (Mondays, 9 AM Eastern), or whenever you run it by hand from the Actions tab:
+This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` and workflows that poll upstream every ~6 hours (GitHub can't be notified of pushes to a repo you don't own) and keep a tested image published on top of his latest release — hands-off, with the AI doing any fixing. When his `main` (releases) has a new commit or a new Player APK release, a build runs; you can also run it by hand from the Actions tab:
 
 1. **Check for changes.** It reads upstream `main`'s newest commit and the newest FastChannels Player release. If neither they nor the patch changed since the last build, it stops without rebuilding.
 2. **Apply the patch** to a fresh upstream checkout with `git am --3way`. A 3-way merge means upstream can move, add or edit code around our changes and the patch still lands. It fails only if upstream rewrites the same lines the patch changes.
@@ -31,11 +31,15 @@ This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` 
 7. **Publish** to GHCR as `:latest`, `:upstream-<commit>` and `:build-<key>`.
 8. **Refresh the patch.** The patch is regenerated against the upstream it just built on and committed back here. It always carries upstream's newest surrounding code, so small upstream edits never pile up into a conflict.
 
-The other six days, a drift check applies the patch to upstream's latest code, runs the static checks and refreshes the patch, without building an image. A conflict is caught the day it appears.
+A `:latest` rebuild happens **only** on a real change (a new upstream commit, a new Player APK, or a patch change); a docs or CI tweak just re-runs the tests, never a rebuild.
+
+**It watches his `development` branch too**, so the AI fixes drift *before* it reaches a release. On a new development commit it applies the patch and, if upstream drifted, the AI (GLM 5.3 Flash via Aider) adapts the patch and opens a *held* pull request — its prepared fix. A reconcile workflow then re-tests each held fix against `main` and **auto-merges and publishes** it the moment it's proven correct for production (the publish build re-runs the full gauntlet, so a wrong fix can never reach `:latest`). So a breaking upstream change is usually fixed and ready before his release even lands — and you do nothing.
 
 The overlay's code lives in its own files — `app/scrapers/directv_dai.py` (ad insertion), `app/scrapers/dtv_android.py` (the Android TV sign-in, self-contained enough to use without DAI), `app/scrapers/dtv_aac_ads.py` (the inserted-ad audio swap), and `app/scrapers/dtv_aac_gain.py` (the inserted-ad loudness cut) — which upstream doesn't have and so can't conflict with. Upstream's files only get a handful of one-line hooks (listed with re-apply instructions in `AGENTS.md`), which keeps conflicts rare and trivial to fix.
 
-If any step fails, nothing is published, `:latest` stays on the last good build, and a "Build failed" issue pings you. On the unattended scheduled runs an AI then tries to fix it automatically (the same AI and the same safety gauntlet as a patch conflict, below): it reproduces the failing check, adapts the patch to upstream's current code, and the fix must build, smoke-test and boot-test cleanly before it's merged and published. Until it's resolved, the daily run does a full build instead of a drift check, so a one-off failure (a registry hiccup, say) fixes itself the next day.
+If any step fails, nothing is published, `:latest` stays on the last good build, and a "Build failed" issue pings you. On the scheduled runs an AI then tries to fix it automatically (the same AI and gauntlet as a patch conflict, below): it reproduces the failing check, adapts the patch to upstream's current code, and the fix must build, smoke-test and boot-test cleanly before it's merged and published. A one-off failure (a registry hiccup, say) clears on the next run.
+
+**You never have to act.** The AI does the fixing and merging; you only get FYI notifications (GitHub emails you) — when a fix is prepared, when a new image is built and published, and, the one worth a glance, if the AI ever can't fix something (it keeps retrying). It costs about nothing to run: GitHub Actions is free on a public repo, and the AI (Flash) runs only on real drift, at pennies.
 
 ## When the patch conflicts
 
