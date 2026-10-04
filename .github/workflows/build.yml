@@ -358,8 +358,8 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           # Any OpenRouter model, as "openrouter/<model id>". Override with the
-          # AI_MODEL repo variable (set to openrouter/google/gemini-2.5-pro).
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}
+          # AI_MODEL repo variable (set to openrouter/z-ai/glm-5.3-flash).
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
         run: |
           # Pinned: a new Aider release can change or drop flags this step relies on.
           pip install --quiet aider-chat==0.86.2
@@ -420,7 +420,7 @@ jobs:
         timeout-minutes: 60
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
           UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
           APK: ${{ needs.build.outputs.apk }}
           CACHE_BUST: ${{ github.run_id }}
@@ -520,7 +520,7 @@ jobs:
         timeout-minutes: 60
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
           UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
           APK: ${{ needs.build.outputs.apk }}
           CACHE_BUST: ${{ github.run_id }}
@@ -620,7 +620,7 @@ jobs:
           git push -f origin "$branch"
           issue=$(gh issue list --state open --limit 100 --json number,title --jq ".[] | select(.title == \"$issue_title\") | .number" | head -1)
           cat > body.md <<BODY
-          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and $reason. The AI (\`${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}\` via Aider) $did. The result passed the static checks and a full image build, Player APK check, smoke test and boot test.
+          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and $reason. The AI (\`${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}\` via Aider) $did. The result passed the static checks and a full image build, Player APK check, smoke test and boot test.
 
           This PR is merged automatically, which starts the publishing build. \`:latest\` only updates if that build passes too.
 

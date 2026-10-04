@@ -13,7 +13,7 @@
 #   UPSTREAM_SHA=<sha> OPENROUTER_API_KEY=<key> [AI_MODEL=<m>] [APK=<id>] [CACHE_BUST=<t>] \
 #       scripts/ai_fix_drift.sh <patched-checkout> <overlay-checkout>
 #
-# The AI (Aider on an OpenRouter model, Gemini 2.5 Pro by default) sees the failing check's
+# The AI (Aider on an OpenRouter model, GLM 5.3 Flash by default) sees the failing check's
 # log and AGENTS.md as read-only context and may edit only the patch's files. Every edit is
 # verified to stay in that set and to carry no API key, amended into the patch commit, then
 # re-checked against the WHOLE gauntlet (not just the stage that failed) — the same bar as a
@@ -37,7 +37,7 @@ overlay_arg=${2:?usage: ai_fix_drift.sh <patched-checkout> <overlay-checkout>}
 base=${UPSTREAM_SHA:?set UPSTREAM_SHA to the upstream commit the patches were applied to}
 : "${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY}"
 root=$(cd "$(dirname "$0")/.." && pwd)
-model=${AI_MODEL:-openrouter/google/gemini-2.5-pro}
+model=${AI_MODEL:-openrouter/z-ai/glm-5.3-flash}
 max_passes=3
 
 work=$PWD

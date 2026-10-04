@@ -18,13 +18,13 @@ jobs:
       - name: Call AI_MODEL through OpenRouter with the resolver's key
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/google/gemini-2.5-pro' }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
         run: |
           [ -n "$OPENROUTER_API_KEY" ] || { echo "::error::OPENROUTER_API_KEY secret is not set"; exit 1; }
           # Aider routes with an "openrouter/" prefix; the raw API wants just the model id.
           model="${AI_MODEL#openrouter/}"
           echo "Testing model '$model' under this account's OpenRouter data policies..."
-          # Generous max_tokens: reasoning models (e.g. Gemini 2.5 Pro) spend tokens
+          # Generous max_tokens: reasoning models (e.g. GLM 5.3 Flash) spend tokens
           # thinking before any visible content, so a tiny budget yields empty content.
           code=$(curl -sS -o resp.json -w '%{http_code}' https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer $OPENROUTER_API_KEY" \
