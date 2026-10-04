@@ -14,7 +14,10 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
+import subprocess
+import threading
 import time
 from urllib.parse import quote
 
@@ -78,9 +81,15 @@ CONFIG_FIELD = ConfigField(
     'use_dai', 'Use DirecTV ad insertion (DAI)',
     field_type='toggle', default='false',
     help_text=(
-        'On = play the stream DirecTV\'s own apps use, with DirecTV\'s '
-        'local ads in commercial breaks. Off = the national feed '
-        'without DirecTV\'s inserted ads.'
+        'On = play the stream DirecTV\'s own apps use, with DirecTV\'s local '
+        'ads in commercial breaks. Off = the national feed without DirecTV\'s '
+        'inserted ads. Requires the AH4C bridge (an Android device) — it '
+        'does not work with Prismcast, which has no Android device to read. '
+        'Turning this on captures each bridge device\'s advertising ID: a Fire '
+        'TV is read silently; a Google TV box briefly shows its Ads settings '
+        'screen for a few seconds while it\'s read, and is skipped if it\'s '
+        'playing. The ID is saved and reused. When you add a new box later, a '
+        '"Capture advertising IDs" button appears to pull its ID.'
     ),
 )
 
@@ -148,10 +157,15 @@ def cached_url_usable(cached: dict | None, dai: bool) -> bool:
     if bool(cached.get('dai')) != dai or ('yospace.com' in url and 'yospace.pool=' not in url):
         return False
     if dai and 'yospace.com' in url:
-        fw_did = device_ad_flags(dtv_android._client_device()).get('_fw_did')
+        fw_did = _current_device_ad_flags().get('_fw_did')
         if fw_did:
             return f'_fw_did={quote(fw_did, safe=",:~")}' in url
-        return '_fw_did=android_id:' not in url
+        # Not a bridge device (e.g. Channels playing the URL itself): reuse only a session
+        # not pinned to a specific device. Reject a cached android_id OR a real advertising
+        # id; the shared google_advertising_id:optout form is fine (a non-bridge requester
+        # produces that itself from the account's consent).
+        return ('_fw_did=android_id:' not in url
+                and not re.search(r'_fw_did=google_advertising_id:(?!optout)', url))
     return True
 
 
@@ -191,9 +205,11 @@ def build_query(config: dict, dai_channel_names: dict, ccid: str) -> dict:
         q['bZipCode'] = zip_code
 
     # The ad id, is_lat and comscore_device come from the playback device, the way
-    # DirecTV's Android TV app sets them (see device_ad_flags). Without is_lat=0
-    # the ad server sends national spots only (no local or political ads).
-    device = device_ad_flags(dtv_android._client_device())
+    # DirecTV's Android TV app sets them (see device_ad_flags), using the device's
+    # captured real advertising id. Without is_lat=0 the ad server sends national spots
+    # only (no local or political ads). This only reads the captured id; capture itself
+    # is explicit (DAI toggle-on or the admin button), never triggered by a tune.
+    device = _current_device_ad_flags()
     if device:
         q.update(device)
     else:
@@ -212,27 +228,357 @@ def build_query(config: dict, dai_channel_names: dict, ccid: str) -> dict:
     return q
 
 
-def device_ad_flags(props: dict) -> dict:
-    """The device ad flags, the same way on every Android TV device (Fire TV,
-    Google TV, Shield):
-    - comscore_device = <systemName>_<Build.MANUFACTURER>_<Build.MODEL>, whitespace
-      removed, as the Android TV app builds it (universalYospaceParameters);
-      systemName is "Android".
-    - _fw_did=android_id:<Android ID> with is_lat=0. DirecTV's own prefix for an
-      Android device id; every Android TV device exposes the Android ID over adb.
-      (The app sends the platform advertising id instead, which a Google TV/Shield
-      only exposes through Play services; to treat every device alike, no device
-      uses its advertising id.) is_lat=0 is what gets local and political ads.
-    - A device that limits ad tracking (Fire OS limit_ad_tracking=1) gets the
-      app's opted-out form: google_advertising_id:optout, adid=optout, is_lat=1."""
+def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
+    """The device ad flags the DirecTV Android TV app sends, built from this bridge
+    device's own values. Priority, matching the app:
+    - The device's real platform advertising id, when one was captured for it
+      (``ad_id`` from capture_registered_devices): google_advertising_id:<id> +
+      adid=<id> with is_lat=0 — exactly what the app sends. is_lat=0 is what
+      gets local and political ads.
+    - Its opted-out form when that advertising id was deleted/limited (``ad_id``
+      optout, or Fire OS limit_ad_tracking=1): google_advertising_id:optout,
+      adid=optout, is_lat=1.
+    - Absolute last resort, when no advertising id can be read: _fw_did=android_id:
+      <Android ID> with is_lat=0. DirecTV's own prefix for an Android device id,
+      which every Android device exposes over adb. We never invent a value.
+    comscore_device = Android_<Build.MANUFACTURER>_<Build.MODEL>, whitespace removed,
+    as the app builds it (universalYospaceParameters)."""
     if not props:
         return {}
     flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{props.get('manufacturer', '')}_{props.get('model', '')}")}
-    if props.get('limit_ad_tracking') == '1':
+    gaid = ((ad_id or {}).get('advertising_id') or '').strip()
+    # An all-zero id is Android's "deleted / limited" sentinel, never a real id: treat
+    # it as opt-out, and never send it as an advertising id.
+    optout = bool((ad_id or {}).get('optout')) or gaid == _ZERO_GAID
+    if gaid == _ZERO_GAID:
+        gaid = ''
+    if gaid and not optout:
+        flags.update({'is_lat': '0', '_fw_did': f'google_advertising_id:{gaid}', 'adid': gaid})
+    elif optout or props.get('limit_ad_tracking') == '1':
         flags.update({'is_lat': '1', '_fw_did': 'google_advertising_id:optout', 'adid': 'optout'})
     elif len(props.get('android_id', '')) >= 8:
         flags.update({'is_lat': '0', '_fw_did': f"android_id:{props['android_id']}"})
     return flags
+
+
+# ── Device advertising-id capture (DAI) ────────────────────────────────────────
+#
+# The Android TV app sends the playback device's real platform advertising id
+# (google_advertising_id:<id> + adid) with is_lat from the device's own ad-tracking
+# choice. We match that per bridge device, read the way each platform exposes it:
+#   - Fire OS mirrors it into Settings.Secure, so `settings get secure advertising_id`
+#     reads it silently (most bridge sticks are Fire TV).
+#   - GMS (Google TV / plain Android with Play Services) locks the id to an app
+#     process: there is no settings mirror, and a shell cannot bind the GMS service
+#     (ActivityManager refuses a non-app caller). The only root-free read is the
+#     device's own Ads settings screen — open it, read the id off the view
+#     hierarchy (uiautomator), restore. That briefly shows the screen on the box
+#     (~3s), so it is done ONCE.
+#   - Anything else: no advertising id is read, and device_ad_flags keeps android_id.
+#
+# Captured per device and reused from directv_dai_adids.json; NEVER re-read on a schedule
+# (that would flash every Google TV box) and NEVER at a tune (that would interrupt the
+# tuning box). Capture runs only from an explicit action: clear_cache_if_toggled (DAI
+# turned on, or a DirecTV config save while DAI is on, captures the uncaptured boxes) and
+# the admin "Capture advertising IDs" button; a box that is playing is skipped. To force a
+# fresh capture of all boxes, toggle DAI off and on.
+
+_ZERO_GAID = '00000000-0000-0000-0000-000000000000'
+_GAID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE)
+_ADS_ACTION = 'com.google.android.gms.settings.ADS_PRIVACY'
+
+# Robust on-device GMS capture: wake, leave the screensaver, open the Ads screen, then
+# read the id off a FRESH uiautomator dump each pass (a stale /sdcard/ui.xml is removed
+# first, so a dump that silently fails can never be read as the screen). "active" is
+# decided by a real, non-zero advertising id being present (locale-independent); "deleted"
+# by the Ads screen showing with no real id. Restores HOME. Prints STATE and GAID. The
+# flash stays ~3s because it breaks the instant the screen is readable.
+_GMS_CAPTURE_SH = r'''
+ZERO=00000000-0000-0000-0000-000000000000
+UUID='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+input keyevent KEYCODE_WAKEUP
+input keyevent KEYCODE_HOME
+am start -a com.google.android.gms.settings.ADS_PRIVACY >/dev/null 2>&1
+got=""; state=""; j=0
+while [ $j -lt 12 ]; do
+  sleep 0.3
+  rm -f /sdcard/ui.xml 2>/dev/null
+  uiautomator dump /sdcard/ui.xml >/dev/null 2>&1
+  [ -f /sdcard/ui.xml ] || { j=$((j+1)); continue; }
+  got=$(grep -oE "$UUID" /sdcard/ui.xml 2>/dev/null | head -1)
+  if [ -n "$got" ] && [ "$got" != "$ZERO" ]; then
+    state=active; break
+  fi
+  if grep -q "advertising ID" /sdcard/ui.xml 2>/dev/null; then
+    state=deleted; got=""; break
+  fi
+  got=""
+  j=$((j+1))
+done
+input keyevent KEYCODE_HOME
+echo "STATE=$state"
+echo "GAID=$got"
+'''
+
+_adid_lock = threading.Lock()
+_adid_inflight: set[str] = set()
+# Addresses last tried with no readable id (adb unreachable, or a non-English deleted
+# screen): kept out of "uncaptured" for a while so the capture button doesn't nag
+# forever, then retried. In memory, so a restart retries once.
+_adid_tried: dict[str, float] = {}
+_ADID_TRIED_TTL = 6 * 3600
+
+
+def _adids_file() -> str:
+    """directv_dai_adids.json, beside the device store. Kept separate from
+    dtv_android's device-identity store so that store's hourly re-read can never
+    clobber a captured id (and so no advertising-id logic lives in dtv_android)."""
+    return os.path.join(os.path.dirname(dtv_android._devices_file()), 'directv_dai_adids.json')
+
+
+def _saved_adids() -> dict:
+    try:
+        with open(_adids_file(), encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_adids(adids: dict) -> None:
+    path = _adids_file()
+    # Unique temp name per process+thread so two concurrent captures can't interleave
+    # into the same temp file before the atomic os.replace.
+    tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(adids, f)
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.debug('[directv-dai] could not save advertising ids: %s', exc)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _store_adid(address: str, entry: dict) -> bool:
+    """Merge one device's captured id into the store under the lock (read-modify-write, so
+    concurrent captures can't clobber each other's entry). Returns True if it actually
+    changed, ignoring the capture timestamp."""
+    keys = ('advertising_id', 'optout', 'source')
+    with _adid_lock:
+        adids = _saved_adids()
+        prev = adids.get(address)
+        changed = not prev or any(prev.get(k) != entry.get(k) for k in keys)
+        adids[address] = entry
+        _save_adids(adids)
+    return changed
+
+
+def _adb_shell(address: str, shell_cmd: str, timeout: int = 20) -> str:
+    """Run one adb shell command on a bridge device; '' on any failure."""
+    try:
+        subprocess.run(['adb', 'connect', address], capture_output=True, timeout=8)
+        r = subprocess.run(['adb', '-s', address, 'shell', shell_cmd],
+                           capture_output=True, text=True, timeout=timeout)
+        return r.stdout or ''
+    except Exception as exc:
+        logger.debug('[directv-dai] adb command failed for %s: %s', address, exc)
+        return ''
+
+
+# Sentinel: the GMS screen read was skipped because the box is playing (defer, don't
+# interrupt). Distinct from None (no advertising id) so callers can report it.
+_PLAYING = object()
+
+
+def _is_playing(address: str) -> bool:
+    """True when the box is actively playing audio/video, so the GMS screen capture must
+    not run (it would interrupt playback). A box asleep or on its screensaver is not
+    playing. Signals: a media session in the PLAYING state, or an actively started media
+    audio player. Fail-safe is to NOT capture: on any doubt here, treat as playing."""
+    out = _adb_shell(address, 'dumpsys power 2>/dev/null | grep mWakefulness; echo ---; '
+                              'dumpsys media_session 2>/dev/null; echo ---; '
+                              'dumpsys audio 2>/dev/null', timeout=12)
+    if not out:
+        return True  # couldn't tell -> don't risk interrupting
+    power, _, rest = out.partition('---')
+    if 'Dreaming' in power or 'Asleep' in power or 'Dozing' in power:
+        return False  # screensaver / asleep: safe to capture
+    media_session, _, audio = rest.partition('---')
+    if 'state=PlaybackState {state=3' in media_session:  # PlaybackState.STATE_PLAYING
+        return True
+    # Any actively started audio player means something is playing. On a bridge box that
+    # only ever runs the stream, treat ANY started player (not just USAGE_MEDIA) as playing,
+    # so a muted or oddly-tagged stream can't slip through and get its screen interrupted.
+    if 'state:started' in audio:
+        return True
+    return False
+
+
+def _read_fire_advertising_id(address: str) -> dict | None:
+    """Fire OS (and any build that mirrors it): a silent Settings.Secure read."""
+    out = _adb_shell(address, 'echo A=$(settings get secure advertising_id); '
+                              'echo L=$(settings get secure limit_ad_tracking)')
+    aid = lat = ''
+    for ln in out.splitlines():
+        if ln.startswith('A='):
+            aid = ln[2:].strip().lower()
+        elif ln.startswith('L='):
+            lat = ln[2:].strip()
+    if not (_GAID_RE.fullmatch(aid) or aid == _ZERO_GAID):
+        return None
+    optout = aid == _ZERO_GAID or lat == '1'
+    return {'advertising_id': '' if optout else aid, 'optout': optout, 'source': 'fire'}
+
+
+def _read_gms_advertising_id(address: str):
+    """GMS (Google TV / plain Android with Play Services): read the id off the Ads settings
+    screen. Only attempted when that screen exists on the box. It briefly shows the screen
+    (~3s) and interrupts whatever the box is displaying, so it runs only from an explicit
+    action (DAI toggle-on or the admin capture button), never at tune time, and is GATED:
+    if the box is currently playing, it is skipped (returns the _PLAYING sentinel) so an
+    active stream is never interrupted. Returns a reading dict, None (no id), or _PLAYING."""
+    probe = _adb_shell(address, f'cmd package query-activities -a {_ADS_ACTION} 2>/dev/null')
+    if 'AdsSettingsActivity' not in probe:
+        return None
+    if _is_playing(address):
+        logger.info('[directv-dai] skipped advertising-id capture for %s: box is playing', address)
+        return _PLAYING
+    b64 = base64.b64encode(_GMS_CAPTURE_SH.encode()).decode()
+    out = _adb_shell(address, f'echo {b64} | base64 -d > /data/local/tmp/dai_cap.sh; '
+                              'sh /data/local/tmp/dai_cap.sh; rm -f /data/local/tmp/dai_cap.sh',
+                     timeout=45)
+    state = gaid = ''
+    for ln in out.splitlines():
+        if ln.startswith('STATE='):
+            state = ln[6:].strip()
+        elif ln.startswith('GAID='):
+            gaid = ln[5:].strip().lower()
+    if state == 'active' and _GAID_RE.fullmatch(gaid) and gaid != _ZERO_GAID:
+        return {'advertising_id': gaid, 'optout': False, 'source': 'gms'}
+    if state == 'deleted':
+        return {'advertising_id': '', 'optout': True, 'source': 'gms'}
+    return None
+
+
+def _capture_one(address: str):
+    """This bridge device's real advertising id + opt-out, trying each platform's own
+    channel in turn. Returns a reading dict, None (no id -> keep android_id), or the
+    _PLAYING sentinel (GMS read skipped because the box is in use). The silent Fire read
+    is never gated; only the GMS screen read is."""
+    return _read_fire_advertising_id(address) or _read_gms_advertising_id(address)
+
+
+def _capture_and_store(address: str) -> str:
+    """Capture one device and persist it, under the single-flight guard so the same box is
+    never captured twice at once (a batch and a button press can't double-run it). Returns
+    'captured', 'playing' (skipped, box in use), or 'none' (no advertising id readable)."""
+    if not address:
+        return 'none'
+    with _adid_lock:
+        if address in _adid_inflight:
+            return 'none'
+        _adid_inflight.add(address)
+    try:
+        res = _capture_one(address)
+        if res is _PLAYING:
+            return 'playing'   # still pending: keep it, re-run when idle
+        if res is None:
+            with _adid_lock:
+                _adid_tried[address] = time.time()   # nothing readable: stop nagging a while
+            return 'none'
+        entry = {'advertising_id': res['advertising_id'], 'optout': res['optout'],
+                 'source': res['source'], 'captured_at': int(time.time())}
+        if _store_adid(address, entry):
+            logger.info('[directv-dai] captured advertising id for %s (%s, %s)',
+                        address, res['source'], 'optout' if res['optout'] else 'present')
+        with _adid_lock:
+            _adid_tried.pop(address, None)
+        return 'captured'
+    finally:
+        with _adid_lock:
+            _adid_inflight.discard(address)
+
+
+def _bridge_addresses() -> list[str]:
+    try:
+        from .. import bridge_devices
+        return [d['address'] for d in bridge_devices.known_devices()[0] if d.get('address')]
+    except Exception as exc:
+        logger.debug('[directv-dai] could not list bridge devices: %s', exc)
+        return []
+
+
+def capture_registered_devices(addresses: list[str] | None = None) -> dict:
+    """Capture + persist the advertising id for every registered bridge device (or the
+    given ones), serially. Returns counts {'captured', 'playing', 'none'}. Runs ONLY from
+    an explicit action (DAI toggle-on, or the admin capture button) — never on a schedule
+    and never at tune time. Must run inside a Flask app context (device list + store)."""
+    addrs = addresses if addresses is not None else _bridge_addresses()
+    counts = {'captured': 0, 'playing': 0, 'none': 0}
+    for addr in addrs:
+        counts[_capture_and_store(addr)] += 1
+    return counts
+
+
+def capture_in_background(addresses: list[str] | None = None) -> int:
+    """Run capture_registered_devices in a daemon thread, carrying the current Flask app
+    context into it (the thread needs one for the DB-backed device list and the store
+    path). Resolves the device list in the calling request thread. Returns how many
+    devices it will visit."""
+    try:
+        from flask import current_app
+        app = current_app._get_current_object()
+    except Exception:
+        app = None
+    if addresses is None:
+        addresses = _bridge_addresses()
+    addresses = list(addresses or [])
+    if not addresses:
+        return 0
+
+    def _run():
+        try:
+            if app is not None:
+                with app.app_context():
+                    capture_registered_devices(addresses)
+            else:
+                capture_registered_devices(addresses)
+        except Exception as exc:
+            logger.warning('[directv-dai] background capture failed: %s', exc)
+    threading.Thread(target=_run, daemon=True).start()
+    return len(addresses)
+
+
+def uncaptured_addresses() -> list[str]:
+    """Registered bridge devices with no captured advertising id yet (new boxes), used to
+    show the admin capture button only when there is something to capture. Excludes a box
+    we recently tried and couldn't read (unreachable / non-English deleted) so the button
+    doesn't nag forever; it reappears after _ADID_TRIED_TTL. Needs an app context."""
+    saved = _saved_adids()
+    now = time.time()
+    with _adid_lock:
+        recent = {a for a, t in _adid_tried.items() if now - t < _ADID_TRIED_TTL}
+    return [a for a in _bridge_addresses() if a and a not in saved and a not in recent]
+
+
+def _current_bridge_address() -> str | None:
+    try:
+        from flask import has_request_context, request
+        ip = (request.remote_addr or '').strip() if has_request_context() else ''
+    except Exception:
+        ip = ''
+    return dtv_android._bridge_address(ip) if ip else None
+
+
+def _current_device_ad_flags() -> dict:
+    """device_ad_flags for the bridge device making the current request, using the
+    advertising id captured for it earlier. Reads the store only — a tune NEVER triggers a
+    capture (capture is explicit: DAI toggle-on or the admin button)."""
+    address = _current_bridge_address()
+    return device_ad_flags(dtv_android._client_device(), _saved_adids().get(address or ''))
 
 
 _ZIP_CACHE: dict[str, str] = {}
@@ -462,6 +808,15 @@ def _find_first_key(obj, key):
 def clear_cache_if_toggled(source, old: dict, current: dict) -> None:
     """The toggle picks which stream URL resolve() caches (for 55 minutes), so
     drop every cached one when it changes; the next tune fetches under the new setting."""
-    if getattr(source, 'name', None) == 'directv' and enabled(old) != enabled(current):
+    if getattr(source, 'name', None) != 'directv':
+        return
+    if enabled(old) != enabled(current):
         from ..config_store import persist_source_cache_updates
         persist_source_cache_updates(source.id, {'directv_playback': {}})
+    if enabled(current):
+        # Whenever DAI is on, capture the advertising id of any bridge device that doesn't
+        # have one yet: all of them right after turning DAI on, or a newly-added box on a
+        # later save. Background, skipping any box that's currently playing. This save-time
+        # pass is the ONLY automatic trigger -- a tune never captures (no new upstream hook,
+        # and a Google TV box is never interrupted mid-stream).
+        capture_in_background(uncaptured_addresses())

@@ -258,11 +258,21 @@ assert query.get('attnid') == 'dfw003' and query.get('p') == 'dfw', 'DirecTV app
 assert query.get('metr') == '1071', "metr must be DirecTV's TV device-class code"
 assert 'comscore_device' not in query, 'comscore_device only comes from a real bridge device'
 
-# A bridge device's own values take over from the account consent, the same way on
-# every device: android_id:<Android ID> + is_lat=0 (no platform advertising id on any
-# device), comscore_device as the app builds it; limited tracking gets the optout form.
+# A bridge device's own values take over from the account consent. We send the real
+# platform advertising id the app sends, captured per device: google_advertising_id:<id>
+# + adid with is_lat=0. A deleted/limited id gives the app's optout form. android_id is
+# the absolute last resort when no advertising id can be read. comscore_device as the app
+# builds it; comscore_device never carries whitespace.
 fire = {'manufacturer': 'Amazon', 'model': 'AFTKRT', 'board': 'karat', 'release': '11',
         'limit_ad_tracking': '0', 'android_id': 'abcdef0123456789'}
+_cap = {'advertising_id': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', 'optout': False}
+assert dai.device_ad_flags(fire, _cap) == {'comscore_device': 'Android_Amazon_AFTKRT', 'is_lat': '0',
+    '_fw_did': 'google_advertising_id:bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f',
+    'adid': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f'}
+assert dai.device_ad_flags(fire, {'advertising_id': '', 'optout': True})['_fw_did'] == 'google_advertising_id:optout'
+assert dai.device_ad_flags(fire, {'advertising_id': '00000000-0000-0000-0000-000000000000', 'optout': False}
+    )['_fw_did'] == 'google_advertising_id:optout', 'an all-zero (deleted) id is the optout form, never sent as an id'
+# No captured advertising id -> android_id last resort; limited tracking -> optout form.
 assert dai.device_ad_flags(fire) == {'comscore_device': 'Android_Amazon_AFTKRT', 'is_lat': '0',
     '_fw_did': 'android_id:abcdef0123456789'}
 assert dai.device_ad_flags({**fire, 'limit_ad_tracking': '1'})['_fw_did'] == 'google_advertising_id:optout'
@@ -270,7 +280,61 @@ shield = {'manufacturer': 'NVIDIA', 'model': 'SHIELD Android TV', 'android_id': 
 assert dai.device_ad_flags(shield) == {'comscore_device': 'Android_NVIDIA_SHIELDAndroidTV', 'is_lat': '0',
     '_fw_did': 'android_id:abcdef0123456789'}
 assert dai.device_ad_flags({}) == {}
-assert 'advertising_id' not in dict(dtv_android._DEVICE_PROPS), 'no device reads a platform advertising id'
+assert 'advertising_id' not in dict(dtv_android._DEVICE_PROPS), \
+    'the portable identity read (dtv_android) never reads an advertising id; capture lives in directv_dai'
+
+# Advertising-id capture, with adb mocked: Fire reads the id silently from settings;
+# GMS (Ads activity present, box idle) reads it off the Ads screen; a playing box is
+# skipped (the _PLAYING sentinel, never interrupted); neither yields -> None, so
+# device_ad_flags keeps android_id. A deleted id captures as the optout form.
+_real_adb = dai._adb_shell
+_real_is_playing = dai._is_playing
+dai._is_playing = lambda a: False
+dai._adb_shell = lambda addr, cmd, timeout=20: 'A=BB650B6A-5432-4DD2-9C0D-C0E4D9F7127F\nL=0\n' if 'advertising_id' in cmd else ''
+assert dai._read_fire_advertising_id('x') == {
+    'advertising_id': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', 'optout': False, 'source': 'fire'}, \
+    'a Fire id is normalized to lowercase'
+dai._adb_shell = lambda addr, cmd, timeout=20: 'A=null\nL=1\n' if 'advertising_id' in cmd else ''
+assert dai._read_fire_advertising_id('x') is None, 'a null settings id is not a Fire read'
+
+
+def _gms_adb(addr, cmd, timeout=20):
+    if 'advertising_id' in cmd:
+        return 'A=null\nL=null\n'            # no settings mirror -> not Fire
+    if 'query-activities' in cmd:
+        return 'com.google.android.gms/.adid.settings.AdsSettingsActivity'
+    return 'STATE=active\nGAID=bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f\n'
+
+
+dai._adb_shell = _gms_adb
+assert dai._capture_one('x') == {
+    'advertising_id': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', 'optout': False, 'source': 'gms'}
+dai._is_playing = lambda a: True   # a playing box is skipped, never interrupted
+assert dai._capture_one('x') is dai._PLAYING, 'a playing box must be skipped, not captured'
+dai._is_playing = lambda a: False
+dai._adb_shell = lambda addr, cmd, timeout=20: ('A=null\nL=null\n' if 'advertising_id' in cmd
+    else 'AdsSettingsActivity' if 'query-activities' in cmd else 'STATE=deleted\nGAID=\n')
+assert dai._capture_one('x') == {'advertising_id': '', 'optout': True, 'source': 'gms'}
+dai._adb_shell = lambda addr, cmd, timeout=20: ''   # nothing readable -> android_id fallback
+assert dai._capture_one('x') is None
+dai._adb_shell = _real_adb
+dai._is_playing = _real_is_playing
+
+# The playback gate itself (real parser, adb mocked): a playing box is detected (a PLAYING
+# media session or any started audio player), an idle/screensaver box is not, and an
+# unreadable box fails safe to "playing" so a stream is never risked.
+_real_adb2 = dai._adb_shell
+dai._adb_shell = lambda a, c, timeout=12: 'mWakefulness=Awake\n---\nstate=PlaybackState {state=3, position=1}\n---\n'
+assert dai._is_playing('x') is True, 'a PLAYING media session means playing'
+dai._adb_shell = lambda a, c, timeout=12: 'mWakefulness=Awake\n---\n(none)\n---\nAudioPlaybackConfiguration piid:9 state:started usage=USAGE_MEDIA\n'
+assert dai._is_playing('x') is True, 'a started audio player means playing'
+dai._adb_shell = lambda a, c, timeout=12: 'mWakefulness=Dreaming\n---\n---\n'
+assert dai._is_playing('x') is False, 'the screensaver is idle'
+dai._adb_shell = lambda a, c, timeout=12: 'mWakefulness=Awake\n---\nstate=PlaybackState {state=2}\n---\nAudioPlaybackConfiguration piid:9 state:idle usage=USAGE_MEDIA\n'
+assert dai._is_playing('x') is False, 'awake with nothing started/playing is idle'
+dai._adb_shell = lambda a, c, timeout=12: ''
+assert dai._is_playing('x') is True, 'unreadable fails safe to playing (never interrupt)'
+dai._adb_shell = _real_adb2
 real_client_device = dtv_android._client_device
 dtv_android._client_device = lambda: fire
 dev = dai.build_query(config, {}, '123')
@@ -280,6 +344,17 @@ dev_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8?yo.up=
 assert dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True)
 dtv_android._client_device = lambda: {**fire, 'android_id': 'ffffffffffffffff'}
 assert not dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True), 'another device reused a session'
+# A non-bridge requester (no bridge device -> fw_did is None) must not reuse a session
+# pinned to a real advertising id; the shared optout session stays reusable.
+dtv_android._client_device = lambda: {}
+_gaid_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8'},
+    {'_fw_did': 'google_advertising_id:bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f'})
+assert not dai.cached_url_usable({'fallback_url': _gaid_url, 'dai': True}, True), \
+    "a non-bridge requester must not reuse another device's real-GAID session"
+_optout_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8'},
+    {'_fw_did': 'google_advertising_id:optout'})
+assert dai.cached_url_usable({'fallback_url': _optout_url, 'dai': True}, True), \
+    'the shared optout session is reusable by a non-bridge requester'
 dtv_android._client_device = real_client_device
 
 # Sessions always use a device's saved values (a stable identity). A new device is
