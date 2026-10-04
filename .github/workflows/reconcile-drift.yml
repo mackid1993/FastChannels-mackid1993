@@ -1,0 +1,92 @@
+name: Reconcile held drift fixes
+
+# The hands-off merger. The development watcher (upstream-watch.yml) has the agent prepare
+# fixes for upstream drift as HELD pull requests (branch auto/drift-*). This workflow is what
+# merges them FOR you — you never touch a PR.
+#
+# Every 6 hours (and on demand), for each held drift PR it re-tests that PR's patch against the
+# CURRENT upstream main. The moment a prepared fix is proven correct for production main, it
+# merges the PR and kicks the publish build — which re-runs the full gauntlet (image, smoke,
+# boot) before anything reaches :latest, so a wrong fix can never be published. Fixes that
+# aren't yet valid against main (his release hasn't caught up to that development change) are
+# left held and retried next cycle.
+#
+# It merges at most one PR per run (the next run takes the next), and shares build.yml's
+# concurrency group so it can never race a publish.
+
+on:
+  schedule:
+    - cron: "45 */6 * * *"   # every 6h, offset from the build + development watchers
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: kineticman/FastChannels
+  UPSTREAM_BRANCH: main
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v5
+        with:
+          path: overlay
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Merge any held fix that's now valid against main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)
+          [ -n "$sha" ] || { echo "::error::could not read upstream $UPSTREAM_BRANCH"; exit 1; }
+          echo "Upstream $UPSTREAM_BRANCH HEAD: $sha"
+
+          mapfile -t held < <(gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,headRefName --jq '.[] | select(.headRefName | startswith("auto/drift-")) | "\(.number) \(.headRefName)"')
+          if [ "${#held[@]}" -eq 0 ]; then
+            echo "No held drift PRs to reconcile."
+            exit 0
+          fi
+          echo "Held drift PRs: ${held[*]}"
+
+          pip install --quiet ruff jinja2
+          git -C overlay fetch -q origin
+
+          for entry in "${held[@]}"; do
+            num=${entry%% *}; branch=${entry#* }
+            echo "::group::Testing PR #$num ($branch) against main $sha"
+            # Use this PR's patches/ instead of main's, then restore.
+            git -C overlay checkout -q "origin/$branch" -- patches
+            rm -rf up && git clone -q --branch "$UPSTREAM_BRANCH" "https://github.com/$UPSTREAM_REPO.git" up
+            git -C up checkout -q "$sha"
+            ok=true
+            UPSTREAM_SHA="$sha" overlay/scripts/apply-patches.sh up || ok=false
+            if [ "$ok" = true ]; then UPSTREAM_SHA="$sha" overlay/scripts/validate.sh up || ok=false; fi
+            git -C overlay checkout -q HEAD -- patches   # restore main's patches
+            echo "::endgroup::"
+            if [ "$ok" = true ]; then
+              echo "PR #$num is valid against main — merging and publishing (the publish build re-runs the full gauntlet)."
+              gh pr merge "$num" -R "$GITHUB_REPOSITORY" --squash --delete-branch
+              # Pushes with GITHUB_TOKEN don't trigger workflows, so kick the publish build.
+              gh workflow run build.yml --repo "$GITHUB_REPOSITORY"
+              echo "Merged PR #$num and started the publishing build; leaving any other held PRs for the next run."
+              exit 0
+            fi
+            echo "PR #$num is not yet valid against main (his release hasn't caught up); leaving it held."
+          done
+          echo "No held fix is valid against main yet; nothing merged."

@@ -1,23 +1,24 @@
 name: Upstream watch (development)
 
-# Early-warning radar for kineticman/FastChannels' DEVELOPMENT branch.
+# Watches kineticman/FastChannels' DEVELOPMENT branch so the AGENT fixes drift early —
+# you never touch anything.
 #
-# GitHub can't notify us when a repo we don't own gets a push, so we poll every 6
-# hours. On a new development commit (deduped via the Actions cache, so each commit is
-# checked exactly once), apply the patches to it and run the static checks. This is
-# cheap and safe by construction: no image build, no OpenRouter/AI call, no PR, no
-# merge, no publish — it only reads development and runs validate.sh.
+# GitHub can't notify us of pushes to a repo we don't own, so we poll every 6 hours.
+# On a new development commit (deduped via the Actions cache, so the agent is invoked
+# at most once per commit), dispatch the build workflow in drift-check mode against
+# development:
 #
-# If the patch would conflict or fail a check against development, it opens an issue
-# that @mentions you and immediately closes it — an early-warning email that a fix
-# will be needed when this change reaches main. If the patch still applies and
-# validates, it stays silent.
+#     build.yml  upstream_branch=development  drift_only=true
 #
-# It deliberately does NOT try to fix or merge anything. The real fix is fully
-# automated on MAIN (build.yml): when the change lands on his release branch, the
-# build auto-fixes the patch (GLM 5.3 Flash), re-tests the full gauntlet, merges and
-# publishes — gated so a bad fix never reaches :latest. So this watcher can never
-# touch your image or leave you a PR to merge; it just tells you what's coming.
+# In that mode build.yml applies the patches to development and runs the static checks
+# (no image, no publish — it's a "test run"). If the patch drifts/conflicts, the GLM 5.3
+# Flash resolver adapts it and opens a HELD pull request (branch auto/drift-<short>)
+# labelled with the development commit it fixes. Nothing is built, published, or merged
+# here, so it can never touch :latest.
+#
+# The held PR is the agent's prepared fix. The reconcile workflow (reconcile-drift.yml)
+# then auto-merges it the moment it's proven correct against main, and publishes — all
+# hands-off. The notification on the PR is FYI only; there is never anything for you to do.
 
 on:
   schedule:
@@ -25,8 +26,8 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write              # to dispatch build.yml
   contents: read
-  issues: write
 
 concurrency:
   group: upstream-watch
@@ -45,76 +46,27 @@ jobs:
         run: |
           sha=$(git ls-remote "https://github.com/$UPSTREAM_REPO.git" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)
           [ -n "$sha" ] || { echo "::error::could not read upstream $UPSTREAM_BRANCH"; exit 1; }
-          { echo "sha=$sha"; echo "short=${sha:0:7}"; } >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Upstream $UPSTREAM_BRANCH HEAD: $sha"
 
-      - name: Already checked this commit?
+      - name: Already invoked the agent for this commit?
         id: seen
         uses: actions/cache@v4
         with:
           path: .dev-watch-marker
           key: dev-watch-v2-${{ steps.head.outputs.sha }}
 
-      - name: Check out this repo
+      - name: Dispatch a drift check against development (agent fixes on drift)
         if: steps.seen.outputs.cache-hit != 'true'
-        uses: actions/checkout@v5
-        with:
-          path: overlay
-
-      - name: Set up Python
-        if: steps.seen.outputs.cache-hit != 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Drift check against development (no AI, no image, no publish)
-        id: drift
-        if: steps.seen.outputs.cache-hit != 'true'
-        env:
-          UPSTREAM_SHA: ${{ steps.head.outputs.sha }}
-        run: |
-          git clone --branch "$UPSTREAM_BRANCH" "https://github.com/$UPSTREAM_REPO.git" upstream
-          git -C upstream checkout -q "${{ steps.head.outputs.sha }}"
-          if ! overlay/scripts/apply-patches.sh upstream; then
-            echo "result=conflict" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          pip install --quiet ruff jinja2
-          if ! overlay/scripts/validate.sh upstream; then
-            echo "result=drift" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          echo "result=clean" >> "$GITHUB_OUTPUT"
-          echo "No drift: the patch still applies and validates against development ${{ steps.head.outputs.short }}."
-
-      - name: Early-warning email on drift
-        if: steps.seen.outputs.cache-hit != 'true' && steps.drift.outputs.result != 'clean' && steps.drift.outputs.result != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ steps.drift.outputs.result }}" = conflict ]; then
-            what="no longer applies cleanly (a 3-way merge conflict)"
-          else
-            what="fails a static check (a hook or added module drifted)"
-          fi
-          cat > hu.md <<BODY
-          Heads up: upstream \`development\` moved to [\`${{ steps.head.outputs.short }}\`](https://github.com/$UPSTREAM_REPO/commit/${{ steps.head.outputs.sha }}) and the patch **$what** against it.
-
-          No action needed. When this change reaches \`main\`, the build auto-fixes the patch (GLM 5.3 Flash), re-tests the full gauntlet, merges and publishes on its own. This is just an early warning so a release never surprises you.
-
-          Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-          cc @${{ github.repository_owner }}
-          BODY
-          url=$(gh issue create --title "Upstream development drift incoming (${{ steps.head.outputs.short }})" --body-file hu.md)
-          echo "Opened early-warning: $url"
-          gh issue close "${url##*/}" --comment "Early-warning notification — closing (no action needed)."
-
-      - name: Mark this commit checked
-        # Only after the drift check actually ran, so a failed clone/setup is retried next poll.
-        if: steps.seen.outputs.cache-hit != 'true' && steps.drift.outcome == 'success'
-        run: |
+          echo "New $UPSTREAM_BRANCH commit ${{ steps.head.outputs.sha }} — running a drift check; the agent fixes it if it drifts."
+          gh workflow run build.yml --repo "$GITHUB_REPOSITORY" -f upstream_branch="$UPSTREAM_BRANCH" -f drift_only=true
+          # Mark seen only after a successful dispatch, so a failed dispatch is retried.
           mkdir -p .dev-watch-marker
           echo "${{ steps.head.outputs.sha }}" > .dev-watch-marker/sha
 
       - name: Nothing new
         if: steps.seen.outputs.cache-hit == 'true'
-        run: echo "development unchanged since the last check (${{ steps.head.outputs.sha }}); nothing to do."
+        run: echo "$UPSTREAM_BRANCH unchanged since the last check (${{ steps.head.outputs.sha }}); nothing to do."

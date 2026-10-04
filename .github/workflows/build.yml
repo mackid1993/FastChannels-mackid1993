@@ -646,16 +646,21 @@ jobs:
           git commit -q -m "$title (resolved by AI)"
           git push -f origin "$branch"
           issue=$(gh issue list --state open --limit 100 --json number,title --jq ".[] | select(.title == \"$issue_title\") | .number" | head -1)
+          if [ "$TEST_RUN" = true ]; then
+            title="Held fix: $title — auto-merges once valid against main"
+            merge_note="**Held — no action needed (FYI).** This is the agent's prepared fix for upstream *development*. The reconcile workflow auto-merges it the moment it is proven valid against \`main\`, then publishes — and a wrong fix can't reach \`:latest\` because that build re-runs every check. Nothing for you to do; this is just so you're aware."
+          else
+            merge_note="This PR is merged automatically, which starts the publishing build. \`:latest\` only updates if that build passes too."
+          fi
           cat > body.md <<BODY
           Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and $reason. The AI (\`${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}\` via Aider) $did. The result passed the static checks and a full image build, Player APK check, smoke test and boot test.
 
-          This PR is merged automatically, which starts the publishing build. \`:latest\` only updates if that build passes too.
+          $merge_note
 
           ${issue:+Refs #$issue}
 
           cc @${{ github.repository_owner }}
           BODY
-          [ "$TEST_RUN" != true ] || title="[test run, don't merge] $title"
           pr=$(gh pr list --head "$branch" --state open --json url --jq '.[0].url')
           [ -n "$pr" ] || pr=$(gh pr create --head "$branch" --base main --title "$title" --body-file body.md)
           echo "Opened $pr"
