@@ -116,11 +116,16 @@ Keep every hook correctly wired into upstream's CURRENT code. Rules, highest pri
    No wrapper, no new logic -- just make the old name resolve to real upstream code. This
    settles rule 2's "can't edit the test" against "don't restore old code": you keep one name
    reachable, pointing at real code.
-5. NEVER FABRICATE. Never create a module, function, class or file to stand in for missing
-   upstream code, and never write fake data or hardcode a value to satisfy a test. An alias
-   must point at REAL, existing upstream code. If a capability a hook needs is gone from
-   upstream entirely (confirm it is absent in upstream_index.txt), make no edit and say so --
-   do not invent a replacement.
+5. NEVER FABRICATE -- AND RECOGNIZE A REMOVED CAPABILITY. An alias must point at REAL, existing
+   upstream code; never create a module/function/file or write fake data to satisfy a test.
+   upstream_index.txt lists EVERY def/class in upstream's app/, so if a thing is not there, it
+   is not in upstream. To tell MOVED from REMOVED: the capability a hook needs is whatever a
+   test checks for (e.g. `known_devices` = a function whose source returns device entries with
+   `address` and `host`); a partial or single-purpose match (e.g. one device's adb address) is
+   NOT that capability. If nothing in the index provides it, it was REMOVED -- then make no edit
+   for that hook, state in ONE sentence which capability is gone, and do NOT re-implement,
+   synthesize, approximate, or keep retrying it. A removed dependency means the patch cannot
+   pass on this upstream; stopping and saying so (not a green build) is the correct result.
 6. Never add other non-hook code to an upstream file -- no stubs, no try/except around an
    import to swallow it, no deleted or no-op'd hooks. Your own modules you may change as needed.
 7. Minimal diff, valid Python, the patch still applies. No refactoring or reformatting.
