@@ -1,7 +1,7 @@
 """DirecTV DAI: attenuate inserted AAC ads a fixed amount, losslessly.
 
 The inserted-ad AAC twins (see dtv_aac_ads) play a few dB hotter than the
-AC-3 programming, so breaks blast. This drops every inserted
+stereo-downmixed AC-3 programming, so breaks blast. This drops every inserted
 ad's loudness by editing the AAC-LC ``global_gain`` field of every channel of
 every frame -- the same lossless lever mp3gain/aacgain use -- implemented here
 from the ISO/IEC 14496-3 bitstream syntax. 8 steps x 1.5 dB = -12 dB (calibrated to
