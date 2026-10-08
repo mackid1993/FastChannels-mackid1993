@@ -1,22 +1,22 @@
 name: Build patched image
 
 # Every 6 hours (and on a push to this repo's patches/scripts/workflow): take
-# kineticman/FastChannels' development branch as it is right now (the repo variable
-# UPSTREAM_BRANCH overrides it; set it to `main` to go back to his releases), apply the patches
+# kineticman/FastChannels' main branch (his releases) as it is right now, apply the patches
 # in patches/, validate, build, smoke-test and boot-test the image, then publish that tested
 # image to GHCR. Nothing is published unless every check passes, and the build-key dedup makes
 # a run a no-op when upstream, the patches and the Player APK are all unchanged — so this
-# builds + publishes promptly when his branch moves, not just weekly. Run it by hand
+# builds + publishes promptly when his main moves, not just weekly. Run it by hand
 # (Actions > Build patched image > Run workflow) for a build sooner.
 #
-# Production tracks development since 2026-10-08 (upstream merged the Android TV code
-# sign-in there first; the DAI patch builds on it). upstream-watch.yml's schedule is paused
-# while that's so, since this workflow already watches development.
+# The DEVELOPMENT branch is watched separately (upstream-watch.yml): it dispatches this
+# workflow in drift-check mode (drift_only=true, upstream_branch=development) to warn — and
+# prepare a GLM 5.3 Flash fix — ahead of a release, without ever building or publishing.
 
 on:
   schedule:
-    # Every 6 hours: build + publish when kineticman's tracked branch has a new commit;
-    # otherwise the build-key dedup turns the run into a no-op.
+    # Every 6 hours: build + publish when kineticman's main (his releases) has a new commit;
+    # otherwise the build-key dedup turns the run into a no-op. The development watcher
+    # (upstream-watch.yml) warns ahead of a release; this is the real build + publish.
     - cron: "0 */6 * * *"
   push:
     branches: [main]
@@ -54,7 +54,7 @@ permissions:
 
 env:
   UPSTREAM_REPO: ${{ inputs.upstream_repo || 'kineticman/FastChannels' }}
-  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || vars.UPSTREAM_BRANCH || 'development' }}
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
   # A test run (against another repo/branch) builds and checks but never publishes,
   # refreshes the patches, or files issues.
   TEST_RUN: ${{ (inputs.upstream_repo != '' || inputs.upstream_branch != '') && 'true' || 'false' }}
@@ -131,7 +131,18 @@ jobs:
 
       - name: Skip if this exact build already exists
         id: skip
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # The DAI patch builds on upstream's DirecTV code sign-in (directv_device_auth.py),
+          # merged into his development branch on 2026-10-08. Until his main carries it, a main
+          # build has nothing to build on, so wait quietly (no failure, no AI repair) instead
+          # of failing every run. Remove this once main has it.
+          if ! gh api "repos/$UPSTREAM_REPO/contents/app/scrapers/directv_device_auth.py?ref=${{ steps.inputs.outputs.sha }}" --silent 2>/dev/null; then
+            echo "::notice::Upstream $UPSTREAM_BRANCH ${{ steps.inputs.outputs.short }} doesn't have the DirecTV code sign-in yet (app/scrapers/directv_device_auth.py); waiting for his release. :latest stays on the last good build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "${{ inputs.force }}" != "true" ] && [ "${{ steps.inputs.outputs.drift }}" != "true" ] && docker buildx imagetools inspect "$IMAGE:build-${{ steps.inputs.outputs.key }}" >/dev/null 2>&1; then
             echo "Already built: upstream ${{ steps.inputs.outputs.short }}, APK ${{ steps.inputs.outputs.apk_tag }}, same patches."
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -205,7 +216,7 @@ jobs:
           tags: fastchannels:ci
           labels: |
             org.opencontainers.image.title=FastChannels (mackid1993)
-            org.opencontainers.image.description=kineticman/FastChannels ${{ env.UPSTREAM_BRANCH }} plus the DirecTV DAI patch
+            org.opencontainers.image.description=kineticman/FastChannels main (releases) plus the DirecTV DAI patch
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ steps.inputs.outputs.sha }}
             fastchannels.player-apk=${{ steps.inputs.outputs.apk_tag }}

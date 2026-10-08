@@ -4,7 +4,7 @@ Background for any AI agent working in this repo, including the AI step CI runs 
 
 ## What this repo is
 
-A patch overlay, not a fork. It builds [kineticman/FastChannels](https://github.com/kineticman/FastChannels) (branch `development` since 2026-10-08, set by the repo variable `UPSTREAM_BRANCH`, default `development`; `main`, his releases, before that) plus the patches in `patches/`, and publishes the result to `ghcr.io/mackid1993/fastchannels-mackid1993`. Upstream's code never lives here; CI clones it fresh for every build.
+A patch overlay, not a fork. It builds [kineticman/FastChannels](https://github.com/kineticman/FastChannels) (branch `main`, where his releases come from; one manual `development` build was published as `:latest` on 2026-10-08, and `main` builds skip quietly until his `main` has `app/scrapers/directv_device_auth.py`) plus the patches in `patches/`, and publishes the result to `ghcr.io/mackid1993/fastchannels-mackid1993`. Upstream's code never lives here; CI clones it fresh for every build.
 
 ```
 patches/            the changes applied on top of upstream, as `git format-patch` files
@@ -26,7 +26,7 @@ archive/            frozen old versions, never applied (the pre-2026-10-08 Andro
 
 Every 6 hours, on a manual run, or on a push to `patches/`, `scripts/` or the build workflow, the build job runs these steps — building and publishing only when there's a real change:
 
-1. Read the tracked upstream branch's newest commit and the newest Player APK release. Skip if that exact combination with these patches was already built.
+1. Read upstream `main`'s newest commit and the newest Player APK release. Skip if that exact combination with these patches was already built.
 2. `git am --3way` the patches onto a fresh upstream checkout.
 3. Static checks: compile, no new ruff error-class findings, templates parse, the DAI module and every hook are present.
 4. Build the image (bundles the latest Player APK from kineticman's releases) and confirm the APK is inside.
@@ -45,7 +45,12 @@ If either path can't produce a passing fix, `ai-failed` comments on the matching
 
 ## Watching upstream development (early fixes) + reconcile
 
-**Paused while production tracks `development`.** `upstream-watch.yml` normally polls kineticman's `development` every 6 hours and dispatches `build.yml` in drift-check test mode there. If the patch drifts, the AI prepares a **held** PR (`auto/drift-*`), and `reconcile-drift.yml` adopts that PR once it's valid against the production branch. Since 2026-10-08 production builds from `development` itself, so the watch's schedule is commented out. To go back to `main`, set `UPSTREAM_BRANCH=main` and restore the schedule. `reconcile-drift.yml` follows `UPSTREAM_BRANCH` too.
+Two more workflows keep the whole thing hands-off by fixing drift *before* it reaches a release:
+
+- **`upstream-watch.yml`** polls kineticman's `development` branch every 6 hours. On a new commit (deduped via the Actions cache) it dispatches `build.yml` in drift-check mode against development (`upstream_branch=development`, `drift_only=true`). Because `upstream_branch` is set, that run is a test run: it never builds an image, publishes, refreshes the patch, or merges. If the patch drifts there, the AI adapts it and `open-pr` opens a **held** PR (branch `auto/drift-*`). That's the agent's prepared fix, left open and worded as FYI, not "merge me".
+- **`reconcile-drift.yml`** polls every 6 hours. For each open `auto/drift-*` PR it re-tests that PR's patch against the *current* upstream `main`. The moment a fix is proven valid for production, it merges the PR and dispatches the publishing build, which re-runs the full gauntlet, so a wrong fix can't reach `:latest`. It merges at most one per run and shares the `build` concurrency group so it can't race a publish.
+
+**Wait gate (2026-10-08):** `build.yml`'s skip step skips any upstream commit that lacks `app/scrapers/directv_device_auth.py` (his code sign-in, development-only for now), with a notice, so `main` builds wait for his release instead of failing into AI repair. Delete the gate once `main` has the file.
 
 ## The DAI patch
 

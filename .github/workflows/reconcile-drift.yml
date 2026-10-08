@@ -30,8 +30,7 @@ concurrency:
 
 env:
   UPSTREAM_REPO: kineticman/FastChannels
-  # The branch production builds from (build.yml): development since 2026-10-08.
-  UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH || 'development' }}
+  UPSTREAM_BRANCH: main
 
 jobs:
   reconcile:

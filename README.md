@@ -1,6 +1,6 @@
 # FastChannels-mackid1993
 
-[kineticman/FastChannels](https://github.com/kineticman/FastChannels) (currently his `development` branch; see "Which upstream branch") with a DirecTV addition, kept up to date automatically:
+[kineticman/FastChannels](https://github.com/kineticman/FastChannels) (`main`, the branch his releases come from) with a DirecTV addition, kept up to date automatically:
 
 - **DirecTV ad insertion (DAI):** an opt-in toggle in the DirecTV source settings. When on, playback uses the Yospace ad-insertion stream DirecTV's own apps use, with the account's own targeting values (DMA, billing ZIP, consent, household and profile IDs) and each bridge device's real advertising ID, ad-tracking setting and comScore device name — the same values DirecTV's Android TV app sends. That's how it gets local and political ads for the account's market. Requests look like the app's: its `channel/v2` authorization request and its player User-Agent, built from each device's own model, board and Android version. It needs the AH4C bridge (an Android device) — it does nothing on Prismcast. Each device's real advertising ID is captured once and reused: when you turn DAI on (and via a "Capture advertising IDs" button for devices added later), a Fire TV is read silently and a Google TV/Android TV device briefly shows its Ads settings screen — a device that's currently playing is skipped so a stream is never interrupted. The device's Android ID is the fallback when no advertising ID can be read, and a deleted or limited ID sends the opt-out form.
 
@@ -18,9 +18,9 @@ Use it anywhere you'd use upstream's image; the data volume and settings are the
 
 ## How it stays current
 
-This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` and workflows that poll upstream every ~6 hours (GitHub can't be notified of pushes to a repo you don't own) and keep a tested image published on top of his tracked branch — hands-off, with the AI doing any fixing. When that branch has a new commit or a new Player APK release, a build runs; you can also run it by hand from the Actions tab:
+This repo doesn't hold a copy of FastChannels. It holds the patch in `patches/` and workflows that poll upstream every ~6 hours (GitHub can't be notified of pushes to a repo you don't own) and keep a tested image published on top of his latest release — hands-off, with the AI doing any fixing. When his `main` (releases) has a new commit or a new Player APK release, a build runs; you can also run it by hand from the Actions tab:
 
-1. **Check for changes.** It reads the upstream branch's newest commit and the newest FastChannels Player release. If neither they nor the patch changed since the last build, it stops without rebuilding.
+1. **Check for changes.** It reads upstream `main`'s newest commit and the newest FastChannels Player release. If neither they nor the patch changed since the last build, it stops without rebuilding.
 2. **Apply the patch** to a fresh upstream checkout with `git am --3way`. A 3-way merge means upstream can move, add or edit code around our changes and the patch still lands. It fails only if upstream rewrites the same lines the patch changes.
 3. **Static checks:** every Python file compiles; ruff's error rules (syntax errors, undefined names) find nothing new compared with pristine upstream; the one hook is present; and every upstream name the DAI code wires into still exists (a rename fails here, naming exactly what moved).
 4. **Build** the image, which downloads the latest Player APK from upstream's latest release, and confirm the APK is bundled.
@@ -33,7 +33,13 @@ A `:latest` rebuild happens **only** on a real change (a new upstream commit, a 
 
 ## Which upstream branch
 
-Production builds from his **`development`** branch since 2026-10-08. He merged the Android TV code sign-in there first, and the DAI patch builds on it, so it can't run on his `main` until his next release. To go back to `main` once he releases, set the repository variable `UPSTREAM_BRANCH` to `main` (Settings → Secrets and variables → Actions → Variables) and restore the `schedule:` in `upstream-watch.yml`. That workflow is the early-warning watch on development, and it's paused while production tracks development itself. The reconcile workflow follows the same variable.
+Builds always come from his **`main`** (his releases). The one exception was a single manual build from his `development` branch on 2026-10-08, published as `:latest` (upstream `b71954d`). He had just merged the Android TV code sign-in there, and this patch now builds on it.
+
+Until his `main` carries that code sign-in (`app/scrapers/directv_device_auth.py`), the scheduled `main` builds **wait**. Each run notes "waiting for his release" and skips, with no failure and no AI repair, and `:latest` stays on the 2026-10-08 development build. The first `main` build after his release builds and publishes normally. Once that's happened, the wait check in `build.yml` (in the "Skip if this exact build already exists" step) can be deleted.
+
+**It watches his `development` branch too**, so the AI fixes drift *before* it reaches a release. On a new development commit it applies the patch and, if upstream drifted, the AI (GLM 5.3 Flash via Aider) adapts the patch and opens a *held* pull request — its prepared fix. A reconcile workflow then re-tests each held fix against `main` and **auto-merges and publishes** it the moment it's proven correct for production (the publish build re-runs the full gauntlet, so a wrong fix can never reach `:latest`).
+
+To do another one-off build from development, run **Build patched image** from the Actions tab with `upstream_branch=development`. That's a test run: it builds and tests the image but publishes nothing.
 
 ## How little of upstream it touches
 
