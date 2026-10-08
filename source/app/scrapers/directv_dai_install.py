@@ -43,6 +43,7 @@ TARGETS = (
     ('app.scrapers.directv', 'DirectvScraper._fetch_allchannels_rows'),
     ('app.scrapers.directv_device_auth', '_result'),
     ('app.scrapers.directv_device_auth', 'is_device_session'),
+    ('app.scrapers.directv_device_auth', 'app_headers'),
     ('app.routes.directv_proxy', '_requests'),
     ('app.routes.directv_proxy', '_DIRECTV_BROWSER_CDN_SUFFIXES'),
     ('app.routes.directv_proxy', '_directv_browser_cdn_allowed'),

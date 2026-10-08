@@ -1,17 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mackid1993 <fastchannels-ci@users.noreply.github.com>
-Date: Thu, 8 Oct 2026 16:37:05 -0400
-Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids and the inserted-ad
- audio fix, wired in by one hook
+Date: Thu, 8 Oct 2026 17:04:51 -0400
+Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
+ the inserted-ad audio fix, wired in by one hook
 
 ---
  app/__init__.py                     |    1 +
  app/scrapers/directv_dai.py         | 1037 +++++++++++++++++++++++++++
  app/scrapers/directv_dai_device.py  |  177 +++++
- app/scrapers/directv_dai_install.py |  681 ++++++++++++++++++
+ app/scrapers/directv_dai_install.py |  682 ++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 ++
  app/scrapers/dtv_aac_gain.py        |  663 +++++++++++++++++
- 6 files changed, 2608 insertions(+)
+ 6 files changed, 2609 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -1256,10 +1256,10 @@ index 0000000..2e4ee89
 +
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..7ef941b
+index 0000000..9828737
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,681 @@
+@@ -0,0 +1,682 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` at the end
@@ -1305,6 +1305,7 @@ index 0000000..7ef941b
 +    ('app.scrapers.directv', 'DirectvScraper._fetch_allchannels_rows'),
 +    ('app.scrapers.directv_device_auth', '_result'),
 +    ('app.scrapers.directv_device_auth', 'is_device_session'),
++    ('app.scrapers.directv_device_auth', 'app_headers'),
 +    ('app.routes.directv_proxy', '_requests'),
 +    ('app.routes.directv_proxy', '_DIRECTV_BROWSER_CDN_SUFFIXES'),
 +    ('app.routes.directv_proxy', '_directv_browser_cdn_allowed'),
