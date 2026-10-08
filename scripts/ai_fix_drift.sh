@@ -85,8 +85,8 @@ kineticman/FastChannels. The patch is exactly two things:
     `from .scrapers import directv_dai_install; directv_dai_install.install(app)`.
     Every other line of every upstream file is UPSTREAM's; never add code to one.
 install() wires the feature in at RUNTIME by wrapping upstream functions BY NAME; the names
-it depends on are listed in directv_dai_install.TARGETS (plus SAVE_CONFIG_RULE and
-TEMPLATE_MARKERS). So the normal drift is: upstream renamed or moved one of those names.
+it depends on are listed in directv_dai_install.TARGETS (plus SAVE_CONFIG_RULE and the
+strings in SOURCE_MARKERS). So the normal drift is: upstream renamed or moved one of those.
 The fix goes in directv_dai_install.py (and TARGETS): point the wrapper at upstream's
 current name/location, keeping the wrapper's behavior. Never edit an upstream file to put
 the old name back.

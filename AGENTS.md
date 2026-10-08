@@ -72,7 +72,10 @@ Sign-in, refresh and DRM recovery are **upstream's** (`app/scrapers/directv_devi
 - Any error in our code: log it, run upstream's function. Drift degrades to "DAI off", never to broken playback.
 - Module-level wraps happen once per process (`create_app` runs several times), and per-app wraps (views, blueprint, `after_request`) once per app. A double wrap would cut ad loudness twice.
 
-`TARGETS` (top of `directv_dai_install.py`) lists every upstream name it touches. `validate.sh` checks each one statically before any image is built, and fails with the exact name. `smoke_test.py` checks each is wrapped exactly once, then drives it.
+`TARGETS` (top of `directv_dai_install.py`) lists every upstream name it touches, and `SOURCE_MARKERS` lists every upstream *string* it relies on without calling it, such as a template field or a lock key. Three layers report breakage, each naming exactly what moved:
+- **`validate.sh`** runs before any image is built. It checks every `TARGETS` name and every `SOURCE_MARKERS` string statically. It also runs upstream's real `renderDirectvConfig` (cut out of `sources.html`) with the DAI script wrapped around it in node, and checks that the toggle, the profile picker and the ad-id button render before `config-actions`.
+- **`smoke_test.py`** runs inside the built image. It checks every target is wrapped exactly once and that `install.status()` is clean. Then it drives the wiring end to end on a throwaway database: the settings API's `directv.code_signed_in`, the DAI schema field, the profile route, saving the toggle (cache clear plus capture), and the real `/admin/sources` page getting the script.
+- **At runtime**, `install.status()` (`/directv-dai/status`) lists missing names, missing strings and any wiring step that raised. The DirecTV settings show those in red. If `renderDirectvConfig` itself is gone, a banner at the top of the sources page says the DAI settings couldn't be added.
 
 | Upstream name (TARGETS) | What the wrap does |
 |---|---|
@@ -91,7 +94,7 @@ Sign-in, refresh and DRM recovery are **upstream's** (`app/scrapers/directv_devi
 | `directv_proxy._directv_browser_proxyable_url` (+ `_directv_browser_asset_proxy_url`) | An inserted-ad creative (`dtv_aac_gain.is_ad_segment`, path-anchored) takes the relay on any CDN host. |
 | `directv_proxy.directv_browser_asset` (the view, found in `app.view_functions`) | A full (non-Range) inserted-ad AAC segment is fetched here and cut with `dtv_aac_gain.attenuate_ad_segment` (−12 dB, lossless). Every other asset goes to upstream's view. |
 | `SAVE_CONFIG_RULE` = `POST /api/sources/<int:source_id>/config` (found by URL rule) | After upstream saves the DirecTV settings: `directv_dai.clear_cache_if_toggled`, which drops cached URLs on a toggle flip and captures uncaptured devices' ad ids. |
-| `TEMPLATE_MARKERS` in `sources.html` (`function renderDirectvConfig`, `class="config-actions"`) | Our blueprint serves `/directv-dai/admin.js` plus the `directv-profile` and `directv-capture-adids` routes. An `after_request` adds the script tag to the page containing `function renderDirectvConfig`. The script wraps that global function to add the **Run as DirecTV profile** picker (when `cfg.directv.code_signed_in`), the DAI toggle and the "Capture advertising IDs" button, all before `config-actions`. |
+| `SOURCE_MARKERS` (strings in upstream files: `function renderDirectvConfig`, `class="config-actions"` and `cfg.directv.code_signed_in` in `sources.html`; `'code_signed_in'` in `api_sources.py`; the refresh-lock key `directv:auth:refreshing:` in `directv.py`) | Our blueprint serves `/directv-dai/admin.js` plus the `directv-profile` and `directv-capture-adids` routes. An `after_request` adds the script tag to the page containing `function renderDirectvConfig`. The script wraps that global function to add the **Run as DirecTV profile** picker (when `cfg.directv.code_signed_in`), the DAI toggle and the "Capture advertising IDs" button, all before `config-actions`. |
 
 If upstream renames a target, change the reference in `directv_dai_install.py` (and `TARGETS`). **Never edit an upstream file to bring the old name back.**
 

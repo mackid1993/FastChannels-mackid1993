@@ -54,8 +54,21 @@ TARGETS = (
 )
 # Views found by URL rule (more stable than function names).
 SAVE_CONFIG_RULE = '/api/sources/<int:source_id>/config'
-# The admin sources page bits the injected script relies on.
-TEMPLATE_MARKERS = ('function renderDirectvConfig', 'class="config-actions"')
+# Strings in upstream's files the wiring relies on without calling them by name:
+# (file, text, what breaks without it). validate.sh, smoke_test.py and the admin page's
+# warning (see status()) all check these.
+SOURCE_MARKERS = (
+    ('app/templates/admin/sources.html', 'function renderDirectvConfig',
+     'the DAI settings (toggle, profile picker, ad-id button) attach to this function'),
+    ('app/templates/admin/sources.html', 'class="config-actions"',
+     'the DAI settings are placed just before this'),
+    ('app/templates/admin/sources.html', 'cfg.directv.code_signed_in',
+     'the profile picker shows only for a code sign-in, read from this field'),
+    ('app/routes/api_sources.py', "'code_signed_in'",
+     'the settings API provides the code-sign-in flag the profile picker reads'),
+    ('app/scrapers/directv.py', 'directv:auth:refreshing:',
+     "the profile swap waits on upstream's token-refresh lock (this key)"),
+)
 
 _CHANNEL_AUTH_V2 = 'https://api.cld.dtvce.com/right/authorization/channel/v2'
 
@@ -65,6 +78,7 @@ _TUNE = contextvars.ContextVar('directv_dai_tune', default=None)
 
 _process_patched = False
 _missing: list[str] = []
+_failed: list[str] = []   # wiring steps that raised (named in status())
 
 
 def _resolve(module_name: str, path: str):
@@ -84,6 +98,35 @@ def missing() -> list[str]:
         except Exception:
             gone.append(f'{module_name}.{path}')
     return gone
+
+
+def missing_markers(root: str) -> list[str]:
+    """SOURCE_MARKERS not found under ``root`` (the app checkout), as readable messages."""
+    import os
+    gone = []
+    for path, text, why in SOURCE_MARKERS:
+        try:
+            with open(os.path.join(root, path), encoding='utf-8') as f:
+                if text in f.read():
+                    continue
+        except Exception:
+            pass
+        gone.append(f'{path} no longer has {text!r}: {why}')
+    return gone
+
+
+def status(app=None) -> dict:
+    """What's not wired, for the admin page's warning and for CI: upstream names that
+    are gone, and upstream strings that are gone. Empty lists mean everything is wired."""
+    import os
+    root = ''
+    try:
+        from flask import current_app
+        root = os.path.dirname((app or current_app).root_path)
+    except Exception:
+        pass
+    return {'missing': missing(), 'markers': missing_markers(root) if root else [],
+            'failed': sorted(set(_failed))}
 
 
 def install(app) -> None:
@@ -109,6 +152,7 @@ def _try(step, *args) -> None:
     try:
         step(*args)
     except Exception:
+        _failed.append(step.__name__.lstrip('_'))
         logger.exception('[directv-dai] could not wire %s', step.__name__)
 
 
@@ -458,6 +502,10 @@ def _register_admin(app) -> None:
         return Response(_ADMIN_JS, mimetype='application/javascript',
                         headers={'Cache-Control': 'no-cache'})
 
+    @bp.route('/directv-dai/status')
+    def dai_status():
+        return jsonify(status())
+
     @bp.route('/api/sources/<int:source_id>/directv-capture-adids', methods=['GET', 'POST'])
     def directv_capture_adids(source_id):
         """GET: how many bridge devices still need an advertising-id capture. POST: capture
@@ -520,7 +568,19 @@ _ADMIN_JS = r"""
 // DirecTV source settings by wrapping upstream's renderDirectvConfig (no template edit).
 (function () {
   const orig = window.renderDirectvConfig;
-  if (typeof orig !== 'function') { console.warn('[directv-dai] renderDirectvConfig not found'); return; }
+  if (typeof orig !== 'function') {
+    // Upstream renamed the DirecTV settings renderer: say so on the page rather than
+    // silently showing no DAI settings.
+    const warn = () => {
+      const d = document.createElement('div');
+      d.style.cssText = 'margin:8px 16px;padding:8px 12px;border:1px solid var(--danger,#c33);border-radius:6px;color:var(--danger,#c33)';
+      d.textContent = 'DirecTV DAI: this FastChannels version changed its DirecTV settings page, so the DAI toggle, profile picker and advertising-ID button could not be added. Playback is unaffected; the overlay needs an update.';
+      document.body.prepend(d);
+    };
+    if (document.body) warn(); else document.addEventListener('DOMContentLoaded', warn);
+    console.warn('[directv-dai] renderDirectvConfig not found');
+    return;
+  }
   const esc = s => (typeof escapeHtml === 'function') ? escapeHtml(String(s))
     : String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 
@@ -574,9 +634,28 @@ _ADMIN_JS = r"""
       const extra = (signedIn ? profileHtml(sourceId) : '') + daiHtml(sourceId, schema, values);
       const at = html.lastIndexOf('<div class="config-actions">');
       html = at >= 0 ? html.slice(0, at) + extra + html.slice(at) : html + extra;
-      setTimeout(() => { directvLoadAdidStatus(sourceId); if (signedIn) directvLoadProfiles(sourceId); }, 0);
+      setTimeout(() => { directvLoadAdidStatus(sourceId); if (signedIn) directvLoadProfiles(sourceId); directvDaiCheck(sourceId); }, 0);
     } catch (e) { console.warn('[directv-dai]', e); }
     return html;
+  };
+
+  // Shows a warning in the DAI settings when part of the wiring no longer matches this
+  // FastChannels version (an upstream rename): that part is off until the overlay is updated.
+  window.directvDaiCheck = async function (sourceId) {
+    const box = document.getElementById(`directv-dai-${sourceId}`);
+    if (!box) return;
+    try {
+      const d = await (await fetch('/directv-dai/status')).json();
+      const issues = [...(d.missing || []).map(n => `upstream renamed or removed ${n}`), ...(d.markers || []),
+                      ...(d.failed || []).map(n => `could not wire ${n} (see the server log)`)];
+      if (!issues.length) return;
+      const w = document.createElement('div');
+      w.className = 'field field-full';
+      w.style.color = 'var(--danger)';
+      w.innerHTML = '<strong>DAI wiring needs an update for this FastChannels version:</strong><ul style="margin:4px 0 0 18px">'
+        + issues.map(i => `<li>${esc(i)}</li>`).join('') + '</ul>';
+      box.prepend(w);
+    } catch (e) { /* status unavailable: say nothing */ }
   };
 
   window.directvLoadProfiles = async function (sourceId) {

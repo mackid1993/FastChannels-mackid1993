@@ -57,6 +57,7 @@ echo "== overlay modules, the one hook, and the upstream names it wires into"
 # upstream renames or removes. This lists every such name from directv_dai_install.TARGETS
 # and fails with the exact name, before any image is built. Fix a moved name in
 # directv_dai_install.py, never by editing upstream's files.
+export DAI_ADMIN_JS="$tmp/dai_admin.js"
 python - "$root" <<'PY'
 import ast, os, sys
 ok = True
@@ -75,7 +76,7 @@ for f in ('app/scrapers/directv_dai_install.py',):
         sys.exit(1)
 tree = ast.parse(open('app/scrapers/directv_dai_install.py', encoding='utf-8').read())
 consts = {t.id: ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
-          for t in n.targets if isinstance(t, ast.Name) and t.id in ('TARGETS', 'TEMPLATE_MARKERS', 'SAVE_CONFIG_RULE')}
+          for t in n.targets if isinstance(t, ast.Name) and t.id in ('TARGETS', 'SOURCE_MARKERS', 'SAVE_CONFIG_RULE', '_ADMIN_JS')}
 
 def names(body):
     out = set()
@@ -109,14 +110,58 @@ for module, path in consts['TARGETS']:
         cls = next(n for n in mod.body if isinstance(n, ast.ClassDef) and n.name == head)
         if attr not in names(cls.body):
             err(f'upstream renamed or removed {module}.{path} (DAI wires into it; update directv_dai_install.py)')
-tpl = open('app/templates/admin/sources.html', encoding='utf-8').read()
-for marker in consts['TEMPLATE_MARKERS']:
-    if marker not in tpl:
-        err(f'sources.html no longer has {marker!r} (the DAI settings script relies on it)')
+for path, text, why in consts['SOURCE_MARKERS']:
+    if not os.path.isfile(path) or text not in open(path, encoding='utf-8').read():
+        err(f'{path} no longer has {text!r}: {why} (update directv_dai_install.py)')
 rule = consts['SAVE_CONFIG_RULE'].removeprefix('/api')
 if f"route('{rule}', methods=['POST']" not in open('app/routes/api_sources.py', encoding='utf-8').read():
     err(f'the save-config route {rule} (POST) moved (DAI clears its cache / captures ad ids on save)')
 print('all DAI wiring targets present' if ok else 'DAI wiring targets missing')
+# Hand the admin script to the browser check below.
+open(os.environ.get('DAI_ADMIN_JS', '/dev/null'), 'w').write(consts.get('_ADMIN_JS', ''))
 sys.exit(0 if ok else 1)
 PY
+
+echo "== DAI settings script against upstream's real renderDirectvConfig"
+# Runs upstream's own renderDirectvConfig (cut from sources.html) with the DAI script
+# wrapped around it, the way the browser does, and checks the toggle, the profile picker
+# and the ad-id button come out before config-actions. Catches a changed signature or
+# markup that the string checks above can't. Needs node (preinstalled on GitHub runners).
+if command -v node >/dev/null 2>&1; then
+  node - "$DAI_ADMIN_JS" app/templates/admin/sources.html <<'JS'
+const fs = require('fs');
+const [js, tplPath] = process.argv.slice(2);
+const tpl = fs.readFileSync(tplPath, 'utf8');
+const start = tpl.indexOf('function renderDirectvConfig(');
+if (start < 0) { console.log('::error::sources.html has no renderDirectvConfig'); process.exit(1); }
+// Brace-match the function body (template literals keep their ${...} balanced). The body
+// starts after the parameter list, which can hold a `cfg = {}` default.
+let i = tpl.indexOf(') {', start) + 2, depth = 0, end = -1;
+for (; i < tpl.length; i++) {
+  if (tpl[i] === '{') depth++;
+  else if (tpl[i] === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
+}
+const fnSrc = tpl.slice(start, end);
+global.window = global;
+global.escapeHtml = s => String(s);
+global.setTimeout = () => {};
+global.document = {getElementById: () => null, body: null, addEventListener: () => {}};
+(0, eval)(fnSrc + '; window.renderDirectvConfig = renderDirectvConfig;');
+(0, eval)(fs.readFileSync(js, 'utf8'));
+const schema = [{key: 'use_dai', label: 'Use DirecTV ad insertion (DAI)', help_text: 'h', default: 'false'}];
+let html;
+try {
+  html = window.renderDirectvConfig(1, schema, {use_dai: 'true'}, {directv: {code_signed_in: true}, config_status: 'configured'});
+} catch (e) { console.log('::error::renderDirectvConfig threw with the DAI script: ' + e); process.exit(1); }
+const fail = m => { console.log('::error::DAI settings script: ' + m); process.exitCode = 1; };
+const actions = html.lastIndexOf('<div class="config-actions">');
+if (!html.includes('data-key="use_dai"')) fail('the DAI toggle did not render');
+if (!html.includes('Run as DirecTV profile')) fail('the profile picker did not render for a code sign-in');
+if (!html.includes('directv-adid-btn-1')) fail('the Capture advertising IDs button did not render');
+if (actions < 0 || html.indexOf('data-key="use_dai"') > actions) fail('the DAI settings are not placed before config-actions');
+if (!process.exitCode) console.log('DAI settings render inside upstream\'s DirecTV settings');
+JS
+else
+  echo "node not found; skipped (CI runners have it)"
+fi
 echo "All static checks passed."

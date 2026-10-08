@@ -55,7 +55,12 @@ The overlay's code lives in its own files, which upstream doesn't have and so ca
 
 Upstream's code gets **exactly one line**, at the end of `create_app` in `app/__init__.py`. That line runs the wiring, which attaches DAI to upstream's functions at startup instead of editing their bodies. Upstream can rewrite any of those functions freely and the patch still applies.
 
-What *can* drift is a name: if upstream renames a function the wiring hooks onto, the static checks fail with that exact name before any image is built. The fix is one line in `directv_dai_install.py`, never in upstream's files. At runtime, every piece fails safe: if something it hooks onto is missing or errors, that piece logs an error and the stream plays as if DAI were off.
+What *can* drift is a name, or a string the wiring relies on, like a settings field or a lock key. You'll know three ways:
+- **The build fails** before any image is built, naming exactly what upstream changed. A "Build failed" issue pings you, and the AI repair takes it. The fix is one line in `directv_dai_install.py`, never in upstream's files.
+- **The smoke test fails** if the wiring is there but no longer works. It drives upstream's real settings API, profile route, save button and sources page on a throwaway database.
+- **The DirecTV settings page shows it in red** if a running server ever has a mismatch, for example a development build, listing what's not wired. A banner appears if the settings can't attach at all.
+
+At runtime every piece fails safe: if something it hooks onto is missing or errors, that piece logs an error and the stream plays as if DAI were off.
 
 If any step fails, nothing is published, `:latest` stays on the last good build, and a "Build failed" issue pings you. On the scheduled runs an AI then tries to fix it automatically (the same AI and gauntlet as a patch conflict, below): it reproduces the failing check, adapts the patch to upstream's current code, and the fix must build, smoke-test and boot-test cleanly before it's merged and published. A one-off failure (a registry hiccup, say) clears on the next run.
 

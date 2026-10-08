@@ -72,9 +72,11 @@ assert not isinstance(directv_proxy._requests._real, install._RelayRequests), 't
 _wrapped_views = {e for e, v in app.view_functions.items() if getattr(v, '__directv_dai__', False)}
 assert any(e.endswith('directv_browser_asset') for e in _wrapped_views), 'the browser-asset view is not wired (ad loudness cut)'
 assert any(e.endswith('save_source_config') for e in _wrapped_views), 'the save-config view is not wired (toggle cache clear / ad-id capture)'
-_tpl = open('app/templates/admin/sources.html', encoding='utf-8').read()
-for _m in install.TEMPLATE_MARKERS:
-    assert _m in _tpl, f'sources.html lost {_m!r}; the DAI settings script relies on it'
+# The same report the admin page shows: every name and upstream string the wiring relies
+# on is present, and no wiring step raised.
+with app.app_context():
+    _st = install.status(app)
+assert _st == {'missing': [], 'markers': [], 'failed': []}, f'DAI wiring is incomplete: {_st}'
 assert callable(getattr(BaseScraper, '_update_cache', None)), 'BaseScraper._update_cache is gone'
 assert isinstance(inspect.getattr_static(BaseScraper, 'cache'), property), 'BaseScraper.cache is no longer a property'
 # The device ad id reads upstream's bridge-device list; if it's renamed or reshaped the
@@ -597,5 +599,42 @@ with app.test_request_context():
     for fn in app.after_request_funcs.get(None, []):
         _other = fn(_other)
     assert b'directv-dai' not in _other.get_data(), 'the DAI script was injected into an unrelated page'
+
+# (k) End to end through upstream's own pages and API, on a real (throwaway) database:
+# the settings API still tells the page it's a code sign-in (the profile picker keys on
+# it), the DAI toggle is in the schema, the profile route answers, saving the toggle runs
+# the cache clear + ad-id capture, and the sources page really gets the DAI script.
+from app.extensions import db  # noqa: E402
+from app.models import Source  # noqa: E402
+_real_list, _real_capture = dai.list_profiles, dai.capture_in_background
+_captures = []
+dai.list_profiles = lambda bearer: {'profiles': [{'id': 'p1', 'name': 'David', 'primary': True}], 'current_id': 'p1'}
+dai.capture_in_background = lambda addrs=None: _captures.append(addrs) or 0
+try:
+    with app.app_context():
+        db.create_all()
+        _src = Source(name='directv', display_name='DirecTV Stream',
+                      config={'auth_method': 'dtv_android', 'refresh_token': 'r', 'bearer_token': 'b'})
+        db.session.add(_src)
+        db.session.commit()
+        _sid = _src.id
+    _cfg = _client.get(f'/api/sources/{_sid}/config').get_json()
+    assert (_cfg.get('directv') or {}).get('code_signed_in') is True,         f"the settings API no longer reports directv.code_signed_in (the profile picker keys on it): {_cfg.get('directv')}"
+    assert any(f.get('key') == 'use_dai' for f in _cfg.get('schema') or []), 'the DAI toggle is missing from the settings API'
+    _pr = _client.get(f'/api/sources/{_sid}/directv-profile')
+    assert _pr.status_code == 200 and _pr.get_json()['profiles'][0]['id'] == 'p1', _pr.get_data()
+    _sv = _client.post(f'/api/sources/{_sid}/config', json={'use_dai': 'true'})
+    assert _sv.status_code < 400, _sv.get_data()
+    with app.app_context():
+        assert dai.enabled(db.session.get(Source, _sid).config), 'saving the DAI toggle did not stick'
+    assert _captures, 'saving the DirecTV settings with DAI on did not run the ad-id capture'
+    _page = _client.get('/admin/sources')
+    if _page.status_code == 200:
+        assert b'/directv-dai/admin.js' in _page.get_data(), 'the sources page did not get the DAI settings script'
+    else:
+        print(f'note: /admin/sources answered {_page.status_code} on the throwaway DB; page injection checked via after_request only')
+    assert _client.get('/directv-dai/status').get_json() == {'missing': [], 'markers': [], 'failed': []}
+finally:
+    dai.list_profiles, dai.capture_in_background = _real_list, _real_capture
 
 print('Overlay smoke test passed.')
