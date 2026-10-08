@@ -473,6 +473,29 @@ def _register_admin(app) -> None:
         return jsonify({'enabled': True, 'ok': True, **counts,
                         'pending': len(directv_dai.uncaptured_addresses())})
 
+    @bp.route('/api/sources/<int:source_id>/directv-profile', methods=['GET', 'POST'])
+    def directv_profile(source_id):
+        """GET: the account's viewer profiles and which one ads are requested as. POST: run
+        as a chosen profile (its ad id becomes the Yospace `profid`)."""
+        from ..models import Source
+        source = Source.query.get_or_404(source_id)
+        if source.name != 'directv':
+            return jsonify({'error': 'not a directv source'}), 400
+        cfg = dict(source.config or {})
+        if not directv_dai.profiles_supported(cfg):
+            return jsonify({'error': 'profiles need the DirecTV code sign-in', 'profiles': []}), 400
+        if request.method == 'GET':
+            info = directv_dai.list_profiles(cfg.get('bearer_token') or '')
+            selected = (cfg.get('dtv_android_profile_id') or '').strip() or (info.get('current_id') or '')
+            return jsonify({'profiles': info.get('profiles') or [], 'selected_id': selected,
+                            'current_id': info.get('current_id') or ''})
+        data = request.get_json(silent=True) or request.form
+        profile_id = (data.get('profile_id') or '').strip()
+        if not profile_id:
+            return jsonify({'error': 'no profile_id'}), 400
+        result = directv_dai.select_profile(source, profile_id, (data.get('profile_name') or '').strip())
+        return jsonify(result), (200 if result.get('ok') else 400)
+
     app.register_blueprint(bp)
 
     tag = b'<script src="/directv-dai/admin.js"></script>'
@@ -492,7 +515,7 @@ def _register_admin(app) -> None:
 
 
 _ADMIN_JS = r"""
-// DirecTV DAI: adds the DAI toggle and the "Capture advertising IDs" button to the
+// DirecTV DAI: adds the viewer-profile picker, the DAI toggle and the "Capture advertising IDs" button to the
 // DirecTV source settings by wrapping upstream's renderDirectvConfig (no template edit).
 (function () {
   const orig = window.renderDirectvConfig;
@@ -526,15 +549,87 @@ _ADMIN_JS = r"""
       </div>`;
   }
 
-  window.renderDirectvConfig = function (sourceId, schema, values) {
+  // The viewer-profile picker: shown once the source has a code sign-in session.
+  function profileHtml(sourceId) {
+    return `
+      <div class="field field-full" style="margin-top:0.9rem" id="directv-profile-${sourceId}">
+        <label for="directv-profile-select-${sourceId}" style="font-weight:600">Run as DirecTV profile</label>
+        <div class="help">FastChannels requests ads as this viewer profile &mdash; its ad id becomes DirecTV's <code>profid</code>. Changing it clears the cached stream so the next tune uses it.</div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">
+          <select id="directv-profile-select-${sourceId}" disabled style="min-width:180px;padding:6px">
+            <option>Loading profiles&hellip;</option>
+          </select>
+          <button class="btn btn-run" type="button" id="directv-profile-btn-${sourceId}"
+                  onclick="directvSelectProfile(${sourceId})" disabled>Use profile</button>
+          <span id="directv-profile-status-${sourceId}" style="color:var(--text-muted)"></span>
+        </div>
+      </div>`;
+  }
+
+  window.renderDirectvConfig = function (sourceId, schema, values, cfg) {
     let html = orig.apply(this, arguments);
     try {
-      const extra = daiHtml(sourceId, schema, values);
+      const signedIn = !!(cfg && cfg.directv && cfg.directv.code_signed_in);
+      const extra = (signedIn ? profileHtml(sourceId) : '') + daiHtml(sourceId, schema, values);
       const at = html.lastIndexOf('<div class="config-actions">');
       html = at >= 0 ? html.slice(0, at) + extra + html.slice(at) : html + extra;
-      setTimeout(() => directvLoadAdidStatus(sourceId), 0);
+      setTimeout(() => { directvLoadAdidStatus(sourceId); if (signedIn) directvLoadProfiles(sourceId); }, 0);
     } catch (e) { console.warn('[directv-dai]', e); }
     return html;
+  };
+
+  window.directvLoadProfiles = async function (sourceId) {
+    const sel = document.getElementById(`directv-profile-select-${sourceId}`);
+    const btn = document.getElementById(`directv-profile-btn-${sourceId}`);
+    const statusEl = document.getElementById(`directv-profile-status-${sourceId}`);
+    if (!sel) return;
+    try {
+      const r = await fetch(`/api/sources/${sourceId}/directv-profile`);
+      const d = await r.json().catch(() => ({}));
+      const profiles = d.profiles || [];
+      if (!r.ok || !profiles.length) {
+        sel.innerHTML = `<option>${esc(r.ok ? 'No profiles found' : (d.error || 'Could not load profiles'))}</option>`;
+        return;
+      }
+      sel.innerHTML = profiles.map(p =>
+        `<option value="${esc(p.id)}"${p.id === d.selected_id ? ' selected' : ''}>` +
+        `${esc(p.name)}${p.primary ? ' (primary)' : ''}${p.id === d.selected_id ? ' — running' : ''}</option>`
+      ).join('');
+      sel.disabled = false;
+      if (btn) btn.disabled = false;
+      if (statusEl) statusEl.textContent = '';
+    } catch (e) {
+      sel.innerHTML = '<option>Could not load profiles</option>';
+    }
+  };
+
+  window.directvSelectProfile = async function (sourceId) {
+    const sel = document.getElementById(`directv-profile-select-${sourceId}`);
+    const btn = document.getElementById(`directv-profile-btn-${sourceId}`);
+    const statusEl = document.getElementById(`directv-profile-status-${sourceId}`);
+    if (!sel || !sel.value) return;
+    const name = (sel.options[sel.selectedIndex]?.text || '').replace(/ \(primary\)| — running/g, '');
+    if (btn) btn.disabled = true;
+    if (statusEl) { statusEl.style.color = 'var(--text-muted)'; statusEl.textContent = 'Switching…'; }
+    try {
+      const r = await fetch(`/api/sources/${sourceId}/directv-profile`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({profile_id: sel.value, profile_name: name}),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.ok) {
+        if (statusEl) { statusEl.style.color = 'var(--success-soft)'; statusEl.innerHTML = '&#10003; Running as this profile.'; }
+        directvLoadProfiles(sourceId);
+      } else if (statusEl) {
+        statusEl.style.color = 'var(--danger)';
+        statusEl.textContent = d.error || 'Could not switch profile';
+      }
+    } catch (e) {
+      if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = 'Network error'; }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   };
 
   window.directvLoadAdidStatus = async function (sourceId) {

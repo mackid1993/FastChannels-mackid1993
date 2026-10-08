@@ -389,6 +389,19 @@ sc = _Scraper()
 dai.note_channels(sc, [{'ccid': '1', 'daiChannelName': ' cnn '}, {'ccid': '2', 'daiChannelName': ''}, 'junk'])
 assert sc.cache == {'dai_channel_names': {'1': 'cnn'}}, sc.cache
 
+# The viewer-profile picker: the chosen profile's partnerProfileID1 becomes the Yospace
+# profid (dtv_android_profid). Needed for ad targeting; must not be dropped again.
+for _n in ('list_profiles', 'select_profile', 'profile_token_exchange', 'profiles_supported'):
+    assert callable(getattr(dai, _n, None)), f'the viewer-profile picker lost {_n}'
+assert dai._partner_profile_id1({'valuePairs': {'partnerProfileID1': ' pp1 '}}) == 'pp1'
+assert dai._partner_profile_id1({'partnerProfileId1': 'pp2'}) == 'pp2'
+assert dai._partner_profile_id1({}) == ''
+assert dai.profiles_supported({'auth_method': 'device_code', 'refresh_token': 'r'})
+assert dai.profiles_supported({'auth_method': 'dtv_android', 'refresh_token': 'r'})
+assert not dai.profiles_supported({'auth_method': 'curl_cffi', 'refresh_token': 'r'})
+assert any(r.rule == '/api/sources/<int:source_id>/directv-profile' for r in app.url_map.iter_rules()),     'the directv-profile route is not registered'
+assert b'directvSelectProfile' in install._ADMIN_JS.encode() and b'Run as DirecTV profile' in install._ADMIN_JS.encode(),     'the profile picker is missing from the DirecTV settings script'
+
 # ── Behavioral wiring tests ──────────────────────────────────────────────────
 # Drive upstream's own functions and routes through the runtime wiring with stubbed
 # network, so the wrapping must really happen (not just exist) or the build fails.

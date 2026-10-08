@@ -39,9 +39,13 @@ on:
         type: string
         default: ""
       upstream_branch:
-        description: "Test only: build against this branch instead (nothing is published)"
+        description: "Test only: build against this branch instead (nothing is published, unless 'publish' is ticked)"
         type: string
         default: ""
+      publish:
+        description: "With upstream_branch: publish that build as :latest (a one-off; scheduled builds stay on main)"
+        type: boolean
+        default: false
 
 concurrency:
   group: build
@@ -57,7 +61,7 @@ env:
   UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
   # A test run (against another repo/branch) builds and checks but never publishes,
   # refreshes the patches, or files issues.
-  TEST_RUN: ${{ (inputs.upstream_repo != '' || inputs.upstream_branch != '') && 'true' || 'false' }}
+  TEST_RUN: ${{ (inputs.upstream_repo != '' || inputs.upstream_branch != '') && !inputs.publish && 'true' || 'false' }}
   # Drift-only = apply + validate the patches, NO image, NO publish. A push to this repo (a
   # CI/patch/doc change) runs a drift check — it reruns the tests but never rebuilds or
   # republishes the image. A dispatch can ask for it too (the development watcher does). Only a

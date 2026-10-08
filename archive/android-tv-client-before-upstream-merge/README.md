@@ -15,6 +15,6 @@ Only `patches/` is applied.
 
 The git tag `pre-dai-only-trim` marks the same state of this repo.
 
-To bring a piece back, copy it out of here and into the current module.
-`dtv_android.list_profiles`/`select_profile` is the viewer-profile picker, and
-`drm_reauth` is the single-flight DRM recovery.
+To bring a piece back, copy it out of here and into the current module. The viewer-profile
+picker was already carried over, into `directv_dai.py`. `drm_reauth`, the single-flight DRM
+recovery, was not.

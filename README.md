@@ -8,7 +8,9 @@
 
 - **Inserted ads matched to programming loudness:** DirecTV's inserted ads come in several dB louder than the show. With DAI on, the relay pulls each inserted ad down to the programming level — lowering its AAC gain in place, losslessly (no re-encoding) — so breaks don't blast. It only touches inserted ads, never live programming, and leaves an ad untouched if it can't read it cleanly.
 
-- **Sign-in is upstream's.** DirecTV's Android TV code sign-in (approve a code once at directv.com/tvsigninv2; no password stored; refreshes on its own) started in this overlay and is now part of upstream as "Sign in with a code". The overlay no longer carries its own copy. A session signed in by the old overlay is still recognized and refreshes through upstream's code, so there's nothing to redo. The old overlay's full Android TV client, including the viewer-profile picker, is archived in `archive/android-tv-client-before-upstream-merge/`.
+- **Pick which DirecTV profile you watch as:** the DirecTV source settings include a *Run as DirecTV profile* picker. Choose one of the account's viewer profiles and ads are requested as it — its Yospace `profid`, the way the app does — so ad targeting follows the profile you pick. Switching clears the cached stream so the next tune uses it.
+
+- **Sign-in is upstream's.** DirecTV's Android TV code sign-in (approve a code once at directv.com/tvsigninv2; no password stored; refreshes on its own) started in this overlay and is now part of upstream as "Sign in with a code". The overlay no longer carries its own copy. A session signed in by the old overlay is still recognized and refreshes through upstream's code, so there's nothing to redo. The old overlay's full Android TV client is archived in `archive/android-tv-client-before-upstream-merge/`.
 
 ```
 docker pull ghcr.io/mackid1993/fastchannels-mackid1993:latest
@@ -33,13 +35,13 @@ A `:latest` rebuild happens **only** on a real change (a new upstream commit, a 
 
 ## Which upstream branch
 
-Builds always come from his **`main`** (his releases). The one exception was a single manual build from his `development` branch on 2026-10-08, published as `:latest` (upstream `b71954d`). He had just merged the Android TV code sign-in there, and this patch now builds on it.
+Builds always come from his **`main`** (his releases). The one exception was manual builds from his `development` branch on 2026-10-08, published as `:latest` (upstream `b71954d`). He had just merged the Android TV code sign-in there, and this patch now builds on it.
 
 Until his `main` carries that code sign-in (`app/scrapers/directv_device_auth.py`), the scheduled `main` builds **wait**. Each run notes "waiting for his release" and skips, with no failure and no AI repair, and `:latest` stays on the 2026-10-08 development build. The first `main` build after his release builds and publishes normally. Once that's happened, the wait check in `build.yml` (in the "Skip if this exact build already exists" step) can be deleted.
 
 **It watches his `development` branch too**, so the AI fixes drift *before* it reaches a release. On a new development commit it applies the patch and, if upstream drifted, the AI (GLM 5.3 Flash via Aider) adapts the patch and opens a *held* pull request — its prepared fix. A reconcile workflow then re-tests each held fix against `main` and **auto-merges and publishes** it the moment it's proven correct for production (the publish build re-runs the full gauntlet, so a wrong fix can never reach `:latest`).
 
-To do another one-off build from development, run **Build patched image** from the Actions tab with `upstream_branch=development`. That's a test run: it builds and tests the image but publishes nothing.
+To do another one-off build from development, run **Build patched image** from the Actions tab with `upstream_branch=development`. Left at that, it's a test run: it builds and tests the image but publishes nothing. Tick `publish` as well to publish it as `:latest`. Scheduled builds stay on `main` either way.
 
 ## How little of upstream it touches
 

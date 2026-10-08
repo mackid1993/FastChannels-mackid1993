@@ -4,7 +4,7 @@ Background for any AI agent working in this repo, including the AI step CI runs 
 
 ## What this repo is
 
-A patch overlay, not a fork. It builds [kineticman/FastChannels](https://github.com/kineticman/FastChannels) (branch `main`, where his releases come from; one manual `development` build was published as `:latest` on 2026-10-08, and `main` builds skip quietly until his `main` has `app/scrapers/directv_device_auth.py`) plus the patches in `patches/`, and publishes the result to `ghcr.io/mackid1993/fastchannels-mackid1993`. Upstream's code never lives here; CI clones it fresh for every build.
+A patch overlay, not a fork. It builds [kineticman/FastChannels](https://github.com/kineticman/FastChannels) (branch `main`, where his releases come from; manual `development` builds (`upstream_branch=development` + `publish`) were published as `:latest` on 2026-10-08, and `main` builds skip quietly until his `main` has `app/scrapers/directv_device_auth.py`) plus the patches in `patches/`, and publishes the result to `ghcr.io/mackid1993/fastchannels-mackid1993`. Upstream's code never lives here; CI clones it fresh for every build.
 
 ```
 patches/            the changes applied on top of upstream, as `git format-patch` files
@@ -91,7 +91,7 @@ Sign-in, refresh and DRM recovery are **upstream's** (`app/scrapers/directv_devi
 | `directv_proxy._directv_browser_proxyable_url` (+ `_directv_browser_asset_proxy_url`) | An inserted-ad creative (`dtv_aac_gain.is_ad_segment`, path-anchored) takes the relay on any CDN host. |
 | `directv_proxy.directv_browser_asset` (the view, found in `app.view_functions`) | A full (non-Range) inserted-ad AAC segment is fetched here and cut with `dtv_aac_gain.attenuate_ad_segment` (−12 dB, lossless). Every other asset goes to upstream's view. |
 | `SAVE_CONFIG_RULE` = `POST /api/sources/<int:source_id>/config` (found by URL rule) | After upstream saves the DirecTV settings: `directv_dai.clear_cache_if_toggled`, which drops cached URLs on a toggle flip and captures uncaptured devices' ad ids. |
-| `TEMPLATE_MARKERS` in `sources.html` (`function renderDirectvConfig`, `class="config-actions"`) | Our blueprint serves `/directv-dai/admin.js` plus the `directv-capture-adids` route. An `after_request` adds the script tag to the page containing `function renderDirectvConfig`. The script wraps that global function to add the DAI toggle and the "Capture advertising IDs" button before `config-actions`. |
+| `TEMPLATE_MARKERS` in `sources.html` (`function renderDirectvConfig`, `class="config-actions"`) | Our blueprint serves `/directv-dai/admin.js` plus the `directv-profile` and `directv-capture-adids` routes. An `after_request` adds the script tag to the page containing `function renderDirectvConfig`. The script wraps that global function to add the **Run as DirecTV profile** picker (when `cfg.directv.code_signed_in`), the DAI toggle and the "Capture advertising IDs" button, all before `config-actions`. |
 
 If upstream renames a target, change the reference in `directv_dai_install.py` (and `TARGETS`). **Never edit an upstream file to bring the old name back.**
 
@@ -103,6 +103,7 @@ If upstream renames a target, change the reference in `directv_dai_install.py` (
   - `request_flags()`/`build_query()` build `_CLIENT_PARAMS` plus the account's values and the device flags.
   - `device_ad_flags(props, ad_id)`.
   - Advertising-id capture: `capture_registered_devices`, `capture_in_background`, `uncaptured_addresses`, `_capture_and_store`, `_reachable`, `_read_fire_advertising_id`, `_read_gms_advertising_id`, `_is_playing`, and the `directv_dai_adids.json` store with its thread lock plus `flock`.
+  - Viewer profiles, which set the Yospace `profid` and are required for ad targeting: `list_profiles`, `select_profile`, `profile_token_exchange`, `_partner_profile_id1`, `profiles_supported`. The exchange is single-flight behind upstream's `directv:auth:refreshing:<name>` lock.
   - `gpp_targeted_ad_opt_out()`, `store_login_result()`, `fetch_account_context()`, `ids_from_bearer_jwt()`, `note_channels()`, `clear_cache_if_toggled()`.
 - **`directv_dai_device.py`**: the bridge device behind the request.
   - `_client_device()` matches the request IP to `bridge_devices.known_devices()` and reads Android ID, `limit_ad_tracking`, release, model, board and manufacturer over adb. They're persisted in `directv_dai_devices.json`, re-checked about hourly, and only a real change updates them.
