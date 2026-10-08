@@ -24,7 +24,6 @@ from urllib.parse import quote
 
 import requests
 
-from .base import ConfigField
 from . import directv_dai_device as device
 
 logger = logging.getLogger(__name__)
@@ -78,10 +77,12 @@ _CLIENT_PARAMS = {
     'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
 }
 
-CONFIG_FIELD = ConfigField(
-    'use_dai', 'Use DirecTV ad insertion (DAI)',
-    field_type='toggle', default='false',
-    help_text=(
+# The toggle, shown by our own settings panel (directv_dai_install) and stored as
+# config['use_dai']; it is not in upstream's config_schema, so upstream's settings save
+# leaves it alone.
+CONFIG_FIELD = {
+    'key': 'use_dai', 'label': 'Use DirecTV ad insertion (DAI)', 'default': 'false',
+    'help_text': (
         'On = play the stream DirecTV\'s own apps use, with DirecTV\'s local '
         'ads in commercial breaks. Off = the national feed without DirecTV\'s '
         'inserted ads. Requires the AH4C bridge (an Android device) — it '
@@ -92,14 +93,31 @@ CONFIG_FIELD = ConfigField(
         'it\'s playing. The ID is saved and reused. When you add a new device '
         'later, a "Capture advertising IDs" button appears to pull its ID.'
     ),
-)
-
-CONFIG_FIELDS = (CONFIG_FIELD,)
-
+}
 
 
 def enabled(config: dict | None) -> bool:
     return str((config or {}).get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+_DAI_ON = [0.0, False]   # [valid until, value]
+_DAI_ON_TTL = 15
+
+
+def dai_on() -> bool:
+    """Whether the DirecTV source has DAI on, for code with no scraper config at hand
+    (the relay's User-Agent). Cached briefly; a toggle save resets it."""
+    now = time.time()
+    if now < _DAI_ON[0]:
+        return _DAI_ON[1]
+    try:
+        from ..models import Source
+        src = Source.query.filter_by(name='directv').first()
+        on = bool(src is not None and enabled(src.config))
+    except Exception:
+        on = _DAI_ON[1]
+    _DAI_ON[:] = [now + _DAI_ON_TTL, on]
+    return on
 
 
 # ── Stream URL ───────────────────────────────────────────────────────────────
@@ -279,9 +297,9 @@ def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
 #
 # Captured per device and reused from directv_dai_adids.json; NEVER re-read on a schedule
 # (that would flash every Google TV box) and NEVER at a tune (that would interrupt the
-# tuning box). Capture runs only from an explicit action: clear_cache_if_toggled (DAI
-# turned on, or a DirecTV config save while DAI is on, captures the uncaptured boxes) and
-# the admin "Capture advertising IDs" button; a box that is playing is skipped. To force a
+# tuning box). Capture runs only from an explicit action: turning DAI on in the DAI panel
+# (settings_changed -> clear_cache_if_toggled captures the uncaptured boxes) and the admin
+# "Capture advertising IDs" button; a box that is playing is skipped. To force a
 # fresh capture of all boxes, toggle DAI off and on.
 
 _ZERO_GAID = '00000000-0000-0000-0000-000000000000'
@@ -726,7 +744,9 @@ def store_login_result(cfg: dict, result: dict) -> None:
     Upstream's code sign-in (directv_device_auth) returns a bare session, so the DAI
     targeting context (DMA/ZIP/consent) is fetched here with its bearer, once: a refresh
     reuses what's stored. Best-effort: a failed fetch never breaks the sign-in."""
-    if ('dai_context' not in result and result.get('bearer_token')
+    # Only with DAI on: with it off, sign-in makes no extra DirecTV requests (turning DAI
+    # on fetches them then; see settings_changed).
+    if (enabled(cfg) and 'dai_context' not in result and result.get('bearer_token')
             and (result.get('auth_method') == 'device_code' or not cfg.get('dai_dma_id'))):
         try:
             from . import directv_device_auth
@@ -1020,6 +1040,54 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
 
 # ── Settings ─────────────────────────────────────────────────────────────────
 
+def settings_changed(source, old: dict, current: dict) -> None:
+    """After the DAI panel saves the toggle: drop cached URLs on a flip, capture new
+    devices' ad ids, and fetch the account's targeting values if they're missing."""
+    _DAI_ON[0] = 0.0
+    clear_cache_if_toggled(source, old, current)
+    if enabled(current) and not current.get('dai_dma_id') and current.get('bearer_token'):
+        _in_background(_fetch_missing_account_context, source.id)
+
+
+def _fetch_missing_account_context(source_id: int) -> None:
+    """DAI was turned on for a session whose sign-in ran with DAI off: fetch the
+    account's DMA/ZIP/consent now (the same request sign-in makes), with its bearer."""
+    from ..config_store import persist_source_config_updates
+    from ..models import Source
+    from . import directv_device_auth
+    src = Source.query.get(source_id)
+    cfg = dict((src.config if src else None) or {})
+    if not cfg.get('bearer_token') or cfg.get('dai_dma_id'):
+        return
+    account = requests.Session()
+    account.headers.update(directv_device_auth.app_headers())
+    ctx = fetch_account_context(account, cfg['bearer_token'])
+    updates = {f'dai_{k}': v for k, v in ctx.items() if v}
+    if updates:
+        persist_source_config_updates(source_id, updates)
+        logger.info('[directv-dai] fetched the account targeting values (%s)', ', '.join(sorted(updates)))
+
+
+def _in_background(fn, *args) -> None:
+    """Run fn in a daemon thread with the current Flask app context."""
+    try:
+        from flask import current_app
+        app = current_app._get_current_object()
+    except Exception:
+        app = None
+
+    def _run():
+        try:
+            if app is not None:
+                with app.app_context():
+                    fn(*args)
+            else:
+                fn(*args)
+        except Exception as exc:
+            logger.warning('[directv-dai] background %s failed: %s', getattr(fn, '__name__', 'task'), exc)
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def clear_cache_if_toggled(source, old: dict, current: dict) -> None:
     """The toggle picks which stream URL resolve() caches (for 55 minutes), so
     drop every cached one when it changes; the next tune fetches under the new setting."""
@@ -1029,9 +1097,8 @@ def clear_cache_if_toggled(source, old: dict, current: dict) -> None:
         from ..config_store import persist_source_cache_updates
         persist_source_cache_updates(source.id, {'directv_playback': {}})
     if enabled(current):
-        # Whenever DAI is on, capture the advertising id of any bridge device that doesn't
-        # have one yet: all of them right after turning DAI on, or a newly-added box on a
-        # later save. Background, skipping any box that's currently playing. This save-time
-        # pass is the ONLY automatic trigger -- a tune never captures (no new upstream hook,
-        # and a Google TV box is never interrupted mid-stream).
+        # Whenever DAI is saved on, capture the advertising id of any bridge device that
+        # doesn't have one yet (all of them right after turning DAI on). Background, skipping
+        # any box that's currently playing. This save-time pass is the ONLY automatic
+        # trigger -- a tune never captures (a Google TV box is never interrupted mid-stream).
         capture_in_background(uncaptured_addresses())

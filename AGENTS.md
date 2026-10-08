@@ -9,7 +9,8 @@ A patch overlay, not a fork. It builds [kineticman/FastChannels](https://github.
 ```
 patches/            the changes applied on top of upstream, as `git format-patch` files
 scripts/
-  apply-patches.sh    git am --3way each patch onto an upstream checkout
+  apply-patches.sh    git am --3way each patch onto an upstream checkout, then insert_hook.py
+  insert_hook.py      inserts the one install() line into upstream's create_app (never a patch hunk)
   validate.sh         static checks on the patched tree
   ruff_diff.py        fail only on ruff findings upstream doesn't already have
   smoke_test.py       exercises the DAI code inside the built image (incl. behavioral relay tests)
@@ -19,7 +20,8 @@ scripts/
   refresh-patches.sh  regenerates patches/ and source/ from commits on top of an upstream commit
 source/             readable copies of the overlay's own modules (generated; patches/ is authoritative)
 archive/            frozen old versions, never applied (the pre-2026-10-08 Android TV client patch)
-.github/workflows/build.yml
+.github/workflows/build.yml             the release build (upstream main) + AI repair
+.github/workflows/test-development.yml  test only: the full gauntlet on upstream development
 ```
 
 ## Build lifecycle
@@ -27,8 +29,8 @@ archive/            frozen old versions, never applied (the pre-2026-10-08 Andro
 Every 6 hours, on a manual run, or on a push to `patches/`, `scripts/` or the build workflow, the build job runs these steps — building and publishing only when there's a real change:
 
 1. Read upstream `main`'s newest commit and the newest Player APK release. Skip if that exact combination with these patches was already built.
-2. `git am --3way` the patches onto a fresh upstream checkout.
-3. Static checks: compile, no new ruff error-class findings, templates parse, the DAI module and every hook are present.
+2. `git am --3way` the patches onto a fresh upstream checkout (they only add our files), then `insert_hook.py` adds the one line to `create_app`.
+3. Static checks: compile, no new ruff error-class findings, upstream's files differ by the one hook line only, and every upstream name, string and route the overlay relies on is present.
 4. Build the image (bundles the latest Player APK from kineticman's releases) and confirm the APK is inside.
 5. Smoke test the DAI code inside the image; boot the container and wait for the web UI.
 6. Publish `:latest`, `:upstream-<sha>`, `:build-<key>`.
@@ -38,7 +40,7 @@ Step 1's dedup (the build key is just upstream sha + Player APK + the patch's ad
 
 The AI fix (Aider, with the model in the `AI_MODEL` variable — set to `openrouter/z-ai/glm-5.3-flash`) runs for two kinds of failure. It only ever edits files; CI does all git operations and runs the validation. Both paths converge on one shared repair script, **`scripts/ai_fix_drift.sh`**: it runs the whole gauntlet (`reproduce.sh`), hands the AI the failing log plus the files the patch touches (`git diff --name-only <sha> HEAD`), verifies the AI changed only those files and leaked no key, amends the fix into the patch commit, and re-checks everything — up to three attempts, each shown the latest failure. A fix must pass the static checks **and** a full image build, APK check, smoke test and boot test before the `open-pr` job merges it and starts the publishing build. A bad fix never reaches `main`.
 
-- **Conflict** (step 2 fails): the `resolve` job recreates the conflict and asks the AI to resolve it, editing only the conflicted files, then finishes the merge and runs `ai_fix_drift.sh`. Resolving the markers is often enough (the script reproduces clean and does nothing more), but if the *same* upstream change also drifted a file the patch adds or hooks that didn't conflict — e.g. upstream renamed a name one of the patch's own modules imports — the script repairs that too. So the conflict path self-heals instead of publishing a half-fixed patch that builds and then fails the smoke test.
+- **Conflict** (step 2 fails; practically unreachable now that the patch only adds our own files and the hook line is inserted by `insert_hook.py`): the `resolve` job recreates the conflict and asks the AI to resolve it, editing only the conflicted files, then finishes the merge and runs `ai_fix_drift.sh`. Resolving the markers is often enough (the script reproduces clean and does nothing more), but if the *same* upstream change also drifted a file the patch adds or hooks that didn't conflict — e.g. upstream renamed a name one of the patch's own modules imports — the script repairs that too. So the conflict path self-heals instead of publishing a half-fixed patch that builds and then fails the smoke test.
 - **Drift** (step 2 applies cleanly but a later check fails — upstream renamed or moved something a hook or an added module depends on): the `resolve-drift` job runs `ai_fix_drift.sh`, but **only on the unattended scheduled runs** (and test-run dispatches), never on a push or the post-merge dispatch. A clean reproduction (a transient hiccup, or a failure only in the publish/refresh steps) or a Docker/APK failure (infrastructure, not patch-fixable) stops without calling the AI and exports nothing. The overlay's own tests (`validate.sh`, `smoke_test.py`) are the spec and are not editable by the AI.
 
 If either path can't produce a passing fix, `ai-failed` comments on the matching status issue.
@@ -48,6 +50,7 @@ If either path can't produce a passing fix, `ai-failed` comments on the matching
 Two more workflows keep the whole thing hands-off by fixing drift *before* it reaches a release:
 
 - **`upstream-watch.yml`** polls kineticman's `development` branch every 6 hours. On a new commit (deduped via the Actions cache) it dispatches `build.yml` in drift-check mode against development (`upstream_branch=development`, `drift_only=true`). Because `upstream_branch` is set, that run is a test run: it never builds an image, publishes, refreshes the patch, or merges. If the patch drifts there, the AI adapts it and `open-pr` opens a **held** PR (branch `auto/drift-*`). That's the agent's prepared fix, left open and worded as FYI, not "merge me".
+- **`test-development.yml`** runs the full gauntlet (static checks, image, APK, smoke, boot) against `development` on every push here, daily, and by hand (any upstream ref). Test only: no publish, no commits, no AI. It's how a change here is proven on his newest code while `main` builds wait.
 - **`reconcile-drift.yml`** polls every 6 hours. For each open `auto/drift-*` PR it re-tests that PR's patch against the *current* upstream `main`. The moment a fix is proven valid for production, it merges the PR and dispatches the publishing build, which re-runs the full gauntlet, so a wrong fix can't reach `:latest`. It merges at most one per run and shares the `build` concurrency group so it can't race a publish.
 
 **Wait gate (2026-10-08):** `build.yml`'s skip step skips any upstream commit that lacks `app/scrapers/directv_device_auth.py` (his code sign-in, development-only for now), with a notice, so `main` builds wait for his release instead of failing into AI repair. Delete the gate once `main` has the file.
@@ -60,43 +63,46 @@ Sign-in, refresh and DRM recovery are **upstream's** (`app/scrapers/directv_devi
 
 ### Where the hooks live
 
-**Upstream's code gets exactly one line**, at the end of `create_app` in `app/__init__.py`:
+The design goal: upstream changes break the overlay as rarely as possible, and loudly when they do. So the overlay depends on as few of upstream's internals as it can, and on the most stable ones.
+
+**Upstream's code gets exactly one line**, before `create_app` returns in `app/__init__.py`:
 
 ```python
     from .scrapers import directv_dai_install; directv_dai_install.install(app)  # mackid1993 overlay: DirecTV DAI
     return app
 ```
 
-**Every other hook is in our own `app/scrapers/directv_dai_install.py`.** It wires the feature in at runtime by wrapping upstream functions *by name* after they're defined, never by editing their bodies, so upstream can rewrite those functions freely without a patch conflict. Rules every wrapper follows:
-- DAI off: upstream's function runs untouched.
-- Any error in our code: log it, run upstream's function. Drift degrades to "DAI off", never to broken playback.
-- Module-level wraps happen once per process (`create_app` runs several times), and per-app wraps (views, blueprint, `after_request`) once per app. A double wrap would cut ad loudness twice.
+It is inserted by `scripts/insert_hook.py` (run by `apply-patches.sh`), which finds `create_app` with Python's parser. It is **not** a patch hunk, so `git am` can't conflict on it; `patches/` only adds our five modules. `validate.sh` fails if upstream's files differ by anything but that line.
 
-`TARGETS` (top of `directv_dai_install.py`) lists every upstream name it touches, and `SOURCE_MARKERS` lists every upstream *string* it relies on without calling it, such as a template field or a lock key. Three layers report breakage, each naming exactly what moved:
-- **`validate.sh`** runs before any image is built. It checks every `TARGETS` name and every `SOURCE_MARKERS` string statically. It also runs upstream's real `renderDirectvConfig` (cut out of `sources.html`) with the DAI script wrapped around it in node, and checks that the toggle, the profile picker and the ad-id button render before `config-actions`.
-- **`smoke_test.py`** runs inside the built image. It checks every target is wrapped exactly once and that `install.status()` is clean. Then it drives the wiring end to end on a throwaway database: the settings API's `directv.code_signed_in`, the DAI schema field, the profile route, saving the toggle (cache clear plus capture), and the real `/admin/sources` page getting the script.
-- **At runtime**, `install.status()` (`/directv-dai/status`) lists missing names, missing strings and any wiring step that raised. The DirecTV settings show those in red. If `renderDirectvConfig` itself is gone, a banner at the top of the sources page says the DAI settings couldn't be added.
+**Everything else is in our own `app/scrapers/directv_dai_install.py`**, in three layers, most stable first:
+1. **HTTP layer, keyed on the relay's URL prefix (`RELAY_PREFIX` = `/play/directv/`), not on function names.** An `after_request` swaps inserted AC-3 ads to their AAC twins in every playlist response there; a `before_request` serves inserted-ad AAC segments there with the loudness cut (hosts on upstream's DirecTV CDN allowlist only); the app User-Agent goes on at `requests.Session.request`.
+2. **Our own UI and routes.** The DAI panel (toggle, profile picker, ad-id button) is our script and our routes; it mounts inside upstream's settings box for the DirecTV source (`id="source-config-<id>"`) and is also its own page at `/directv-dai`. `use_dai` lives in the source config, outside upstream's schema.
+3. **Wrapped by name, only where unavoidable** (`TARGETS`).
 
-| Upstream name (TARGETS) | What the wrap does |
-|---|---|
-| `directv.DirectvScraper.config_schema` | Appends the `use_dai` toggle (`directv_dai.CONFIG_FIELDS`), once. |
-| `directv.DirectvScraper.resolve` | Drops a cached URL from the other DAI setting (or, with DAI on, another device; `directv_dai.cached_url_usable`), then runs upstream's resolve with the scraper as the tune context (a `ContextVar`). |
-| `directv.DirectvScraper.prepare_license_request` (classmethod) | Same tune context for the license path's fallback fetch. |
-| `directv._fetch_channel_playback` | With DAI flags for this tune (`directv_dai.request_flags`), makes the Android TV app's `channel/v2` request (`_fetch_dai_playback`: app query, the device's app UA, no Origin/Referer) and returns upstream's dict shape plus `'dai': True`. Raises upstream's `DirectvAuthExpiredError` on `0015` so upstream's re-auth runs. Any other failure falls back to upstream's v1 request. Arguments are bound by name with `inspect.signature`. |
-| `directv._license_content_id_from_stream_url`, `directv.DirectvAuthExpiredError` | Used by the DAI fetch. |
-| `directv.DirectvScraper._fetch_allchannels_rows` | Records each row's `daiChannelName` (the `net` flag) via `directv_dai.note_channels`. |
-| `directv.apply_auth_result` | After upstream writes the session, `directv_dai.store_login_result` adds the DAI account values (DMA/ZIP/GPP fetched with the bearer for a `device_code` session; hhid/u). |
-| `directv_device_auth._result` | Carries `valuePairs.partnerProfileId`/`profileId` into the result (upstream keeps only the activation token). |
-| `directv_device_auth.is_device_session` | Also accepts the old overlay's `auth_method: 'dtv_android'` session, so it refreshes through upstream with no new sign-in. |
-| `directv_proxy._DIRECTV_BROWSER_CDN_SUFFIXES` | Adds `yospace.com`, so Yospace playlists take the relay. |
-| `directv_proxy._requests` | Swapped for `_RelayRequests`, which is identical except that a GET to a DirecTV relay host from a bridge device carries that device's DirecTV app User-Agent (Yospace master fetch + every playlist/segment). Everything else delegates to `requests`. |
-| `directv_proxy._rewrite_directv_browser_playlist` | Runs `dtv_aac_ads.swap_muffled_ads` on the text first (inserted AC-3 ad → its HE-AAC twin). |
-| `directv_proxy._directv_browser_proxyable_url` (+ `_directv_browser_asset_proxy_url`) | An inserted-ad creative (`dtv_aac_gain.is_ad_segment`, path-anchored) takes the relay on any CDN host. |
-| `directv_proxy.directv_browser_asset` (the view, found in `app.view_functions`) | A full (non-Range) inserted-ad AAC segment is fetched here and cut with `dtv_aac_gain.attenuate_ad_segment` (−12 dB, lossless). Every other asset goes to upstream's view. |
-| `SAVE_CONFIG_RULE` = `POST /api/sources/<int:source_id>/config` (found by URL rule) | After upstream saves the DirecTV settings: `directv_dai.clear_cache_if_toggled`, which drops cached URLs on a toggle flip and captures uncaptured devices' ad ids. |
-| `SOURCE_MARKERS` (strings in upstream files: `function renderDirectvConfig`, `class="config-actions"` and `cfg.directv.code_signed_in` in `sources.html`; `'code_signed_in'` in `api_sources.py`; the refresh-lock key `directv:auth:refreshing:` in `directv.py`) | Our blueprint serves `/directv-dai/admin.js` plus the `directv-profile` and `directv-capture-adids` routes. An `after_request` adds the script tag to the page containing `function renderDirectvConfig`. The script wraps that global function to add the **Run as DirecTV profile** picker (when `cfg.directv.code_signed_in`), the DAI toggle and the "Capture advertising IDs" button, all before `config-actions`. |
+Rules every hook follows:
+- DAI off: upstream's behavior, untouched.
+- Any error in our code: log it, run upstream's behavior. Drift degrades to "DAI off", never to broken playback.
+- Never silent: a missing name (`missing()`), a target whose shape changed (`status()['failed']`, e.g. a renamed fetch argument), and at runtime a tune that should have been DAI but wasn't (`status()['runtime']`) are all reported, by CI and in red in the DAI panel.
+- Module-level wraps happen once per process (`create_app` runs several times), per-app hooks once per app. A double wrap would cut ad loudness twice.
 
-If upstream renames a target, change the reference in `directv_dai_install.py` (and `TARGETS`). **Never edit an upstream file to bring the old name back.**
+What the overlay relies on in upstream, all listed at the top of `directv_dai_install.py` and checked by `validate.sh`, `smoke_test.py` and `status()`:
+
+| Upstream name | Kind | What it's for |
+|---|---|---|
+| `directv.DirectvScraper.resolve` | wrap | Drops a cached URL from the other DAI setting (or another device), runs upstream's resolve with the scraper as the tune context (a `ContextVar`), then records whether the tune really got DAI. |
+| `directv._fetch_channel_playback` | wrap | With DAI flags for this tune, makes the Android TV app's `channel/v2` request (`_fetch_dai_playback`) and returns upstream's dict shape plus `'dai': True`. Raises upstream's `DirectvAuthExpiredError` on `0015`; any other failure falls back to upstream's v1 request. Arguments bound by name (`bearer_token`, `cookies`, `client_context`, `ccid`); a missing one is reported. |
+| `directv.DirectvScraper.prepare_license_request` (classmethod) | wrap | The same tune context for the license path's fallback fetch. |
+| `directv.DirectvScraper._fetch_allchannels_rows` | wrap | Records each row's `daiChannelName` (the `net` flag). |
+| `directv.apply_auth_result` | wrap | After upstream writes the session, `store_login_result` adds the DAI account values (DMA/ZIP/GPP fetched with the bearer, DAI on only; hhid/u). |
+| `directv_device_auth._result` | wrap | Carries `valuePairs.partnerProfileId`/`profileId` into the result (upstream keeps only the activation token). |
+| `directv_proxy._DIRECTV_BROWSER_CDN_SUFFIXES` | extended | Adds `yospace.com`, so Yospace playlists take the relay. |
+| `USES`: `_license_content_id_from_stream_url`, `DirectvAuthExpiredError`, `directv_device_auth.AUTH_METHOD`/`app_headers`/`is_device_session`, `_directv_browser_cdn_allowed`, `BaseScraper.cache`/`_update_cache`, `bridge_devices.known_devices`, `config_store.persist_source_cache_updates`/`persist_source_config_updates`, `models.Source`/`SourceCache`, `extensions.db` | called/read | Named so a rename fails with its name. |
+| `RELAY_PREFIX` `/play/directv/` | URL prefix | The HTTP-layer hooks (ad swap, loudness cut, User-Agent). |
+| `SOURCE_MARKERS`: `id="source-config-{{ source.id }}"` in `sources.html`; the refresh-lock key `directv:auth:refreshing:` in `directv.py` | strings | Where the panel mounts (it is also at `/directv-dai`); the profile swap waits on upstream's refresh lock. |
+
+Our routes (our blueprint): `/directv-dai` (the panel page), `/directv-dai/admin.js`, `/directv-dai/status`, `/directv-dai/sources`, `/api/sources/<id>/directv-dai` (read/save the toggle), `/api/sources/<id>/directv-profile`, `/api/sources/<id>/directv-capture-adids`. A session the old overlay signed in (`auth_method: 'dtv_android'`) is re-tagged once to upstream's `AUTH_METHOD` (`migrate_old_sessions`).
+
+If upstream renames something, change the reference in `directv_dai_install.py` (and the module that uses it), and the entry in `TARGETS`/`USES`/`SOURCE_MARKERS`. **Never edit an upstream file, never drop an entry to make a check pass** (the smoke test counts them).
 
 ### Our modules
 
@@ -111,7 +117,7 @@ If upstream renames a target, change the reference in `directv_dai_install.py` (
 - **`directv_dai_device.py`**: the bridge device behind the request.
   - `_client_device()` matches the request IP to `bridge_devices.known_devices()` and reads Android ID, `limit_ad_tracking`, release, model, board and manufacturer over adb. They're persisted in `directv_dai_devices.json`, re-checked about hourly, and only a real change updates them.
   - `player_user_agent()`/`player_headers()` give the app UA, `APP_PROJECT_NAME/5.0.136.2002113867 (Android <release>; <model>; <board>)  PureRN/0.79.5`.
-- **`directv_dai_install.py`**: the wiring above.
+- **`directv_dai_install.py`**: the wiring above, the runtime health notes (`_note`, `health()`, `runtime_warnings()`), and the DAI panel (`_ADMIN_JS`, `_PAGE_HTML`).
 - **`dtv_aac_ads.py`** and **`dtv_aac_gain.py`**: the inserted-ad audio fix, stdlib only. `swap_muffled_ads`, `is_ad_segment`, `attenuate_ad_segment` (returns the bytes unchanged on any parse mismatch).
 
 **Why it exists:** to be ethical, so the right people get their fair share. The patch sends DirecTV and its advertisers the accurate information their own apps send, so local ads are delivered to the right market and counted, and the subscriber's privacy choice is honored. It is not a way to skip ads, fake measurement or impersonate other clients. See `CLAUDE.md` ("Why this exists").
@@ -121,7 +127,7 @@ Invariants a port must keep:
 - **Never invent values.** Only the account's own values and the playback device's own ids go in the query. Never mint random ids or make up an advertising id; anything missing is omitted.
 - **`d=android_tv` must be sent.** Without a device name the ad server recognizes, Yospace inserts no ads at all.
 - **Never send the desktop identity** (`d=desktop`, `plt,DSK`, `devgrp,DSK`, comScore `PC`/`b`): it pulls web ad inventory with wrong-market, band-limited ads.
-- **`is_lat`, `_fw_did`, `adid` and `comscore_device` come from the playback device** (bridge device matched by request IP), built as in `device_ad_flags()`, the same on every device: `android_id:<Android ID>` + `is_lat=0`; limited tracking: the opted-out form (`is_lat=1`, `_fw_did=google_advertising_id:optout`, `adid=optout`) when Fire OS reports `limit_ad_tracking=1`. `is_lat=0` is what gets local ads. Only when the requester isn't a bridge device is `is_lat` derived from GPP, and **only when `gpp_sid` is `7`**.
+- **`is_lat`, `_fw_did`, `adid` and `comscore_device` come from the playback device** (bridge device matched by request IP), built as in `device_ad_flags()`: the device's **real advertising id**, captured once per device (`google_advertising_id:<id>` + `adid=<id>`, `is_lat=0`); a deleted/limited id or `limit_ad_tracking=1` gives the opted-out form (`is_lat=1`, `_fw_did=google_advertising_id:optout`, `adid=optout`); `android_id:<Android ID>` + `is_lat=0` **only** as the last resort when no advertising id could be read. `is_lat=0` is what gets local ads. Only when the requester isn't a bridge device is `is_lat` derived from GPP, and **only when `gpp_sid` is `7`**.
 - Yospace URLs need `yospace.pool=livepause`; without it Yospace answers 503.
 - DAI params are merged with exact-key dedup: a key already in the URL is never duplicated or overridden.
 - Changing the toggle must clear the cached playback URLs.
@@ -129,16 +135,17 @@ Invariants a port must keep:
 
 ## Resolving a conflict (and repairing drift)
 
-The patch is our own modules (`directv_dai.py`, `directv_dai_device.py`, `directv_dai_install.py`, `dtv_aac_ads.py`, `dtv_aac_gain.py`), which we own outright, plus **one line** in upstream's `app/__init__.py`. So:
+The patch only adds our own modules (`directv_dai.py`, `directv_dai_device.py`, `directv_dai_install.py`, `dtv_aac_ads.py`, `dtv_aac_gain.py`), and the one line in `create_app` is inserted by `scripts/insert_hook.py`, not carried as a hunk. So:
 
-- **A conflict** (`git am` fails) can only be that one line. Keep upstream's current `create_app` and put the line back just before it returns `app`.
-- **Drift** (the patch applies but `validate.sh`/`smoke_test.py` fails) means upstream renamed or moved a name in `TARGETS`, the save-config URL rule, or a template marker. The failure names it. Find the new name in `upstream_index.txt`, update the reference in `directv_dai_install.py` (and `TARGETS`), and keep the wrapper's behavior. If the target's shape changed (new arguments, a different return value), adapt the wrapper to it. The wrappers bind arguments by name, so a new parameter alone doesn't break them.
-- **Never add code to an upstream file**, and never restore an old upstream name there. Upstream's files are upstream's, apart from the one line.
-- **The AI runs unattended.** It never asks a question. When a capability is genuinely gone it says so in one sentence and makes no edit.
-- **Backport, don't fabricate.** If a capability a wrapper needs is gone but rebuildable from real upstream data, rebuild it in one of our modules from that real data. Never invent data, and never write a hollow stub.
+- **A conflict** (`git am` fails) can only mean upstream added a file with one of our modules' names. If `insert_hook.py` fails, upstream's app factory changed shape: update `insert_hook.py` (a human change), never `app/__init__.py`.
+- **Drift** (the patch applies but `validate.sh`/`smoke_test.py` fails) means upstream renamed, moved or reshaped something in `TARGETS`, `USES`, `SOURCE_MARKERS` or `RELAY_PREFIX`. The failure names it. Find the new name in `upstream_index.txt`, update the entry and every reference in our modules, and keep the behavior. If a wrapped target's shape changed (new arguments, a different return value), adapt the wrapper to it.
+- **Never touch an upstream file.** CI inserts the hook line and `validate.sh` rejects any other change to upstream's files.
+- **Never drop an entry or weaken a check** to get green; the smoke test counts the entries.
+- **The AI runs unattended.** It never asks a question. When what the overlay needs is truly gone from upstream, it says so in one sentence and makes no edit.
+- **Never fabricate**: no invented values, no hollow stubs, no copies of removed upstream code.
 - Touch only what the failure requires. Keep the Python valid. Verify with `python3 -m compileall -q app`, then `scripts/validate.sh`, then `scripts/smoke_test.py` (CI runs it inside the built image).
-- In CI, only the patch's files are editable; editing any other file fails the run.
+- In CI, only our five modules are editable; editing any other file fails the run.
 
 ## Changing the patch by hand
 
-Clone upstream, run `scripts/apply-patches.sh <checkout>`, commit your change (or amend) in the checkout, then run `scripts/refresh-patches.sh <checkout> <upstream-sha>` and commit `patches/` here.
+Clone upstream, run `scripts/apply-patches.sh <checkout>`, commit your change (or amend) in the checkout, then run `scripts/refresh-patches.sh <checkout> <upstream-sha>` and commit `patches/` and `source/` here (it leaves `app/__init__.py` out; the hook line is always inserted by `insert_hook.py`). Commits are authored as `mackid1993 <david@brustein.net>`, with no Claude/AI attribution trailers (see `CLAUDE.md`).

@@ -7,7 +7,8 @@ device's values are saved in directv_dai_devices.json beside the database, so a 
 keeps one stable identity while it's asleep or adb is down.
 
 The same properties build the app's player User-Agent, which the relay sends on the
-Yospace master fetch and every playlist and segment (A/B tested for inserted ads).
+Yospace master fetch and every playlist and segment with DAI on (A/B tested for
+inserted ads).
 
 Sign-in, refresh and DRM are upstream's (directv_device_auth); nothing here touches them.
 """
@@ -43,11 +44,13 @@ def _client_device() -> dict:
     Each device's values are saved on disk (directv_dai_devices.json) and every
     session uses the saved values, so a device keeps one stable identity even
     while it's asleep or adb is down. A device seen for the first time is read
-    over adb right away. After that it's re-checked in the background about once
-    an hour; if it really changed (factory reset gives a new Android ID, ad
-    tracking toggled, firmware update), the saved values are updated and logged.
-    A failed re-check changes nothing. {} when the request isn't from a known
-    bridge device, or outside a request."""
+    over adb in the background (never in the request: adb can take seconds, and
+    this runs on every relay fetch); until that read lands it has no values.
+    After that it's re-checked in the background about once an hour; if it
+    really changed (factory reset gives a new Android ID, ad tracking toggled,
+    firmware update), the saved values are updated and logged. A failed read or
+    re-check changes nothing. {} when the request isn't from a known bridge
+    device, or outside a request."""
     try:
         from flask import has_request_context, request
         ip = (request.remote_addr or '').strip() if has_request_context() else ''
@@ -65,16 +68,44 @@ def _client_device() -> dict:
     props = _saved_devices().get(address) or {}
     if props:
         _DEVICE_CACHE[address] = (now + _DEVICE_TTL, props)
-        threading.Thread(target=_recheck_device, args=(address, props), daemon=True).start()
+        _spawn(_recheck_device, address, props)
         return props
+    # First sight: hold off repeat reads for _RETRY_TTL, read in the background.
+    _DEVICE_CACHE[address] = (now + _RETRY_TTL, {})
+    _spawn(_first_read, address)
+    hit = _DEVICE_CACHE.get(address)
+    return hit[1] if hit else {}
+
+
+def _spawn(fn, *args) -> None:
+    """Run fn in a daemon thread, inside the current Flask app context (the device
+    store's path comes from the app's database setting)."""
+    try:
+        from flask import current_app
+        app = current_app._get_current_object()
+    except Exception:
+        app = None
+
+    def _run():
+        try:
+            if app is not None:
+                with app.app_context():
+                    fn(*args)
+            else:
+                fn(*args)
+        except Exception as exc:
+            logger.debug('[directv-dai] device read failed: %s', exc)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _first_read(address: str) -> None:
     props = _read_device(address)
     if props:
         _store_device(address, props)
+        _DEVICE_CACHE[address] = (time.time() + _DEVICE_TTL, props)
         logger.info('[directv-dai] saved device values for %s', address)
     else:
-        logger.warning('[directv-dai] adb read failed for %s; this session has no device id', address)
-    _DEVICE_CACHE[address] = (now + (_DEVICE_TTL if props else _RETRY_TTL), props)
-    return props
+        logger.warning('[directv-dai] adb read failed for %s; its sessions have no device id until a read works', address)
 
 
 def _recheck_device(address: str, saved: dict) -> None:
@@ -95,8 +126,24 @@ def _store_device(address: str, props: dict) -> None:
 
 _RETRY_TTL = 60
 
+# Request IP -> bridge address. Looking it up asks upstream's bridge_devices, which
+# reads the database and asks ah4c over HTTP, and the relay looks it up on every
+# playlist and segment fetch, so the answer is kept for a minute.
+_BRIDGE_CACHE: dict[str, tuple[float, str | None]] = {}
+_BRIDGE_TTL = 60
+
 
 def _bridge_address(ip: str) -> str | None:
+    now = time.time()
+    hit = _BRIDGE_CACHE.get(ip)
+    if hit and now < hit[0]:
+        return hit[1]
+    address = _lookup_bridge_address(ip)
+    _BRIDGE_CACHE[ip] = (now + _BRIDGE_TTL, address)
+    return address
+
+
+def _lookup_bridge_address(ip: str) -> str | None:
     try:
         from .. import bridge_devices
         return next((d['address'] for d in bridge_devices.known_devices()[0]

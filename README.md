@@ -53,12 +53,14 @@ The overlay's code lives in its own files, which upstream doesn't have and so ca
 - `app/scrapers/dtv_aac_ads.py`: the inserted-ad audio swap.
 - `app/scrapers/dtv_aac_gain.py`: the inserted-ad loudness cut.
 
-Upstream's code gets **exactly one line**, at the end of `create_app` in `app/__init__.py`. That line runs the wiring, which attaches DAI to upstream's functions at startup instead of editing their bodies. Upstream can rewrite any of those functions freely and the patch still applies.
+Upstream's code gets **exactly one line**, before `create_app` returns in `app/__init__.py`, inserted by `scripts/insert_hook.py` rather than carried in the patch, so the patch (which only adds the files above) can't conflict. That line runs the wiring, which attaches DAI at startup without editing upstream's code. As much as possible it hooks the relay's URLs, our own settings panel and the `requests` library rather than upstream's internal function names, so upstream can restructure its code freely.
 
-What *can* drift is a name, or a string the wiring relies on, like a settings field or a lock key. You'll know three ways:
-- **The build fails** before any image is built, naming exactly what upstream changed. A "Build failed" issue pings you, and the AI repair takes it. The fix is one line in `directv_dai_install.py`, never in upstream's files.
-- **The smoke test fails** if the wiring is there but no longer works. It drives upstream's real settings API, profile route, save button and sources page on a throwaway database.
-- **The DirecTV settings page shows it in red** if a running server ever has a mismatch, for example a development build, listing what's not wired. A banner appears if the settings can't attach at all.
+What *can* drift is one of the few upstream names, or a string the wiring relies on, all listed at the top of `directv_dai_install.py`. You'll know three ways:
+- **The build fails** before any image is built, naming exactly what upstream changed. A "Build failed" issue pings you, and the AI repair takes it. The fix is in `directv_dai_install.py`, never in upstream's files (CI rejects any other change to them).
+- **The smoke test fails** if the wiring is there but no longer works. It drives upstream's real relay routes, the DAI panel, upstream's own settings save and the sources page on a throwaway database.
+- **The DAI panel shows it in red** if a running server ever has a mismatch, including when DAI is on but tunes stopped getting a DAI stream. The panel is in the DirecTV source's settings and also at `/directv-dai`, which works even if upstream rebuilds its settings page.
+
+`test-development.yml` runs the same full test against kineticman's `development` branch on every change here and daily, so a break shows up before his release (test only; nothing is published).
 
 At runtime every piece fails safe: if something it hooks onto is missing or errors, that piece logs an error and the stream plays as if DAI were off.
 
@@ -68,7 +70,7 @@ If any step fails, nothing is published, `:latest` stays on the last good build,
 
 ## When the patch conflicts
 
-If upstream rewrites the lines around the one hook, step 2 fails and the workflow opens an issue here with the upstream commit and instructions.
+The patch only adds the overlay's own files and the hook line is inserted by a script, so a conflict should no longer happen (only if upstream added a file with one of our names). If one does, step 2 fails and the workflow opens an issue here with the upstream commit and instructions.
 
 It then asks an AI to resolve the conflict: [Aider](https://aider.chat) with an OpenRouter model (the `OPENROUTER_API_KEY` secret; the model is set by the `AI_MODEL` repo variable and the workflow default, currently GLM 5.3 Flash, `openrouter/z-ai/glm-5.3-flash`), given the patch and `AGENTS.md` as background. It runs with a read-only token and can edit only the conflicted files. Its result must pass the static checks **and** a full image build, Player APK check, smoke test and boot test before anything is merged. Then CI opens a pull request with it, merges it, and runs the publishing build; the issue closes when that succeeds. If the AI can't produce a passing fix, nothing is merged and the issue gets a comment saying so.
 

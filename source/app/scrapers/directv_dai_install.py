@@ -1,21 +1,36 @@
 """Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 
-Upstream's files carry a single hook (``directv_dai_install.install(app)`` at the end
-of ``create_app``). Everything else is attached here by wrapping upstream's own
-functions and views after they're defined, so upstream can rewrite the bodies of
-those functions freely without a patch conflict. Rules every wrapper follows:
+Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
+``create_app``, inserted by scripts/apply-patches.sh, never by a patch hunk). Everything
+else is attached here, and as little of it as possible depends on upstream's internal
+names:
 
-- DAI off -> the wrapper calls upstream's function untouched.
-- Any error in our code -> log it and fall back to upstream's function, so drift
+- The relay is hooked at the HTTP layer, not by function name: a Flask ``after_request``
+  swaps inserted AC-3 ads to their AAC twins in every DirecTV playlist response under
+  ``/play/directv/``, a ``before_request`` serves inserted-ad AAC segments with the
+  loudness cut, and the app User-Agent is added at the ``requests`` library level
+  (``requests.Session.request``) for relay fetches to DirecTV CDN hosts. Upstream can
+  rename or restructure its relay functions freely.
+- The settings (DAI toggle, viewer-profile picker, "Capture advertising IDs") are our
+  own panel, served by our own blueprint and saved through our own route. The script
+  adds the panel inside each DirecTV source's settings box, and the same panel is at
+  ``/directv-dai`` on its own page, so no upstream template function is touched.
+- What can't be avoided is wrapped by name: the scraper's tune path (resolve, the
+  channel authorization, the license fallback, the lineup rows), apply_auth_result
+  and the code sign-in's result (for the household id).
+
+Rules every hook follows:
+- DAI off -> upstream's behavior, untouched.
+- Any error in our code -> log it and fall back to upstream's behavior, so drift
   degrades to "DAI off", never to broken playback.
-- A target that's gone is logged at ERROR by install() and listed by ``missing()``;
-  CI (validate.sh / smoke_test.py) fails loudly on it. Fix a moved target HERE.
+- Breakage is reported, never silent: a missing name (``missing()``), a wrap whose
+  target changed shape (``_failed``), and at runtime a tune that should have been DAI
+  but wasn't (``_note`` -> ``status()['runtime']``). CI (validate.sh / smoke_test.py)
+  fails on the first two; the admin panel shows all three in red.
 
 Module-level patches are applied once per process (create_app runs several times:
-the web app, the RQ worker, run_directv_auth's own app); per-app pieces (views, the
-blueprint, the admin-page script) once per app.
-
-TARGETS lists every upstream name this touches.
+the web app, the RQ worker, run_directv_auth's own app); per-app pieces (hooks, the
+blueprint) once per app.
 """
 from __future__ import annotations
 
@@ -23,62 +38,66 @@ import contextvars
 import functools
 import inspect
 import logging
+import threading
 import time
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import urlsplit
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-# Every upstream name install() depends on: (module, attribute path). validate.sh and
-# smoke_test.py check each one, so an upstream rename fails CI with its name.
+# Upstream names install() wraps or changes in place: (module, attribute path).
 TARGETS = (
     ('app.scrapers.directv', '_fetch_channel_playback'),
-    ('app.scrapers.directv', '_license_content_id_from_stream_url'),
-    ('app.scrapers.directv', 'DirectvAuthExpiredError'),
     ('app.scrapers.directv', 'apply_auth_result'),
-    ('app.scrapers.directv', 'DirectvScraper.config_schema'),
     ('app.scrapers.directv', 'DirectvScraper.resolve'),
     ('app.scrapers.directv', 'DirectvScraper.prepare_license_request'),
     ('app.scrapers.directv', 'DirectvScraper._fetch_allchannels_rows'),
     ('app.scrapers.directv_device_auth', '_result'),
-    ('app.scrapers.directv_device_auth', 'is_device_session'),
-    ('app.scrapers.directv_device_auth', 'app_headers'),
-    ('app.routes.directv_proxy', '_requests'),
     ('app.routes.directv_proxy', '_DIRECTV_BROWSER_CDN_SUFFIXES'),
-    ('app.routes.directv_proxy', '_directv_browser_cdn_allowed'),
-    ('app.routes.directv_proxy', '_directv_browser_proxyable_url'),
-    ('app.routes.directv_proxy', '_directv_browser_asset_proxy_url'),
-    ('app.routes.directv_proxy', '_rewrite_directv_browser_playlist'),
-    ('app.routes.directv_proxy', 'directv_browser_asset'),
 )
-# Views found by URL rule (more stable than function names).
-SAVE_CONFIG_RULE = '/api/sources/<int:source_id>/config'
+# Upstream names the overlay's modules call or read without wrapping them. Checked the
+# same way as TARGETS, so a rename fails CI with its name instead of a vague error.
+USES = (
+    ('app.scrapers.directv', '_license_content_id_from_stream_url'),
+    ('app.scrapers.directv', 'DirectvAuthExpiredError'),
+    ('app.scrapers.directv_device_auth', 'AUTH_METHOD'),
+    ('app.scrapers.directv_device_auth', 'app_headers'),
+    ('app.scrapers.directv_device_auth', 'is_device_session'),
+    ('app.routes.directv_proxy', '_directv_browser_cdn_allowed'),
+    ('app.scrapers.base', 'BaseScraper.cache'),
+    ('app.scrapers.base', 'BaseScraper._update_cache'),
+    ('app.bridge_devices', 'known_devices'),
+    ('app.config_store', 'persist_source_cache_updates'),
+    ('app.config_store', 'persist_source_config_updates'),
+    ('app.models', 'Source'),
+    ('app.models', 'SourceCache'),
+    ('app.extensions', 'db'),
+)
+# The relay's URL space. The Player app and Channels fetch these URLs, so they're the
+# most stable contract upstream has; the HTTP-layer hooks key on this prefix only.
+RELAY_PREFIX = '/play/directv/'
 # Strings in upstream's files the wiring relies on without calling them by name:
-# (file, text, what breaks without it). validate.sh, smoke_test.py and the admin page's
-# warning (see status()) all check these.
+# (file, text, what breaks without it). validate.sh, smoke_test.py and status() check these.
 SOURCE_MARKERS = (
-    ('app/templates/admin/sources.html', 'function renderDirectvConfig',
-     'the DAI settings (toggle, profile picker, ad-id button) attach to this function'),
-    ('app/templates/admin/sources.html', 'class="config-actions"',
-     'the DAI settings are placed just before this'),
-    ('app/templates/admin/sources.html', 'cfg.directv.code_signed_in',
-     'the profile picker shows only for a code sign-in, read from this field'),
-    ('app/routes/api_sources.py', "'code_signed_in'",
-     'the settings API provides the code-sign-in flag the profile picker reads'),
+    ('app/templates/admin/sources.html', 'id="source-config-{{ source.id }}"',
+     'the DAI panel is added inside each source\'s settings box (it is still at /directv-dai)'),
     ('app/scrapers/directv.py', 'directv:auth:refreshing:',
      "the profile swap waits on upstream's token-refresh lock (this key)"),
 )
+# The fetch arguments the DAI request reads by name (inspect.signature binds them).
+_FETCH_ARGS = ('bearer_token', 'cookies', 'client_context', 'ccid')
 
 _CHANNEL_AUTH_V2 = 'https://api.cld.dtvce.com/right/authorization/channel/v2'
 
-# The scraper (config + cache) behind the current _fetch_channel_playback call. Set by
-# the resolve()/prepare_license_request() wrappers, since upstream's fetch takes no config.
+# The scraper (config + channel names + a result slot) behind the current
+# _fetch_channel_playback call. Set by the resolve()/prepare_license_request() wrappers,
+# since upstream's fetch takes no config.
 _TUNE = contextvars.ContextVar('directv_dai_tune', default=None)
 
 _process_patched = False
 _missing: list[str] = []
-_failed: list[str] = []   # wiring steps that raised (named in status())
+_failed: list[str] = []   # wiring steps that raised or found a changed shape (named in status())
 
 
 def _resolve(module_name: str, path: str):
@@ -90,9 +109,9 @@ def _resolve(module_name: str, path: str):
 
 
 def missing() -> list[str]:
-    """TARGETS that don't exist in this upstream (empty = everything wired)."""
+    """TARGETS and USES that don't exist in this upstream (empty = everything present)."""
     gone = []
-    for module_name, path in TARGETS:
+    for module_name, path in (*TARGETS, *USES):
         try:
             _resolve(module_name, path)
         except Exception:
@@ -115,18 +134,33 @@ def missing_markers(root: str) -> list[str]:
     return gone
 
 
-def status(app=None) -> dict:
-    """What's not wired, for the admin page's warning and for CI: upstream names that
-    are gone, and upstream strings that are gone. Empty lists mean everything is wired."""
-    import os
-    root = ''
+def missing_relay(app) -> list[str]:
+    """The relay hooks need upstream to serve DirecTV under RELAY_PREFIX."""
     try:
-        from flask import current_app
-        root = os.path.dirname((app or current_app).root_path)
+        if any(r.rule.startswith(RELAY_PREFIX) for r in app.url_map.iter_rules()):
+            return []
     except Exception:
         pass
-    return {'missing': missing(), 'markers': missing_markers(root) if root else [],
-            'failed': sorted(set(_failed))}
+    return [f'no upstream route under {RELAY_PREFIX} any more: the ad audio swap and loudness cut are off']
+
+
+def status(app=None) -> dict:
+    """What's not wired, for the admin panel's warning and for CI: upstream names that
+    are gone, upstream strings that are gone, wiring steps that failed, and runtime
+    problems (DAI on, yet a tune didn't get a DAI stream). Empty lists = all good."""
+    import os
+    root, markers, relay = '', [], []
+    try:
+        from flask import current_app
+        app = app or current_app._get_current_object()
+        root = os.path.dirname(app.root_path)
+        relay = missing_relay(app)
+    except Exception:
+        pass
+    if root:
+        markers = missing_markers(root)
+    return {'missing': missing(), 'markers': markers + relay,
+            'failed': sorted(set(_failed)), 'runtime': runtime_warnings()}
 
 
 def install(app) -> None:
@@ -138,11 +172,11 @@ def install(app) -> None:
             logger.error('[directv-dai] upstream moved %s; that part of DAI is not wired', name)
         if not _process_patched:
             _process_patched = True
-            for step in (_patch_scraper, _patch_device_auth, _patch_relay):
+            for step in (_patch_scraper, _patch_device_auth, _patch_relay_hosts, _patch_user_agent):
                 _try(step)
         if 'directv_dai' not in app.extensions:
             app.extensions['directv_dai'] = True
-            for step in (_patch_asset_view, _patch_save_view, _register_admin):
+            for step in (_register_relay_hooks, _register_admin, _register_migration):
                 _try(step, app)
     except Exception:
         logger.exception('[directv-dai] install failed; DAI is off')
@@ -152,8 +186,13 @@ def _try(step, *args) -> None:
     try:
         step(*args)
     except Exception:
-        _failed.append(step.__name__.lstrip('_'))
+        _fail(step.__name__.lstrip('_'))
         logger.exception('[directv-dai] could not wire %s', step.__name__)
+
+
+def _fail(what: str) -> None:
+    _failed.append(what)
+    logger.error('[directv-dai] wiring problem: %s', what)
 
 
 def _wraps(original, wrapper):
@@ -166,48 +205,143 @@ def _already(fn) -> bool:
     return getattr(fn, '__directv_dai__', False) or getattr(getattr(fn, '__func__', None), '__directv_dai__', False)
 
 
+# ── Runtime health: DAI on, but did the tune really get DAI? ──────────────────────
+# Every hook falls back to upstream on trouble, so a broken hook looks like "DAI off".
+# These notes make it visible: the admin panel shows a red line when the most recent
+# problem is newer than the most recent good DAI tune. Stored in redis (shared by every
+# gunicorn worker) when it's reachable, else per process.
+
+_HEALTH_KEY = 'directv_dai:health'
+_PROBLEMS = {
+    'bypassed': 'DAI is on, but a tune never reached the DAI request (upstream changed its tune path)',
+    'error': 'a DAI hook raised (see the server log)',
+    'fallback': 'the last DAI tune fell back to the non-DAI stream',
+}
+_local_health: dict[str, dict] = {}
+_rdb = [None, 0.0]
+
+
+def _redis():
+    now = time.time()
+    if _rdb[0] is not None or now < _rdb[1]:
+        return _rdb[0]
+    try:
+        import redis as _redis_mod
+        from flask import current_app
+        _rdb[0] = _redis_mod.from_url(current_app.config['REDIS_URL'],
+                                      socket_connect_timeout=1, socket_timeout=1)
+        _rdb[0].ping()
+    except Exception:
+        _rdb[0] = None
+        _rdb[1] = now + 60   # no redis: don't retry on every note
+    return _rdb[0]
+
+
+def _note(kind: str, detail: str = '') -> None:
+    now = time.time()
+    detail = (detail or '')[:300]
+    try:
+        rdb = _redis()
+        if rdb is not None:
+            rdb.hset(_HEALTH_KEY, mapping={f'{kind}.at': now, f'{kind}.detail': detail})
+            rdb.hincrby(_HEALTH_KEY, f'{kind}.count', 1)
+            return
+    except Exception:
+        _rdb[0], _rdb[1] = None, time.time() + 60
+    h = _local_health.setdefault(kind, {'count': 0})
+    h.update(count=h['count'] + 1, at=now, detail=detail)
+
+
+def health() -> dict:
+    """{kind: {'at', 'count', 'detail'}} for ok, bypassed, error, fallback, ad_cut, ad_uncut."""
+    out = {k: dict(v) for k, v in _local_health.items()}
+    try:
+        rdb = _redis()
+        if rdb is not None:
+            for key, value in (rdb.hgetall(_HEALTH_KEY) or {}).items():
+                key = key.decode() if isinstance(key, bytes) else key
+                value = value.decode() if isinstance(value, bytes) else value
+                kind, _, field = key.rpartition('.')
+                out.setdefault(kind, {})[field] = (int(value) if field == 'count'
+                                                   else float(value) if field == 'at' else value)
+    except Exception:
+        pass
+    return out
+
+
+def runtime_warnings() -> list[str]:
+    h = health()
+    ok_at = float((h.get('ok') or {}).get('at') or 0)
+    out = []
+    for kind, text in _PROBLEMS.items():
+        info = h.get(kind) or {}
+        if float(info.get('at') or 0) > ok_at:
+            detail = info.get('detail') or ''
+            out.append(f'{text}{": " + detail if detail else ""}')
+    return out
+
+
 # ── Scraper (app/scrapers/directv.py) ───────────────────────────────────────────
 
 def _patch_scraper() -> None:
     from . import directv, directv_dai
     cls = directv.DirectvScraper
 
-    if not any(getattr(f, 'key', None) == 'use_dai' for f in cls.config_schema):
-        cls.config_schema = [*cls.config_schema, *directv_dai.CONFIG_FIELDS]
-
     # resolve(): drop a cached URL from the other DAI setting (or, with DAI on, another
-    # device), then run upstream's resolve with this scraper as the tune context.
+    # device), run upstream's resolve with this scraper as the tune context, then check
+    # the tune really got DAI.
     orig_resolve = cls.resolve
     if not _already(orig_resolve):
         def resolve(self, raw_url, *a, **kw):
+            dai, names = False, None
             try:
                 dai = directv_dai.enabled(self.config)
+                names = self.cache.get('dai_channel_names')
                 playback = self.cache.get('directv_playback') or {}
-                stale = [k for k, v in playback.items()
-                         if isinstance(v, dict) and not directv_dai.cached_url_usable(v, dai)]
-                if stale:
-                    self.cache['directv_playback'] = {k: v for k, v in playback.items() if k not in stale}
+                fresh = {k: v for k, v in playback.items()
+                         if not isinstance(v, dict) or directv_dai.cached_url_usable(v, dai)}
+                if len(fresh) != len(playback):
+                    self._update_cache('directv_playback', fresh)
             except Exception:
+                _note('error', 'resolve: cache check')
                 logger.exception('[directv-dai] cache check failed')
-            token = _TUNE.set((self.config, self.cache.get('dai_channel_names')))
+            state = {'called': False, 'dai': False}
+            token = _TUNE.set((self.config, names, state))
             try:
-                return orig_resolve(self, raw_url, *a, **kw)
+                url = orig_resolve(self, raw_url, *a, **kw)
             finally:
                 _TUNE.reset(token)
+            if dai:
+                try:
+                    _check_tune(self, raw_url, url, state)
+                except Exception:
+                    logger.exception('[directv-dai] tune check failed')
+            return url
         cls.resolve = _wraps(orig_resolve, resolve)
 
     # prepare_license_request() (a classmethod): its fallback fetch uses the same session type.
     orig_license = cls.__dict__.get('prepare_license_request')
-    if isinstance(orig_license, classmethod) and not _already(orig_license):
+    if not isinstance(orig_license, classmethod):
+        _fail('DirectvScraper.prepare_license_request is no longer a classmethod; '
+              'its fallback fetch would skip DAI (adapt _patch_scraper)')
+    elif not _already(orig_license):
         fn = orig_license.__func__
-
-        def prepare_license_request(klass, challenge, config, *a, **kw):
-            token = _TUNE.set((config, None))
-            try:
-                return fn(klass, challenge, config, *a, **kw)
-            finally:
-                _TUNE.reset(token)
-        cls.prepare_license_request = classmethod(_wraps(fn, prepare_license_request))
+        lic_sig = inspect.signature(fn)
+        if 'config' not in lic_sig.parameters:
+            _fail("DirectvScraper.prepare_license_request has no 'config' argument any more (adapt _patch_scraper)")
+        else:
+            def prepare_license_request(klass, *a, **kw):
+                config = None
+                try:
+                    config = lic_sig.bind(klass, *a, **kw).arguments.get('config')
+                except Exception:
+                    logger.exception('[directv-dai] could not read the license request config')
+                token = _TUNE.set((config, None, {'called': False, 'dai': False}) if config else None)
+                try:
+                    return fn(klass, *a, **kw)
+                finally:
+                    _TUNE.reset(token)
+            cls.prepare_license_request = classmethod(_wraps(fn, prepare_license_request))
 
     # The lineup rows carry each channel's daiChannelName (the Yospace `net` flag).
     orig_rows = cls._fetch_allchannels_rows
@@ -225,27 +359,40 @@ def _patch_scraper() -> None:
     orig_fetch = directv._fetch_channel_playback
     if not _already(orig_fetch):
         sig = inspect.signature(orig_fetch)
+        gone = [n for n in _FETCH_ARGS if n not in sig.parameters]
+        if gone:
+            _fail(f'_fetch_channel_playback no longer takes {", ".join(gone)}; '
+                  'DAI tunes fall back to non-DAI (adapt _fetch_dai_playback)')
 
         def _fetch_channel_playback(*args, **kwargs):
             tune = _TUNE.get()
-            flags = None
-            try:
-                if tune:
-                    bound = sig.bind(*args, **kwargs).arguments
+            flags = bound = None
+            if tune and not gone:
+                try:
+                    b = sig.bind(*args, **kwargs)
+                    b.apply_defaults()
+                    bound = b.arguments
                     flags = directv_dai.request_flags(tune[0], tune[1], bound['ccid'])
-            except Exception:
-                logger.exception('[directv-dai] could not build the DAI request; playing without DAI')
+                except Exception:
+                    _note('error', 'could not build the DAI request')
+                    logger.exception('[directv-dai] could not build the DAI request; playing without DAI')
             if not flags:
                 return orig_fetch(*args, **kwargs)
+            state = tune[2] if len(tune) > 2 else {}
+            state['called'] = True
+            reason = 'no DAI stream for this channel'
             try:
                 result = _fetch_dai_playback(directv, bound, flags)
             except directv.DirectvAuthExpiredError:
                 raise
-            except Exception:
+            except Exception as exc:
                 logger.exception('[directv-dai] DAI authorization failed')
-                result = None
+                result, reason = None, f'channel/v2 raised {type(exc).__name__}'
+                _note('error', reason)
             if result:
+                state['dai'] = True
                 return result
+            _note('fallback', reason if isinstance(reason, str) else '')
             logger.warning('[directv-dai] no DAI stream for this tune; playing without DAI')
             return orig_fetch(*args, **kwargs)
         directv._fetch_channel_playback = _wraps(orig_fetch, _fetch_channel_playback)
@@ -263,6 +410,23 @@ def _patch_scraper() -> None:
         directv.apply_auth_result = _wraps(orig_apply, apply_auth_result)
 
 
+def _check_tune(scraper, raw_url: str, url, state: dict) -> None:
+    """DAI is on: record whether this tune really got a DAI stream."""
+    if isinstance(url, str) and 'yospace.com' in url:
+        _note('ok')
+        return
+    if state.get('called'):
+        return   # our DAI request ran and fell back; it noted why
+    # Not fetched this time: a cache hit of a DAI entry is fine (a channel with no DAI
+    # stream caches its non-Yospace URL tagged dai=True); anything else means upstream's
+    # resolve no longer goes through the fetch we wrap.
+    ccid = str(raw_url or '').split('://', 1)[-1].split('/', 1)[0]
+    cached = (scraper.cache.get('directv_playback') or {}).get(ccid)
+    if isinstance(cached, dict) and cached.get('dai'):
+        return
+    _note('bypassed', 'resolve() returned without calling _fetch_channel_playback')
+
+
 def _fetch_dai_playback(directv, args: dict, flags: dict) -> dict | None:
     """The Android TV app's channel authorization (channel/v2): its query, the device's
     app User-Agent, no browser Origin/Referer. Returns upstream's playback dict shape
@@ -271,11 +435,11 @@ def _fetch_dai_playback(directv, args: dict, flags: dict) -> dict | None:
     from . import directv_dai, directv_dai_device
     ccid = args['ccid']
     session = requests.Session()
-    session.headers.update({
-        'Accept': '*/*',
-        'Authorization': f"Bearer {args.get('bearer_token') or ''}",
-        'User-Agent': directv_dai_device.player_user_agent() or getattr(directv, '_UA', 'okhttp'),
-    })
+    session.headers.update({'Accept': '*/*', 'Authorization': f"Bearer {args.get('bearer_token') or ''}"})
+    # The bridge device's own app User-Agent; for any other requester, upstream's own.
+    ua = directv_dai_device.player_user_agent() or getattr(directv, '_UA', None)
+    if ua:
+        session.headers['User-Agent'] = ua
     for c in args.get('cookies') or []:
         try:
             session.cookies.set(c['name'], c['value'], domain=c.get('domain') or None, path=c.get('path') or '/')
@@ -331,165 +495,179 @@ def _patch_device_auth() -> None:
             return out
         auth._result = _wraps(orig_result, _result)
 
-    # A session signed in by the old overlay (auth_method 'dtv_android') is the same
-    # UNIFIED_Android_TV_02 grant: let upstream refresh it, which re-tags it 'device_code'.
-    orig_is = auth.is_device_session
-    if not _already(orig_is):
-        def is_device_session(config, *a, **kw):
-            cfg = config or {}
-            return bool(orig_is(config, *a, **kw)
-                        or (cfg.get('auth_method') == 'dtv_android' and cfg.get('refresh_token')))
-        auth.is_device_session = _wraps(orig_is, is_device_session)
+
+# ── Relay: hosts, User-Agent, ad audio (all at the HTTP layer) ─────────────────────
+
+def _patch_relay_hosts() -> None:
+    """Yospace playlists take upstream's relay (so the HTTP-layer hooks see them)."""
+    from ..routes import directv_proxy as proxy
+    suffixes = proxy._DIRECTV_BROWSER_CDN_SUFFIXES
+    if 'yospace.com' not in suffixes:
+        proxy._DIRECTV_BROWSER_CDN_SUFFIXES = (*suffixes, 'yospace.com')
 
 
-# ── Relay (app/routes/directv_proxy.py) ─────────────────────────────────────────
+def _relay_host(host: str) -> bool:
+    """Upstream's own DirecTV CDN allowlist (with yospace.com added)."""
+    try:
+        from ..routes import directv_proxy as proxy
+        return bool(proxy._directv_browser_cdn_allowed(host or ''))
+    except Exception:
+        return False
 
-class _RelayRequests:
-    """Stands in for directv_proxy's ``requests`` module: identical, except a GET to a
-    DirecTV relay host from a bridge device carries the DirecTV app's User-Agent for that
-    device (the Yospace master fetch and every playlist and segment)."""
 
-    def __init__(self, real, allowed):
-        self._real = real
-        self._allowed = allowed
+def _relay_user_agent(url) -> str | None:
+    """The DirecTV app User-Agent for a relay fetch: inside a request under
+    RELAY_PREFIX, to a DirecTV CDN host, with DAI on, from a bridge device."""
+    from flask import has_request_context, request
+    if not has_request_context() or not request.path.startswith(RELAY_PREFIX):
+        return None
+    if not _relay_host(urlsplit(str(url)).hostname or ''):
+        return None
+    from . import directv_dai, directv_dai_device
+    if not directv_dai.dai_on():
+        return None
+    return directv_dai_device.player_user_agent()
 
-    def __getattr__(self, name):
-        return getattr(self._real, name)
 
-    def get(self, url, *args, **kwargs):
+def _patch_user_agent() -> None:
+    """Every relay fetch (the Yospace master, each playlist and segment) carries the
+    bridge device's DirecTV app User-Agent. Hooked on the requests library, which
+    upstream's relay always goes through, so its code can change freely."""
+    orig = requests.Session.request
+    if _already(orig):
+        return
+
+    def request(self, method, url, *a, **kw):
         try:
-            from . import directv_dai_device
-            ua = directv_dai_device.player_headers()
-            if ua and self._allowed(urlsplit(str(url)).hostname or ''):
-                kwargs['headers'] = {**(kwargs.get('headers') or {}), **ua}
+            if str(method).upper() == 'GET' and len(a) < 3:   # headers not passed positionally
+                ua = _relay_user_agent(url)
+                if ua:
+                    headers = {k: v for k, v in (kw.get('headers') or {}).items()
+                               if str(k).lower() != 'user-agent'}
+                    kw['headers'] = {**headers, 'User-Agent': ua}
         except Exception:
             logger.exception('[directv-dai] could not add the app User-Agent')
-        return self._real.get(url, *args, **kwargs)
+        return orig(self, method, url, *a, **kw)
+    requests.Session.request = _wraps(orig, request)
 
 
-def _patch_relay() -> None:
-    from ..routes import directv_proxy as proxy
+def _register_relay_hooks(app) -> None:
+    from flask import Response, request
     from . import dtv_aac_ads, dtv_aac_gain
 
-    if 'yospace.com' not in proxy._DIRECTV_BROWSER_CDN_SUFFIXES:
-        proxy._DIRECTV_BROWSER_CDN_SUFFIXES = (*proxy._DIRECTV_BROWSER_CDN_SUFFIXES, 'yospace.com')
+    @app.before_request
+    def _directv_dai_ad_segment():
+        """An inserted-ad AAC segment (an allowlisted DirecTV CDN, full fetch) is served
+        here with the −12 dB loudness cut; everything else goes to upstream's view."""
+        try:
+            if request.method != 'GET' or not request.path.startswith(RELAY_PREFIX) or request.headers.get('Range'):
+                return None
+            raw = (request.args.get('url') or '').strip()
+            if not raw or not dtv_aac_gain.is_ad_segment(raw):
+                return None
+            parts = urlsplit(raw)
+            if parts.scheme != 'https' or not _relay_host(parts.hostname or ''):
+                return None
+            return _serve_ad_segment(raw, Response)
+        except Exception:
+            _note('error', 'ad segment')
+            logger.exception('[directv-dai] ad segment handling failed; upstream serves it')
+            return None
 
-    if not isinstance(proxy._requests, _RelayRequests):
-        proxy._requests = _RelayRequests(proxy._requests, proxy._directv_browser_cdn_allowed)
-
-    # Every DAI audio playlist: swap each inserted AC-3 ad for its full-range AAC twin.
-    orig_rewrite = proxy._rewrite_directv_browser_playlist
-    if not _already(orig_rewrite):
-        def _rewrite_directv_browser_playlist(text, *a, **kw):
-            try:
-                text = dtv_aac_ads.swap_muffled_ads(text)
-            except Exception:
-                logger.exception('[directv-dai] ad swap failed')
-            return orig_rewrite(text, *a, **kw)
-        proxy._rewrite_directv_browser_playlist = _wraps(orig_rewrite, _rewrite_directv_browser_playlist)
-
-    # An inserted-ad creative always takes the relay (so its loudness cut runs), whatever CDN.
-    orig_proxyable = proxy._directv_browser_proxyable_url
-    if not _already(orig_proxyable):
-        def _directv_browser_proxyable_url(raw_url, playlist_url, *a, **kw):
-            try:
-                resolved = urljoin(playlist_url, raw_url)
-                if urlsplit(resolved).scheme in ('http', 'https') and dtv_aac_gain.is_ad_segment(resolved):
-                    return proxy._directv_browser_asset_proxy_url(resolved)
-            except Exception:
-                logger.exception('[directv-dai] ad routing failed')
-            return orig_proxyable(raw_url, playlist_url, *a, **kw)
-        proxy._directv_browser_proxyable_url = _wraps(orig_proxyable, _directv_browser_proxyable_url)
-
-
-def _find_endpoint(app, func=None, rule: str | None = None, method: str = 'GET') -> str | None:
-    if rule:
-        for r in app.url_map.iter_rules():
-            if r.rule == rule and method in (r.methods or ()):
-                return r.endpoint
-    if func is not None:
-        for endpoint, view in app.view_functions.items():
-            if view is func or getattr(view, '__wrapped__', None) is func:
-                return endpoint
-    return None
+    @app.after_request
+    def _directv_dai_playlist(resp):
+        """Every DirecTV playlist the relay serves: swap each inserted AC-3 ad (segments
+        and its own EXT-X-MAP init) for its full-range AAC twin. Live content is untouched."""
+        try:
+            if (request.path.startswith(RELAY_PREFIX) and resp.status_code == 200
+                    and 'mpegurl' in (resp.mimetype or '').lower()
+                    and not resp.direct_passthrough and not resp.is_streamed):
+                text = resp.get_data(as_text=True)
+                swapped = dtv_aac_ads.swap_muffled_ads(text)
+                if swapped != text:
+                    resp.set_data(swapped)
+        except Exception:
+            _note('error', 'ad swap')
+            logger.exception('[directv-dai] ad swap failed')
+        return resp
 
 
-def _patch_asset_view(app) -> None:
-    """browser-asset: an inserted-ad AAC segment is fetched and cut here (−12 dB, lossless);
-    every other asset goes to upstream's view untouched."""
-    from flask import Response, abort, request
+def _serve_ad_segment(raw_url: str, Response):
     from ..routes import directv_proxy as proxy
-    from . import directv_dai_device, dtv_aac_gain
-
-    endpoint = _find_endpoint(app, func=proxy.directv_browser_asset)
-    if not endpoint:
-        logger.error('[directv-dai] browser-asset view not found; ad loudness cut is off')
-        return
-    orig_view = app.view_functions[endpoint]
-    if _already(orig_view):
-        return
-
-    def directv_browser_asset(*a, **kw):
-        raw_url = (request.args.get('url') or '').strip()
-        if not (raw_url and dtv_aac_gain.is_ad_segment(raw_url)
-                and urlsplit(raw_url).scheme == 'https' and not request.headers.get('Range')):
-            return orig_view(*a, **kw)
-        headers = {'User-Agent': getattr(proxy, '_BROWSER_UA', 'Mozilla/5.0'), **directv_dai_device.player_headers()}
+    from . import dtv_aac_gain
+    headers = {}
+    if getattr(proxy, '_BROWSER_UA', None):
+        headers['User-Agent'] = proxy._BROWSER_UA   # the app UA replaces it (see _patch_user_agent)
+    try:
+        r = requests.get(raw_url, headers=headers, timeout=(5, 30))
+    except Exception as exc:
+        logger.warning('[directv-dai] ad segment fetch failed (%s); upstream serves it', exc)
+        return None
+    body = r.content
+    if r.status_code == 200:
         try:
-            r = requests.get(raw_url, headers=headers, timeout=(5, 30))
-        except Exception as exc:
-            logger.warning('[directv-dai] ad segment fetch failed: %s', exc)
-            abort(502)
-        body = r.content
-        try:
-            if r.status_code == 200:
-                body = dtv_aac_gain.attenuate_ad_segment(body)
+            cut = dtv_aac_gain.attenuate_ad_segment(body)
+            _note('ad_cut' if cut != body else 'ad_uncut')
+            body = cut
         except Exception:
             logger.exception('[directv-dai] ad loudness cut failed; sending the segment as is')
-        return Response(body, status=r.status_code,
-                        content_type=r.headers.get('Content-Type') or 'application/octet-stream',
-                        headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'})
-    app.view_functions[endpoint] = _wraps(orig_view, directv_browser_asset)
+    return Response(body, status=r.status_code,
+                    content_type=r.headers.get('Content-Type') or 'application/octet-stream',
+                    headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'})
 
 
-def _patch_save_view(app) -> None:
-    """Saving the DirecTV settings: drop cached stream URLs when the DAI toggle flips, and
-    capture the advertising id of any bridge device that doesn't have one yet."""
-    from . import directv_dai
+# ── Old sessions: the pre-2026-10-08 overlay tagged its sign-in 'dtv_android' ─────
 
-    endpoint = _find_endpoint(app, rule=SAVE_CONFIG_RULE, method='POST')
-    if not endpoint:
-        logger.error('[directv-dai] save-config view not found; the toggle will not clear the cache')
-        return
-    orig_view = app.view_functions[endpoint]
-    if _already(orig_view):
-        return
+def migrate_old_sessions() -> None:
+    """The old overlay signed in with the same UNIFIED_Android_TV_02 grant upstream uses
+    now, but tagged it auth_method 'dtv_android'. Re-tag it to upstream's tag, so
+    upstream refreshes it and nobody signs in again. Needs an app context."""
+    from ..config_store import persist_source_config_updates
+    from ..models import Source
+    from . import directv_device_auth as auth
+    for src in Source.query.filter_by(name='directv').all():
+        cfg = src.config or {}
+        if cfg.get('auth_method') == 'dtv_android' and cfg.get('refresh_token'):
+            persist_source_config_updates(src.id, {'auth_method': auth.AUTH_METHOD})
+            logger.info("[directv-dai] re-tagged the old overlay sign-in as upstream's code sign-in")
 
-    def save_source_config(*a, **kw):
-        source_id = kw.get('source_id') or (a[0] if a else None)
-        old = None
+
+def _register_migration(app) -> None:
+    """Runs migrate_old_sessions once per process: at startup when the database is
+    ready, else on the first request."""
+    done = [False]
+
+    def attempt():
+        from ..extensions import db
         try:
+            from sqlalchemy import inspect as sa_inspect
             from ..models import Source
-            src = Source.query.get(source_id)
-            if src is not None and src.name == 'directv':
-                old = dict(src.config or {})
+            if sa_inspect(db.engine).has_table(Source.__tablename__):
+                migrate_old_sessions()
+                done[0] = True
         except Exception:
-            logger.exception('[directv-dai] could not read the old DirecTV settings')
-        resp = orig_view(*a, **kw)
-        if old is not None:
+            logger.debug('[directv-dai] session re-tag not run yet', exc_info=True)
             try:
-                from ..models import Source
-                src = Source.query.get(source_id)
-                status = getattr(resp, 'status_code', None) or (resp[1] if isinstance(resp, tuple) and len(resp) > 1 else 200)
-                if src is not None and int(status) < 400:
-                    directv_dai.clear_cache_if_toggled(src, old, dict(src.config or {}))
+                db.session.rollback()
             except Exception:
-                logger.exception('[directv-dai] post-save step failed')
-        return resp
-    app.view_functions[endpoint] = _wraps(orig_view, save_source_config)
+                pass
+
+    try:
+        with app.app_context():
+            attempt()
+            from ..extensions import db
+            db.session.remove()
+    except Exception:
+        logger.debug('[directv-dai] session re-tag deferred to the first request', exc_info=True)
+
+    @app.before_request
+    def _directv_dai_migrate():
+        if not done[0]:
+            done[0] = True   # one try per process, even if it fails
+            attempt()
 
 
-# ── Admin UI: our own blueprint + one script tag on the sources page ────────────
+# ── Admin UI: our own blueprint, panel and page ─────────────────────────────────
 
 def _register_admin(app) -> None:
     from flask import Blueprint, Response, jsonify, request
@@ -497,22 +675,66 @@ def _register_admin(app) -> None:
 
     bp = Blueprint('directv_dai', __name__)
 
+    def _directv_source(source_id):
+        from ..models import Source
+        source = Source.query.get_or_404(source_id)
+        if source.name != 'directv':
+            return None
+        return source
+
     @bp.route('/directv-dai/admin.js')
     def admin_js():
         return Response(_ADMIN_JS, mimetype='application/javascript',
                         headers={'Cache-Control': 'no-cache'})
 
+    @bp.route('/directv-dai')
+    def dai_page():
+        return Response(_PAGE_HTML, mimetype='text/html')
+
     @bp.route('/directv-dai/status')
     def dai_status():
         return jsonify(status())
+
+    @bp.route('/directv-dai/sources')
+    def dai_sources():
+        from ..models import Source
+        return jsonify({'sources': [{'id': s.id, 'name': s.display_name or s.name}
+                                    for s in Source.query.filter_by(name='directv').all()]})
+
+    @bp.route('/api/sources/<int:source_id>/directv-dai', methods=['GET', 'POST'])
+    def directv_dai_settings(source_id):
+        """GET: everything the DAI panel shows. POST {use_dai}: save the toggle, drop the
+        cached stream URLs, and (DAI on) capture new devices' ad ids and fetch the
+        account's targeting values if sign-in didn't."""
+        source = _directv_source(source_id)
+        if source is None:
+            return jsonify({'error': 'not a directv source'}), 400
+        if request.method == 'POST':
+            from ..config_store import persist_source_config_updates
+            data = request.get_json(silent=True) or request.form
+            want = str(data.get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
+            old = dict(source.config or {})
+            if not persist_source_config_updates(source.id, {'use_dai': 'true' if want else 'false'}):
+                return jsonify({'error': 'could not save the setting; try again'}), 409
+            from ..models import Source
+            source = Source.query.get(source_id)
+            directv_dai.settings_changed(source, old, dict(source.config or {}))
+        cfg = dict(source.config or {})
+        on = directv_dai.enabled(cfg)
+        field = directv_dai.CONFIG_FIELD
+        return jsonify({
+            'ok': True, 'use_dai': on, 'label': field['label'], 'help': field['help_text'],
+            'code_signed_in': directv_dai.profiles_supported(cfg),
+            'pending': len(directv_dai.uncaptured_addresses()) if on else 0,
+            'issues': _issue_lines(),
+        })
 
     @bp.route('/api/sources/<int:source_id>/directv-capture-adids', methods=['GET', 'POST'])
     def directv_capture_adids(source_id):
         """GET: how many bridge devices still need an advertising-id capture. POST: capture
         them (a playing box is skipped, so a stream is never interrupted)."""
-        from ..models import Source
-        source = Source.query.get_or_404(source_id)
-        if source.name != 'directv':
+        source = _directv_source(source_id)
+        if source is None:
             return jsonify({'error': 'not a directv source'}), 400
         if not directv_dai.enabled(dict(source.config or {})):
             return jsonify({'enabled': False, 'ok': True, 'pending': 0})
@@ -526,9 +748,8 @@ def _register_admin(app) -> None:
     def directv_profile(source_id):
         """GET: the account's viewer profiles and which one ads are requested as. POST: run
         as a chosen profile (its ad id becomes the Yospace `profid`)."""
-        from ..models import Source
-        source = Source.query.get_or_404(source_id)
-        if source.name != 'directv':
+        source = _directv_source(source_id)
+        if source is None:
             return jsonify({'error': 'not a directv source'}), 400
         cfg = dict(source.config or {})
         if not directv_dai.profiles_supported(cfg):
@@ -548,14 +769,17 @@ def _register_admin(app) -> None:
     app.register_blueprint(bp)
 
     tag = b'<script src="/directv-dai/admin.js"></script>'
+    marker = b'id="source-config-'
 
     @app.after_request
-    def _inject_admin_script(resp):
+    def _directv_dai_admin_script(resp):
+        """Adds the panel script to upstream pages that have source settings boxes."""
         try:
             if (resp.status_code == 200 and resp.mimetype == 'text/html'
-                    and not resp.direct_passthrough and not resp.is_streamed):
+                    and not resp.direct_passthrough and not resp.is_streamed
+                    and not request.path.startswith('/directv-dai')):
                 body = resp.get_data()
-                if b'function renderDirectvConfig' in body and tag not in body:
+                if marker in body and tag not in body:
                     i = body.rfind(b'</body>')
                     resp.set_data(body[:i] + tag + body[i:] if i >= 0 else body + tag)
         except Exception:
@@ -563,109 +787,140 @@ def _register_admin(app) -> None:
         return resp
 
 
+def _issue_lines() -> list[str]:
+    st = status()
+    return [*(f'upstream renamed or removed {n}' for n in st['missing']), *st['markers'],
+            *(f'could not wire {n}' for n in st['failed']), *st['runtime']]
+
+
+_PAGE_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DirecTV DAI</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 24px 16px; background: #111; color: #eee; }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; } a { color: #8ab4f8; }
+  .directv-dai-panel { border: 1px solid #333; border-radius: 8px; padding: 12px 16px; margin: 16px 0; }
+  .help { color: #aaa; font-size: 0.9rem; margin-top: 4px; }
+  button { padding: 6px 12px; } select { padding: 6px; }
+</style></head>
+<body><main>
+<h1>DirecTV ad insertion (DAI)</h1>
+<p class="help">The same settings also appear inside the DirecTV source's settings on <a href="/admin/sources">Sources</a>.</p>
+<div id="directv-dai-standalone"></div>
+</main>
+<script src="/directv-dai/admin.js"></script>
+</body></html>
+"""
+
 _ADMIN_JS = r"""
-// DirecTV DAI: adds the viewer-profile picker, the DAI toggle and the "Capture advertising IDs" button to the
-// DirecTV source settings by wrapping upstream's renderDirectvConfig (no template edit).
+// DirecTV DAI settings: the DAI toggle, the viewer-profile picker and the "Capture
+// advertising IDs" button, as our own panel. It's added inside each DirecTV source's
+// settings box on the sources page (found by its source-config-<id> id; no upstream
+// function is wrapped), and rendered on its own at /directv-dai.
 (function () {
-  const orig = window.renderDirectvConfig;
-  if (typeof orig !== 'function') {
-    // Upstream renamed the DirecTV settings renderer: say so on the page rather than
-    // silently showing no DAI settings.
-    const warn = () => {
-      const d = document.createElement('div');
-      d.style.cssText = 'margin:8px 16px;padding:8px 12px;border:1px solid var(--danger,#c33);border-radius:6px;color:var(--danger,#c33)';
-      d.textContent = 'DirecTV DAI: this FastChannels version changed its DirecTV settings page, so the DAI toggle, profile picker and advertising-ID button could not be added. Playback is unaffected; the overlay needs an update.';
-      document.body.prepend(d);
-    };
-    if (document.body) warn(); else document.addEventListener('DOMContentLoaded', warn);
-    console.warn('[directv-dai] renderDirectvConfig not found');
-    return;
-  }
-  const esc = s => (typeof escapeHtml === 'function') ? escapeHtml(String(s))
-    : String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+  if (window.__directvDai) return;
+  window.__directvDai = true;
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+  const getJson = async (url, opts) => {
+    const r = await fetch(url, opts);
+    return [r, await r.json().catch(() => ({}))];
+  };
+  let sourcesPromise = null;
+  const sources = () => sourcesPromise || (sourcesPromise = getJson('/directv-dai/sources')
+    .then(([, d]) => d.sources || []).catch(() => []));
 
-  function daiHtml(sourceId, schema, values) {
-    const field = (schema || []).find(f => f.key === 'use_dai') || {};
-    const checked = ['1', 'true', 'yes', 'on'].includes(String((values || {}).use_dai ?? field.default ?? '').trim().toLowerCase());
-    const label = field.label || 'Use DirecTV ad insertion (DAI)';
-    return `
-      <div class="fields-grid" style="margin-top:0.9rem" id="directv-dai-${sourceId}">
-        <div class="field field-full">
-          <div class="config-toggle-field">
-            <div class="config-toggle-text">
-              <label for="cfg-${sourceId}-use_dai">${esc(label)}</label>
-              <div class="help">${esc(field.help_text || '')}</div>
-            </div>
-            <label class="toggle" title="${esc(label)}">
-              <input type="checkbox" id="cfg-${sourceId}-use_dai" data-key="use_dai" data-secret="false"${checked ? ' checked' : ''}>
-              <span class="slider"></span>
-            </label>
-          </div>
-        </div>
-        <div class="field field-full">
-          <button class="btn btn-run" type="button" id="directv-adid-btn-${sourceId}" style="display:none"
-                  onclick="directvCaptureAdids(${sourceId})">Capture advertising IDs</button>
-          <span id="directv-adid-status-${sourceId}" style="color:var(--text-muted)"></span>
-        </div>
-      </div>`;
+  function mount(host, id, before) {
+    const el = document.createElement('div');
+    el.id = `directv-dai-${id}`;
+    el.className = 'directv-dai-panel field field-full';
+    el.style.marginTop = '0.9rem';
+    el.innerHTML = '<div class="help">Loading DirecTV DAI settings&hellip;</div>';
+    if (before && before.parentNode) before.parentNode.insertBefore(el, before); else host.appendChild(el);
+    load(id);
   }
 
-  // The viewer-profile picker: shown once the source has a code sign-in session.
-  function profileHtml(sourceId) {
-    return `
-      <div class="field field-full" style="margin-top:0.9rem" id="directv-profile-${sourceId}">
-        <label for="directv-profile-select-${sourceId}" style="font-weight:600">Run as DirecTV profile</label>
+  async function mountInline() {
+    const list = await sources();
+    for (const s of list) {
+      const box = document.getElementById(`source-config-${s.id}`);
+      if (!box || !box.children.length || document.getElementById(`directv-dai-${s.id}`)) continue;
+      mount(box, s.id, box.querySelector('.config-actions'));
+    }
+  }
+
+  async function load(id) {
+    const el = document.getElementById(`directv-dai-${id}`);
+    if (!el) return;
+    try {
+      const [r, d] = await getJson(`/api/sources/${id}/directv-dai`);
+      if (!r.ok) { el.innerHTML = `<div class="help">${esc(d.error || 'DAI settings unavailable')}</div>`; return; }
+      render(el, id, d);
+    } catch (e) {
+      el.innerHTML = '<div class="help">DAI settings unavailable</div>';
+    }
+  }
+
+  function render(el, id, d) {
+    const issues = (d.issues || []).length
+      ? '<div style="color:var(--danger,#e55);margin-bottom:8px"><strong>DAI wiring needs an update for this FastChannels version:</strong><ul style="margin:4px 0 0 18px">'
+        + d.issues.map(i => `<li>${esc(i)}</li>`).join('') + '</ul></div>'
+      : '';
+    const profile = d.code_signed_in ? `
+      <div style="margin-top:0.9rem">
+        <label for="directv-profile-select-${id}" style="font-weight:600">Run as DirecTV profile</label>
         <div class="help">FastChannels requests ads as this viewer profile &mdash; its ad id becomes DirecTV's <code>profid</code>. Changing it clears the cached stream so the next tune uses it.</div>
         <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">
-          <select id="directv-profile-select-${sourceId}" disabled style="min-width:180px;padding:6px">
-            <option>Loading profiles&hellip;</option>
-          </select>
-          <button class="btn btn-run" type="button" id="directv-profile-btn-${sourceId}"
-                  onclick="directvSelectProfile(${sourceId})" disabled>Use profile</button>
-          <span id="directv-profile-status-${sourceId}" style="color:var(--text-muted)"></span>
+          <select id="directv-profile-select-${id}" disabled style="min-width:180px;padding:6px"><option>Loading profiles&hellip;</option></select>
+          <button class="btn btn-run" type="button" id="directv-profile-btn-${id}" disabled>Use profile</button>
+          <span id="directv-profile-status-${id}" style="color:var(--text-muted)"></span>
         </div>
-      </div>`;
+      </div>` : '';
+    const capture = d.use_dai && d.pending > 0 ? `
+      <div style="margin-top:0.9rem">
+        <button class="btn btn-run" type="button" id="directv-adid-btn-${id}">Capture advertising IDs (${d.pending} new device${d.pending > 1 ? 's' : ''})</button>
+        <span id="directv-adid-status-${id}" style="color:var(--text-muted)"></span>
+      </div>` : `<span id="directv-adid-status-${id}" style="color:var(--text-muted)"></span>`;
+    el.innerHTML = `${issues}
+      <div class="config-toggle-field">
+        <div class="config-toggle-text">
+          <label for="directv-dai-toggle-${id}">${esc(d.label)}</label>
+          <div class="help">${esc(d.help)}</div>
+        </div>
+        <label class="toggle" title="${esc(d.label)}">
+          <input type="checkbox" id="directv-dai-toggle-${id}"${d.use_dai ? ' checked' : ''}>
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="help" id="directv-dai-toggle-status-${id}"></div>
+      ${profile}${capture}`;
+    el.querySelector(`#directv-dai-toggle-${id}`).addEventListener('change', e => saveToggle(id, e.target.checked));
+    const pbtn = el.querySelector(`#directv-profile-btn-${id}`);
+    if (pbtn) { pbtn.addEventListener('click', () => selectProfile(id)); loadProfiles(id); }
+    const cbtn = el.querySelector(`#directv-adid-btn-${id}`);
+    if (cbtn) cbtn.addEventListener('click', () => captureAdids(id));
   }
 
-  window.renderDirectvConfig = function (sourceId, schema, values, cfg) {
-    let html = orig.apply(this, arguments);
+  async function saveToggle(id, on) {
+    const st = document.getElementById(`directv-dai-toggle-status-${id}`);
+    if (st) st.textContent = 'Saving…';
     try {
-      const signedIn = !!(cfg && cfg.directv && cfg.directv.code_signed_in);
-      const extra = (signedIn ? profileHtml(sourceId) : '') + daiHtml(sourceId, schema, values);
-      const at = html.lastIndexOf('<div class="config-actions">');
-      html = at >= 0 ? html.slice(0, at) + extra + html.slice(at) : html + extra;
-      setTimeout(() => { directvLoadAdidStatus(sourceId); if (signedIn) directvLoadProfiles(sourceId); directvDaiCheck(sourceId); }, 0);
-    } catch (e) { console.warn('[directv-dai]', e); }
-    return html;
-  };
+      const [r, d] = await getJson(`/api/sources/${id}/directv-dai`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({use_dai: on}),
+      });
+      if (!r.ok) { if (st) st.textContent = d.error || 'Could not save'; return; }
+      render(document.getElementById(`directv-dai-${id}`), id, d);
+      const st2 = document.getElementById(`directv-dai-toggle-status-${id}`);
+      if (st2) st2.textContent = on ? 'Saved: DAI is on. The next tune uses it.' : 'Saved: DAI is off.';
+    } catch (e) { if (st) st.textContent = 'Network error'; }
+  }
 
-  // Shows a warning in the DAI settings when part of the wiring no longer matches this
-  // FastChannels version (an upstream rename): that part is off until the overlay is updated.
-  window.directvDaiCheck = async function (sourceId) {
-    const box = document.getElementById(`directv-dai-${sourceId}`);
-    if (!box) return;
-    try {
-      const d = await (await fetch('/directv-dai/status')).json();
-      const issues = [...(d.missing || []).map(n => `upstream renamed or removed ${n}`), ...(d.markers || []),
-                      ...(d.failed || []).map(n => `could not wire ${n} (see the server log)`)];
-      if (!issues.length) return;
-      const w = document.createElement('div');
-      w.className = 'field field-full';
-      w.style.color = 'var(--danger)';
-      w.innerHTML = '<strong>DAI wiring needs an update for this FastChannels version:</strong><ul style="margin:4px 0 0 18px">'
-        + issues.map(i => `<li>${esc(i)}</li>`).join('') + '</ul>';
-      box.prepend(w);
-    } catch (e) { /* status unavailable: say nothing */ }
-  };
-
-  window.directvLoadProfiles = async function (sourceId) {
-    const sel = document.getElementById(`directv-profile-select-${sourceId}`);
-    const btn = document.getElementById(`directv-profile-btn-${sourceId}`);
-    const statusEl = document.getElementById(`directv-profile-status-${sourceId}`);
+  async function loadProfiles(id) {
+    const sel = document.getElementById(`directv-profile-select-${id}`);
+    const btn = document.getElementById(`directv-profile-btn-${id}`);
     if (!sel) return;
     try {
-      const r = await fetch(`/api/sources/${sourceId}/directv-profile`);
-      const d = await r.json().catch(() => ({}));
+      const [r, d] = await getJson(`/api/sources/${id}/directv-profile`);
       const profiles = d.profiles || [];
       if (!r.ok || !profiles.length) {
         sel.innerHTML = `<option>${esc(r.ok ? 'No profiles found' : (d.error || 'Could not load profiles'))}</option>`;
@@ -673,89 +928,77 @@ _ADMIN_JS = r"""
       }
       sel.innerHTML = profiles.map(p =>
         `<option value="${esc(p.id)}"${p.id === d.selected_id ? ' selected' : ''}>` +
-        `${esc(p.name)}${p.primary ? ' (primary)' : ''}${p.id === d.selected_id ? ' — running' : ''}</option>`
-      ).join('');
+        `${esc(p.name)}${p.primary ? ' (primary)' : ''}${p.id === d.selected_id ? ' — running' : ''}</option>`).join('');
       sel.disabled = false;
       if (btn) btn.disabled = false;
-      if (statusEl) statusEl.textContent = '';
-    } catch (e) {
-      sel.innerHTML = '<option>Could not load profiles</option>';
-    }
-  };
+    } catch (e) { sel.innerHTML = '<option>Could not load profiles</option>'; }
+  }
 
-  window.directvSelectProfile = async function (sourceId) {
-    const sel = document.getElementById(`directv-profile-select-${sourceId}`);
-    const btn = document.getElementById(`directv-profile-btn-${sourceId}`);
-    const statusEl = document.getElementById(`directv-profile-status-${sourceId}`);
+  async function selectProfile(id) {
+    const sel = document.getElementById(`directv-profile-select-${id}`);
+    const btn = document.getElementById(`directv-profile-btn-${id}`);
+    const st = document.getElementById(`directv-profile-status-${id}`);
     if (!sel || !sel.value) return;
     const name = (sel.options[sel.selectedIndex]?.text || '').replace(/ \(primary\)| — running/g, '');
     if (btn) btn.disabled = true;
-    if (statusEl) { statusEl.style.color = 'var(--text-muted)'; statusEl.textContent = 'Switching…'; }
+    if (st) { st.style.color = 'var(--text-muted)'; st.textContent = 'Switching…'; }
     try {
-      const r = await fetch(`/api/sources/${sourceId}/directv-profile`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+      const [r, d] = await getJson(`/api/sources/${id}/directv-profile`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({profile_id: sel.value, profile_name: name}),
       });
-      const d = await r.json().catch(() => ({}));
       if (r.ok && d.ok) {
-        if (statusEl) { statusEl.style.color = 'var(--success-soft)'; statusEl.innerHTML = '&#10003; Running as this profile.'; }
-        directvLoadProfiles(sourceId);
-      } else if (statusEl) {
-        statusEl.style.color = 'var(--danger)';
-        statusEl.textContent = d.error || 'Could not switch profile';
-      }
+        if (st) { st.style.color = 'var(--success-soft,#6c6)'; st.innerHTML = '&#10003; Running as this profile.'; }
+        loadProfiles(id);
+      } else if (st) { st.style.color = 'var(--danger,#e55)'; st.textContent = d.error || 'Could not switch profile'; }
     } catch (e) {
-      if (statusEl) { statusEl.style.color = 'var(--danger)'; statusEl.textContent = 'Network error'; }
-    } finally {
-      if (btn) btn.disabled = false;
-    }
-  };
+      if (st) { st.style.color = 'var(--danger,#e55)'; st.textContent = 'Network error'; }
+    } finally { if (btn) btn.disabled = false; }
+  }
 
-  window.directvLoadAdidStatus = async function (sourceId) {
-    const btn = document.getElementById(`directv-adid-btn-${sourceId}`);
-    if (!btn) return;
-    try {
-      const r = await fetch(`/api/sources/${sourceId}/directv-capture-adids`);
-      const d = await r.json().catch(() => ({}));
-      if (d.enabled && d.pending > 0) {
-        btn.textContent = `Capture advertising IDs (${d.pending} new device${d.pending > 1 ? 's' : ''})`;
-        btn.style.display = '';
-      } else {
-        btn.style.display = 'none';
-      }
-    } catch (e) { btn.style.display = 'none'; }
-  };
-
-  window.directvCaptureAdids = async function (sourceId) {
-    const btn = document.getElementById(`directv-adid-btn-${sourceId}`);
-    const statusEl = document.getElementById(`directv-adid-status-${sourceId}`);
+  async function captureAdids(id) {
+    const btn = document.getElementById(`directv-adid-btn-${id}`);
+    const st = document.getElementById(`directv-adid-status-${id}`);
     if (btn) btn.disabled = true;
-    if (statusEl) statusEl.textContent = 'Capturing… (a Google TV/Android TV device briefly shows its Ads screen; a playing device is skipped)';
+    if (st) st.textContent = 'Capturing… (a Google TV/Android TV device briefly shows its Ads screen; a playing device is skipped)';
+    let message = '';
     try {
-      const r = await fetch(`/api/sources/${sourceId}/directv-capture-adids`, {method: 'POST'});
-      const d = await r.json().catch(() => ({}));
-      if (d.enabled === false) { directvLoadAdidStatus(sourceId); return; }
-      if (!r.ok || !d.ok) {
-        if (statusEl) statusEl.innerHTML = `<span style="color:var(--danger)">${esc((d && d.error) || 'Capture failed')}</span>`;
-        return;
-      }
-      const parts = [`Captured ${d.captured} device${d.captured === 1 ? '' : 's'}`];
-      if (d.playing) parts.push(`${d.playing} skipped — ${d.playing === 1 ? 'a device is' : 'devices are'} playing (re-run when idle)`);
-      if (d.unreachable) parts.push(`${d.unreachable} couldn't be reached (check ${d.unreachable === 1 ? "it's" : "they're"} on and connected)`);
-      if (d.none) parts.push(`${d.none} with no advertising ID`);
-      if (statusEl) {
-        const ok = !d.playing && !d.unreachable && !d.none;
-        statusEl.innerHTML = ok
-          ? '<span style="color:var(--success-soft)">&#10003; ' + esc(parts.join('; ')) + '.</span>'
-          : esc(parts.join('; ')) + '.';
-      }
-    } catch (e) {
-      if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">Network error</span>';
-    } finally {
-      if (btn) btn.disabled = false;
-      directvLoadAdidStatus(sourceId);
+      const [r, d] = await getJson(`/api/sources/${id}/directv-capture-adids`, {method: 'POST'});
+      if (r.ok && d.ok && d.enabled !== false) {
+        const parts = [`Captured ${d.captured} device${d.captured === 1 ? '' : 's'}`];
+        if (d.playing) parts.push(`${d.playing} skipped — ${d.playing === 1 ? 'a device is' : 'devices are'} playing (re-run when idle)`);
+        if (d.unreachable) parts.push(`${d.unreachable} couldn't be reached (check ${d.unreachable === 1 ? "it's" : "they're"} on and connected)`);
+        if (d.none) parts.push(`${d.none} with no advertising ID`);
+        message = parts.join('; ') + '.';
+      } else if (d.enabled !== false) { message = d.error || 'Capture failed'; }
+    } catch (e) { message = 'Network error'; }
+    await load(id);
+    const st2 = document.getElementById(`directv-adid-status-${id}`);
+    if (st2) st2.textContent = message;
+  }
+
+  window.directvDaiStandalone = async function () {
+    const host = document.getElementById('directv-dai-standalone');
+    if (!host) return;
+    const list = await sources();
+    if (!list.length) { host.innerHTML = '<p class="help">No DirecTV source is set up yet.</p>'; return; }
+    for (const s of list) {
+      const h = document.createElement('h2');
+      h.style.fontSize = '1.05rem';
+      h.textContent = s.name;
+      host.appendChild(h);
+      mount(host, s.id, null);
     }
   };
+
+  const start = () => {
+    if (document.getElementById('directv-dai-standalone')) { window.directvDaiStandalone(); return; }
+    let queued = false;
+    const check = () => { queued = false; mountInline(); };
+    new MutationObserver(() => { if (!queued) { queued = true; setTimeout(check, 50); } })
+      .observe(document.body, {childList: true, subtree: true});
+    check();
+  };
+  if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
 })();
 """

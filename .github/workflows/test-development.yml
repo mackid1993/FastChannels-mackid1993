@@ -1,0 +1,93 @@
+name: Test against upstream development
+
+# A test-only CI: applies the overlay to kineticman/FastChannels' DEVELOPMENT branch and runs
+# the full gauntlet (static checks, image build, Player APK check, smoke test, boot test).
+# It never publishes, never commits, never opens issues or PRs, and never calls the AI —
+# it just says whether the overlay works on his newest code. The release build (build.yml)
+# stays on his main; upstream-watch.yml keeps watching development for drift to auto-fix.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - "scripts/**"
+      - ".github/workflows/test-development.yml"
+  schedule:
+    - cron: "15 7 * * *"   # daily, so a development change that breaks the overlay shows up
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream branch, tag or commit to test (default: development)"
+        type: string
+        default: development
+
+concurrency:
+  group: test-development
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: kineticman/FastChannels
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'development' }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v5
+        with:
+          path: overlay
+
+      - name: Check out upstream
+        id: upstream
+        run: |
+          git clone -q "https://github.com/$UPSTREAM_REPO.git" upstream
+          git -C upstream checkout -q "$UPSTREAM_REF"
+          sha=$(git -C upstream rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Testing the overlay on $UPSTREAM_REPO $UPSTREAM_REF @ ${sha:0:7}"
+
+      - name: Apply the overlay
+        run: overlay/scripts/apply-patches.sh upstream
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Static checks
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          pip install --quiet ruff jinja2
+          overlay/scripts/validate.sh upstream
+
+      - name: Build image
+        run: |
+          docker build -t fastchannels:dev-test \
+            --build-arg "YTDLP_REFRESH=${{ github.run_id }}" \
+            --build-arg "FC_PLAYER_APK_REFRESH=${{ github.run_id }}" \
+            -f upstream/Dockerfile upstream
+
+      - name: Check the Player APK is bundled
+        run: docker run --rm --entrypoint sh fastchannels:dev-test -c 'test -s /app/fc_player_release.apk'
+
+      - name: Smoke-test the overlay in the image
+        run: docker run --rm -w /app -v "$PWD/overlay/scripts:/ci:ro" --entrypoint python fastchannels:dev-test /ci/smoke_test.py
+
+      - name: Boot test
+        run: overlay/scripts/boot_test.sh fastchannels:dev-test
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Overlay on upstream \`$UPSTREAM_REF\` @ \`${{ steps.upstream.outputs.sha }}\`"
+            echo
+            echo "Result: **${{ job.status }}** (test only: nothing was published)"
+          } >> "$GITHUB_STEP_SUMMARY"

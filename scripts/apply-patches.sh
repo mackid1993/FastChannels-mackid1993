@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Apply every patch in patches/ (in order) on top of an upstream checkout.
+# Apply every patch in patches/ (in order) on top of an upstream checkout, then insert
+# the overlay's one line into upstream's create_app.
 #
 #   scripts/apply-patches.sh <upstream-checkout>
 #
-# Uses `git am --3way`, so a patch still applies when upstream has moved the
-# surrounding code, as long as it hasn't rewritten the same lines. Exits non-zero
-# (leaving the checkout clean) when a patch genuinely conflicts.
+# The patches only ADD the overlay's own files, so `git am` has no upstream context to
+# conflict with. The one line in app/__init__.py is not a hunk: scripts/insert_hook.py
+# finds create_app with Python's parser and inserts it, wherever upstream moved it, then
+# it's folded into the last patch commit (so `git diff <upstream> HEAD` is the whole
+# overlay). Exits non-zero (leaving the checkout clean) when a patch genuinely conflicts.
 set -euo pipefail
 
 dir=${1:?usage: apply-patches.sh <upstream-checkout>}
@@ -31,4 +34,14 @@ for patch in "${patches[@]}"; do
         exit 1
     fi
 done
+
+if ! python3 "$root/scripts/insert_hook.py" .; then
+    git reset -q --hard "HEAD~${#patches[@]}"
+    echo "::error title=DAI hook::could not insert the one DAI line into create_app"
+    exit 1
+fi
+if ! git diff --quiet -- app/__init__.py; then
+    git add app/__init__.py
+    git commit -q --amend --no-edit
+fi
 echo "Applied ${#patches[@]} patch(es) on top of upstream."

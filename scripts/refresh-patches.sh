@@ -18,7 +18,9 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-git -C "$dir" format-patch -q --zero-commit --no-signature -o "$tmp" "$base..HEAD"
+# app/__init__.py is left out: its one line is inserted by apply-patches.sh
+# (scripts/insert_hook.py), never carried as a hunk that upstream's edits could conflict.
+git -C "$dir" format-patch -q --zero-commit --no-signature -o "$tmp" "$base..HEAD" -- . ':(exclude)app/__init__.py'
 rm -f "$root"/patches/*.patch
 cp "$tmp"/*.patch "$root/patches/"
 ls "$root/patches"

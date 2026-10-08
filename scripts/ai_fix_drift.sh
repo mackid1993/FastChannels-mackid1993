@@ -14,7 +14,7 @@
 #       scripts/ai_fix_drift.sh <patched-checkout> <overlay-checkout>
 #
 # The AI (Aider on an OpenRouter model, GLM 5.3 Flash by default) sees the failing check's
-# log and AGENTS.md as read-only context and may edit only the patch's files. Every edit is
+# log and AGENTS.md as read-only context and may edit only the overlay's own files. Every edit is
 # verified to stay in that set and to carry no API key, amended into the patch commit, then
 # re-checked against the WHOLE gauntlet (not just the stage that failed) — the same bar as a
 # human change. Up to 3 attempts, each shown the latest failure; a fix is kept only when
@@ -53,8 +53,10 @@ prompt="$work/ai_fix_prompt.txt"
 # there is actually a drift to fix.
 pip install --quiet ruff jinja2
 
-# The editable set: exactly the files the patch adds or modifies. The AI may touch nothing else.
-( cd "$up" && git diff --name-only "$base" HEAD ) > "$editable"
+# The editable set: exactly the overlay's own files the patch adds. Upstream's app/__init__.py
+# (the one hook line, inserted by apply-patches.sh) is not editable, and validate.sh rejects
+# any change to an upstream file beyond that line. The AI may touch nothing else.
+( cd "$up" && git diff --name-only "$base" HEAD -- . ':(exclude)app/__init__.py' ) > "$editable"
 
 snapshot() { ( cd "$up" && find . -path ./.git -prune -o -type f -print0 | xargs -0 sha1sum | sort -k2 ) > "$1"; }
 
@@ -68,76 +70,39 @@ ai_edit() {  # $1 = attempt number
   pip install --quiet aider-chat==0.86.2
   cat > "$prompt" <<'PROMPT'
 You are running FULLY AUTONOMOUSLY in CI. No human will read your reply or answer anything
--- there is nobody to ask. Never ask a question, request clarification, or wait for
-confirmation: decide from the rules below and act. You are given upstream_index.txt -- a map
-of upstream's CURRENT files and every def/class in them. Use it to find where upstream moved
-the code a hook needs. This can be a large adaptation (effectively backporting the patch onto
-a different upstream): re-wire every hook to upstream's current structure. If a capability
-looks gone, first check whether the real DATA it was built from is still in upstream and can
-be re-implemented (rule 5); make no edit (and say why in one sentence) only when there is
-truly no real source left to rebuild it from.
+-- there is nobody to ask. Never ask a question or wait for confirmation: decide from the
+rules below and act. upstream_index.txt maps upstream's CURRENT files and every def/class in
+them; use it to find where upstream moved what the overlay uses.
 
-The files you can edit are the FastChannels DirecTV overlay: a PATCH on upstream
-kineticman/FastChannels. The patch is exactly two things:
-  OURS (whole files, change freely): app/scrapers/directv_dai.py, directv_dai_device.py,
-    directv_dai_install.py, dtv_aac_ads.py, dtv_aac_gain.py
-  ONE HOOK: a single line at the end of create_app in UPSTREAM's app/__init__.py,
-    `from .scrapers import directv_dai_install; directv_dai_install.install(app)`.
-    Every other line of every upstream file is UPSTREAM's; never add code to one.
-install() wires the feature in at RUNTIME by wrapping upstream functions BY NAME; the names
-it depends on are listed in directv_dai_install.TARGETS (plus SAVE_CONFIG_RULE and the
-strings in SOURCE_MARKERS). So the normal drift is: upstream renamed or moved one of those.
-The fix goes in directv_dai_install.py (and TARGETS): point the wrapper at upstream's
-current name/location, keeping the wrapper's behavior. Never edit an upstream file to put
-the old name back.
+The files you can edit are the FastChannels DirecTV DAI overlay, which upstream
+kineticman/FastChannels does not have:
+  app/scrapers/directv_dai.py, directv_dai_device.py, directv_dai_install.py,
+  dtv_aac_ads.py, dtv_aac_gain.py
+Upstream's own files are NOT editable. The overlay's only line in them (the install() call in
+create_app) is inserted by CI, not by you, and CI rejects any other change to an upstream file.
 
-A build check is failing, almost always because upstream renamed or moved something a hook
-sits in or calls. reproduce.log holds the failing output. AGENTS.md explains every hook.
-smoke_test.py and validate.sh are the overlay's own tests -- the exact spec your fix must
-satisfy; both are given to you to read. Satisfy them honestly; you cannot edit them.
+install() (directv_dai_install.py) attaches the overlay at runtime. Everything it relies on
+in upstream is listed there: TARGETS (functions it wraps by name), USES (names the overlay's
+modules call or read), SOURCE_MARKERS (strings in upstream files) and RELAY_PREFIX (the
+URL prefix of upstream's DirecTV relay). A build check is failing because upstream renamed,
+moved or reshaped one of those; reproduce.log names it ("upstream renamed or removed X",
+"no longer takes <argument>", "no longer has <string>", or a failing smoke-test assertion).
 
-Keep every hook correctly wired into upstream's CURRENT code. Rules, highest priority first
-(an earlier rule wins any conflict between them):
-
-1. SCOPE. Edit only the patch files listed at the end of this message. The tests and every
-   other file are read-only; editing any file not in that list ENDS the run as a failure.
-   Never edit another file, never ask to add one.
-2. HONESTY. Keep all the patch's behavior; the tests are its spec. Never weaken, bypass or
-   fake a check.
-3. A HOOK FOLLOWS UPSTREAM. When upstream renamed or moved a name a hook calls or sits in,
-   update the hook's reference -- anywhere in the files you edit -- to the new name or
-   location. This is the normal fix.
-4. KEEP A TEST-PINNED NAME REACHABLE. A test may reference, by its OLD name, an upstream name
-   that upstream renamed or MOVED. Point that old name at the REAL relocated code (find it in
-   upstream_index.txt), by the narrowest mechanism that fits:
-     - a renamed function/attribute in a file you edit -> a module-level alias next to it,
-       `old_name = new_name` (the real object under both names; inspect.signature/getsource
-       resolve through it);
-     - a module the patch does not own that moved -> from one of our own modules (imported
-       before the test uses the name) register it, e.g.
-       `import sys, app.<newpkg>.<newmod> as _m; sys.modules['app.<oldname>'] = _m`,
-       so the pinned import resolves to the REAL relocated module.
-   No wrapper, no new logic -- just make the old name resolve to real upstream code. This
-   settles rule 2's "can't edit the test" against "don't restore old code": you keep one name
-   reachable, pointing at real code.
-5. BACKPORT A REMOVED CAPABILITY FROM ITS REAL SOURCE; NEVER FABRICATE DATA. A capability a
-   hook or test needs may be gone as a named function/module yet still be REBUILDABLE from real
-   upstream data that is still present (check upstream_index.txt). Example pattern: a *registry*
-   function that returned a list is gone, but the underlying thing(s) it listed are still in
-   upstream (a settings field, a single-item accessor, etc.). When that is so, BACKPORT it:
-   re-implement the capability in one of OUR OWN modules, reading that REAL upstream source, and
-   expose it under the name the hook/test expects -- a module-level alias, or a runtime module
-   registered in sys.modules (e.g. build a types.ModuleType carrying your real function and do
-   `sys.modules['app.<oldname>'] = that`). That is a genuine port to upstream's current shape,
-   NOT fabrication, and it is the correct fix -- do it. The ported code MUST read upstream's
-   real data so the feature actually works. FORBIDDEN is only: inventing or hardcoding data
-   (made-up `address`/`host`), or a hollow stub that returns nothing/placeholder. Make no edit
-   (and say in one sentence what is gone) ONLY when no real data source exists anywhere to
-   rebuild the capability from.
-6. Never add other non-hook code to an upstream file -- no stubs, no try/except around an
-   import to swallow it, no deleted or no-op'd hooks. Your own modules you may change as needed.
-7. Minimal diff, valid Python, the patch still applies. No refactoring or reformatting.
-8. Never write a secret (API key, bearer, token) into any file.
+Rules, highest priority first:
+1. SCOPE. Edit only the overlay files listed at the end of this message. The tests
+   (smoke_test.py, validate.sh) are read-only: they are the spec your fix must pass.
+2. FOLLOW UPSTREAM. Point the overlay at upstream's current name, location, argument or
+   string: update the entry in TARGETS/USES/SOURCE_MARKERS AND every reference to it in the
+   overlay's modules. A rename is a rename: never drop an entry to make a check pass (the
+   smoke test counts them), and never weaken a check.
+3. KEEP THE BEHAVIOR. If a wrapped function changed shape (new arguments, a different return
+   value, a classmethod became something else), adapt the wrapper so it does the same job
+   on the new shape. Wrappers bind arguments by name with inspect.signature.
+4. NEVER FABRICATE. Don't invent values, don't write a stub that returns nothing, don't
+   re-create removed upstream code inside the overlay. If what the overlay needs is truly
+   gone from upstream, make no edit and say so in one sentence.
+5. Minimal diff, valid Python, no refactoring or reformatting. Never write a secret (API
+   key, bearer, token) into any file.
 PROMPT
   # Name the exact files the AI may edit, in the prompt itself.
   { printf '\nThe patch files -- the ONLY files you may edit (editing any other file ends the run):\n'
