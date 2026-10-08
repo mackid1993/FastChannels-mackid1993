@@ -1,0 +1,2389 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mackid1993 <fastchannels-ci@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 16:37:05 -0400
+Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids and the inserted-ad
+ audio fix, wired in by one hook
+
+---
+ app/__init__.py                     |   1 +
+ app/scrapers/directv_dai.py         | 854 ++++++++++++++++++++++++++++
+ app/scrapers/directv_dai_device.py  | 177 ++++++
+ app/scrapers/directv_dai_install.py | 586 +++++++++++++++++++
+ app/scrapers/dtv_aac_ads.py         |  49 ++
+ app/scrapers/dtv_aac_gain.py        | 663 +++++++++++++++++++++
+ 6 files changed, 2330 insertions(+)
+ create mode 100644 app/scrapers/directv_dai.py
+ create mode 100644 app/scrapers/directv_dai_device.py
+ create mode 100644 app/scrapers/directv_dai_install.py
+ create mode 100644 app/scrapers/dtv_aac_ads.py
+ create mode 100644 app/scrapers/dtv_aac_gain.py
+
+diff --git a/app/__init__.py b/app/__init__.py
+index 8e4afd6..ccbb258 100644
+--- a/app/__init__.py
++++ b/app/__init__.py
+@@ -194,4 +194,5 @@ def create_app(config_class=Config):
+     def root():
+         return redirect(url_for('admin.dashboard'))
+ 
++    from .scrapers import directv_dai_install; directv_dai_install.install(app)  # mackid1993 overlay: DirecTV DAI
+     return app
+diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
+new file mode 100644
+index 0000000..b2f244e
+--- /dev/null
++++ b/app/scrapers/directv_dai.py
+@@ -0,0 +1,854 @@
++"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
++
++When on, playback uses the stream DirecTV's own apps use: the Yospace
++ad-insertion session (``streamURL``) instead of ``fallbackStreamUrl``, carrying
++the account's own ad-targeting values (DMA, privacy consent, household/profile
++ids) plus this device's own ad ids.
++When off, everything behaves exactly as before.
++
++Everything lives in this module (plus directv_dai_device for the bridge device);
++directv_dai_install wires it into upstream at runtime from one line in create_app.
++"""
++from __future__ import annotations
++
++import base64
++import contextlib
++import json
++import logging
++import os
++import re
++import subprocess
++import threading
++import time
++from urllib.parse import quote
++
++import requests
++
++from .base import ConfigField
++from . import directv_dai_device as device
++
++logger = logging.getLogger(__name__)
++
++_LOCATION_URL = "https://api.cld.dtvce.com/right/location/area/v2/service/location"
++_BASICINFO_URL = "https://api.cld.dtvce.com/profile/information/basicinfogo/service"
++
++# Client flags for the DAI request, matching DirecTV's own Android TV app
++# (com.att.tv, the leanback build). Its shared player code sets, for Android TV:
++# d=android_tv, nielsen_platform=plt,OTT, nielsen_dev_group=devgrp,STV (the
++# group it also uses for the Osprey), metr=1071 (its TV device-class code), and
++# from its default live params comscore_impl_type=a and yo.fr=true. Its shared
++# parameters add comscore_platform (the OS name, lowercased: android) and leave out
++# us_privacy when it's null. p, e, m, at, ut, attnid, _fw_nielsen_app_id and the
++# other yo.* flags are the same
++# across DirecTV's apps. Playback here always ends on a TV through an Android TV
++# device (Fire TV, Google TV/onn sticks and the Osprey are all Android TV).
++#
++# d matters: without a device name the ad server recognizes, Yospace inserts no
++# ads at all. Never send the desktop identity (d=desktop, plt,DSK, devgrp,DSK,
++# comScore "PC"/"b"): it pulled web ad inventory with other markets' spots and
++# band-limited audio.
++_CLIENT_PARAMS = {
++    'd': 'android_tv',
++    'p': 'dfw', 'e': 'prod', 'm': 'live', 'at': 'NOW.RR', 'ut': 'bbtv',
++    'attnid': 'dfw003', 'metr': '1071',
++    'nielsen_platform': 'plt,OTT', 'nielsen_dev_group': 'devgrp,STV',
++    'comscore_platform': 'android', 'comscore_impl_type': 'a',
++    '_fw_nielsen_app_id': 'P7CFE36DB-A8D9-4801-95FE-51C29101342C',
++    # yo.lpa: dropped 2026-10-03. It's an Osprey-config flag the Android TV app does NOT
++    # send, so sending it as the Android client was off-profile. It was only kept because
++    # an older run saw no ad fill without it, but that predated the Android-login +
++    # yospace.pool=livepause + channel/v2 path we run now, so that result no longer
++    # applies. Removed to match the app; verify ads still fill on the next live break (if
++    # a break ever comes back empty/503, this is the first thing to restore).
++    # yo.lp also dropped 2026-10-03: no DirecTV client — app or Osprey — sends it.
++    'yo.fr': 'true', 'yo.av': '5',
++    # The Android TV app's own live Yospace params. Its com.att.tv config tree sets
++    # YSLiveParams = {yo.d.cp, yo.vm}; it does NOT send yo.cps for a live tune. yo.cps
++    # is a Content Playback Spec from the app's default/iOS config tree only
++    # ('b.lp.d.s.<min>-3630.0x.s.n' with a computed <min> we can't know), and sending
++    # it pinned Yospace to a band-limited inserted-ad profile (muffled ~7 kHz) that the
++    # real Android TV app — and the Osprey — never get. Leaving it out, per the repo
++    # rule: if we don't know the value, don't invent one. yo.vm is the ad-macro map,
++    # base64 JSON with APPBUNDLE com.att.tv, sent verbatim. yo.vm is a pinned snapshot of
++    # the app's bundled value: the ${...} inside are Yospace server-side macros (the app
++    # does not substitute them either), so the blob goes as-is and never varies per
++    # session. It drifts only on a DirecTV app update — re-extract YSLiveParams.yo.vm from
++    # the new index.android.bundle then, alongside _APP_USER_AGENT's version.
++    'yo.sl': '3', 'yo.d.cp': 'true',
++    'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
++}
++
++CONFIG_FIELD = ConfigField(
++    'use_dai', 'Use DirecTV ad insertion (DAI)',
++    field_type='toggle', default='false',
++    help_text=(
++        'On = play the stream DirecTV\'s own apps use, with DirecTV\'s local '
++        'ads in commercial breaks. Off = the national feed without DirecTV\'s '
++        'inserted ads. Requires the AH4C bridge (an Android device) — it '
++        'does not work with Prismcast, which has no Android device to read. '
++        'Turning this on captures each bridge device\'s advertising ID: a Fire '
++        'TV is read silently; a Google TV/Android TV device briefly shows its Ads '
++        'settings screen for a few seconds while it\'s read, and is skipped if '
++        'it\'s playing. The ID is saved and reused. When you add a new device '
++        'later, a "Capture advertising IDs" button appears to pull its ID.'
++    ),
++)
++
++CONFIG_FIELDS = (CONFIG_FIELD,)
++
++
++
++def enabled(config: dict | None) -> bool:
++    return str((config or {}).get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
++
++
++# ── Stream URL ───────────────────────────────────────────────────────────────
++
++def _v2_playback(pb: dict) -> dict:
++    groups = {g.get('groupName'): g.get('URLs') or [] for g in pb.get('streamUrls') or [] if isinstance(g, dict)}
++    return {'streamURL': next(iter(groups.get('DAI') or []), None),
++            'fallbackStreamUrl': next(iter(groups.get('Data Center') or []), None)}
++
++
++def pick_stream_url(playback_data: dict, dai: dict | None) -> str | None:
++    """The stream URL to play from a channel/v1 or channel/v2 ``playbackData``
++    object. ``dai`` is the DAI flag dict from request_flags(), or None with DAI off."""
++    pb = playback_data or {}
++    if 'streamUrls' in pb:
++        pb = _v2_playback(pb)
++    if dai:
++        url = pb.get('streamURL') or pb.get('fallbackStreamUrl')
++    else:
++        url = pb.get('fallbackStreamUrl') or pb.get('streamURL')
++    # streamURL is a Yospace ad-insertion session URL. Yospace answers it with
++    # 503 "Content not found" unless it names a session pool; livepause is the
++    # one DirecTV's own apps use.
++    if url and 'yospace.com' in url and 'yospace.pool=' not in url:
++        url += ('&' if '?' in url else '?') + 'yospace.pool=livepause'
++    # Add the account's DAI targeting values (DMA/consent, our device ids, per-channel
++    # net) so ad insertion targets the right market
++    # and honors the account's real ad-personalization choice. Only values we truly
++    # have are sent; nothing is invented.
++    if url and dai and 'yospace.com' in url:
++        # Match on exact param keys, not a substring (a naive `'e=' in query`
++        # would false-positive against the tail of cdncpDevice=/cdncpCtime= and
++        # silently drop e=prod).
++        query = url.split('?', 1)[1] if '?' in url else ''
++        existing_keys = {pair.split('=', 1)[0] for pair in query.split('&') if pair}
++        for k, v in dai.items():
++            if v in (None, '') or k in existing_keys:
++                continue
++            # Leave ':' and ',' literal, as DirecTV's clients send them
++            # (_fw_did=android_id:<id>, devgrp,STV). Percent-encoded, the ad
++            # server doesn't recognize the device id and serves untargeted spots.
++            url += f'&{quote(str(k), safe="")}={quote(str(v), safe=",:~")}'
++            existing_keys.add(k)
++        logger.info('[directv-dai] DAI session active: Yospace ad-insertion streamURL with the account + device targeting flags')
++    return url
++
++
++def cached_url_usable(cached: dict | None, dai: bool) -> bool:
++    """A URL cached under the other DAI setting (or a bare Yospace URL cached
++    before the pool fix) must not be served after the toggle changes. With DAI
++    on, a cached ad session also belongs to one playback device (its device id
++    is in the URL), so another device gets its own."""
++    if not cached:
++        return False
++    url = cached.get('fallback_url') or ''
++    if bool(cached.get('dai')) != dai or ('yospace.com' in url and 'yospace.pool=' not in url):
++        return False
++    if dai and 'yospace.com' in url:
++        fw_did = _current_device_ad_flags().get('_fw_did')
++        if fw_did:
++            return f'_fw_did={quote(fw_did, safe=",:~")}' in url
++        # Not a bridge device (e.g. Channels playing the URL itself): reuse only a session
++        # not pinned to a specific device. Reject a cached android_id OR a real advertising
++        # id; the shared google_advertising_id:optout form is fine (a non-bridge requester
++        # produces that itself from the account's consent).
++        return ('_fw_did=android_id:' not in url
++                and not re.search(r'_fw_did=google_advertising_id:(?!optout)', url))
++    return True
++
++
++def request_flags(config: dict, channel_names: dict | None, ccid: str) -> dict | None:
++    """The DAI flags for one tune, or None when DAI is off."""
++    if not enabled(config):
++        return None
++    return build_query(config, channel_names or {}, ccid)
++
++
++def build_query(config: dict, dai_channel_names: dict, ccid: str) -> dict:
++    """The DAI request flags: the general client flags (never a desktop device
++    identity; see _CLIENT_PARAMS), the account's own household/profile/DMA, its
++    real ad-personalization choice (is_lat derived from the account's GPP consent
++    string), our device's own ad ids, and the per-channel net tag. Only values
++    actually sourced from the account (or minted for our own device) are included."""
++    q = dict(_CLIENT_PARAMS)
++    pid = config.get('dai_partner_profile_id')
++    if pid:
++        q['hhid'] = pid
++        q['u'] = pid
++    # profid is the viewer profile's id. dtv_android_profid is the one the old overlay's
++    # profile picker stored (kept in the config, still honored); dai_profile_id is the
++    # web-login value. Omitted when unknown (fairness rule).
++    profid = config.get('dtv_android_profid') or config.get('dai_profile_id')
++    if profid:
++        q['profid'] = profid
++    if config.get('dai_dma_id'):
++        q['dma_location'] = config['dai_dma_id']
++        q['dma_billing'] = config['dai_dma_id']
++    if config.get('dai_gpp'):
++        q['gpp'] = config['dai_gpp']
++    if config.get('dai_gpp_sid'):
++        q['gpp_sid'] = config['dai_gpp_sid']
++    zip_code = config.get('dai_zip') or _account_zip(config)
++    if zip_code:
++        q['bZipCode'] = zip_code
++
++    # The ad id, is_lat and comscore_device come from the playback device, the way
++    # DirecTV's Android TV app sets them (see device_ad_flags), using the device's
++    # captured real advertising id. Without is_lat=0 the ad server sends national spots
++    # only (no local or political ads). This only reads the captured id; capture itself
++    # is explicit (DAI toggle-on or the admin button), never triggered by a tune.
++    device = _current_device_ad_flags()
++    if device:
++        q.update(device)
++    else:
++        # Not a bridge device (e.g. Channels playing the URL itself): fall back to
++        # the account's consent, decoded from its US-National GPP section only.
++        if str(config.get('dai_gpp_sid')) == '7' and config.get('dai_gpp'):
++            opt_out = gpp_targeted_ad_opt_out(config['dai_gpp'])
++            if opt_out is not None:
++                q['is_lat'] = '1' if opt_out else '0'
++                if opt_out:
++                    q['_fw_did'] = 'google_advertising_id:optout'
++                    q['adid'] = 'optout'
++    net = (dai_channel_names or {}).get(ccid)
++    if net:
++        q['net'] = net
++    return q
++
++
++def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
++    """The device ad flags the DirecTV Android TV app sends, built from this bridge
++    device's own values. Priority, matching the app:
++    - The device's real platform advertising id, when one was captured for it
++      (``ad_id`` from capture_registered_devices): google_advertising_id:<id> +
++      adid=<id> with is_lat=0 — exactly what the app sends. is_lat=0 is what
++      gets local and political ads.
++    - Its opted-out form when that advertising id was deleted/limited (``ad_id``
++      optout, or Fire OS limit_ad_tracking=1): google_advertising_id:optout,
++      adid=optout, is_lat=1.
++    - Absolute last resort, when no advertising id can be read: _fw_did=android_id:
++      <Android ID> with is_lat=0. DirecTV's own prefix for an Android device id,
++      which every Android device exposes over adb. We never invent a value.
++    comscore_device = Android_<Build.MANUFACTURER>_<Build.MODEL>, whitespace removed,
++    as the app builds it (universalYospaceParameters)."""
++    if not props:
++        return {}
++    flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{props.get('manufacturer', '')}_{props.get('model', '')}")}
++    gaid = ((ad_id or {}).get('advertising_id') or '').strip()
++    # An all-zero id is Android's "deleted / limited" sentinel, never a real id: treat
++    # it as opt-out, and never send it as an advertising id.
++    optout = bool((ad_id or {}).get('optout')) or gaid == _ZERO_GAID
++    if gaid == _ZERO_GAID:
++        gaid = ''
++    if gaid and not optout:
++        flags.update({'is_lat': '0', '_fw_did': f'google_advertising_id:{gaid}', 'adid': gaid})
++    elif optout or props.get('limit_ad_tracking') == '1':
++        flags.update({'is_lat': '1', '_fw_did': 'google_advertising_id:optout', 'adid': 'optout'})
++    elif len(props.get('android_id', '')) >= 8:
++        flags.update({'is_lat': '0', '_fw_did': f"android_id:{props['android_id']}"})
++    return flags
++
++
++# ── Device advertising-id capture (DAI) ────────────────────────────────────────
++#
++# The Android TV app sends the playback device's real platform advertising id
++# (google_advertising_id:<id> + adid) with is_lat from the device's own ad-tracking
++# choice. We match that per bridge device, read the way each platform exposes it:
++#   - Fire OS mirrors it into Settings.Secure, so `settings get secure advertising_id`
++#     reads it silently (most bridge sticks are Fire TV).
++#   - GMS (Google TV / plain Android with Play Services) locks the id to an app
++#     process: there is no settings mirror, and a shell cannot bind the GMS service
++#     (ActivityManager refuses a non-app caller). The only root-free read is the
++#     device's own Ads settings screen — open it, read the id off the view
++#     hierarchy (uiautomator), restore. That briefly shows the screen on the box
++#     (~3s), so it is done ONCE.
++#   - Anything else: no advertising id is read, and device_ad_flags keeps android_id.
++#
++# Captured per device and reused from directv_dai_adids.json; NEVER re-read on a schedule
++# (that would flash every Google TV box) and NEVER at a tune (that would interrupt the
++# tuning box). Capture runs only from an explicit action: clear_cache_if_toggled (DAI
++# turned on, or a DirecTV config save while DAI is on, captures the uncaptured boxes) and
++# the admin "Capture advertising IDs" button; a box that is playing is skipped. To force a
++# fresh capture of all boxes, toggle DAI off and on.
++
++_ZERO_GAID = '00000000-0000-0000-0000-000000000000'
++_GAID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE)
++_ADS_ACTION = 'com.google.android.gms.settings.ADS_PRIVACY'
++
++# Robust on-device GMS capture: wake, leave the screensaver, open the Ads screen, then
++# read the id off a FRESH uiautomator dump each pass (a stale /sdcard/ui.xml is removed
++# first, so a dump that silently fails can never be read as the screen). "active" is
++# decided by a real, non-zero advertising id being present (locale-independent); "deleted"
++# by the Ads screen showing with no real id. Restores HOME. Prints STATE and GAID. The
++# flash stays ~3s because it breaks the instant the screen is readable.
++_GMS_CAPTURE_SH = r'''
++ZERO=00000000-0000-0000-0000-000000000000
++UUID='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
++input keyevent KEYCODE_WAKEUP
++input keyevent KEYCODE_HOME
++am start -a com.google.android.gms.settings.ADS_PRIVACY >/dev/null 2>&1
++got=""; state=""; j=0
++while [ $j -lt 12 ]; do
++  sleep 0.3
++  rm -f /sdcard/ui.xml 2>/dev/null
++  uiautomator dump /sdcard/ui.xml >/dev/null 2>&1
++  [ -f /sdcard/ui.xml ] || { j=$((j+1)); continue; }
++  got=$(grep -oE "$UUID" /sdcard/ui.xml 2>/dev/null | head -1)
++  if [ -n "$got" ] && [ "$got" != "$ZERO" ]; then
++    state=active; break
++  fi
++  if grep -q "advertising ID" /sdcard/ui.xml 2>/dev/null; then
++    state=deleted; got=""; break
++  fi
++  got=""
++  j=$((j+1))
++done
++input keyevent KEYCODE_HOME
++echo "STATE=$state"
++echo "GAID=$got"
++'''
++
++_adid_lock = threading.Lock()
++_adid_inflight: set[str] = set()
++# Addresses last tried with no readable id (adb unreachable, or a non-English deleted
++# screen): kept out of "uncaptured" for a while so the capture button doesn't nag
++# forever, then retried. In memory, so a restart retries once.
++_adid_tried: dict[str, float] = {}
++_ADID_TRIED_TTL = 6 * 3600
++
++
++def _adids_file() -> str:
++    """directv_dai_adids.json, beside the device store. Kept separate from
++    the device-identity store (directv_dai_device) so that store's hourly re-read can
++    never clobber a captured id."""
++    return os.path.join(os.path.dirname(device._devices_file()), 'directv_dai_adids.json')
++
++
++def _saved_adids() -> dict:
++    try:
++        with open(_adids_file(), encoding='utf-8') as f:
++            data = json.load(f)
++        return data if isinstance(data, dict) else {}
++    except Exception:
++        return {}
++
++
++def _save_adids(adids: dict) -> None:
++    path = _adids_file()
++    # Unique temp name per process+thread so two concurrent captures can't interleave
++    # into the same temp file before the atomic os.replace.
++    tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
++    try:
++        with open(tmp, 'w', encoding='utf-8') as f:
++            json.dump(adids, f)
++        os.replace(tmp, path)
++    except Exception as exc:
++        logger.debug('[directv-dai] could not save advertising ids: %s', exc)
++        try:
++            os.unlink(tmp)
++        except OSError:
++            pass
++
++
++@contextlib.contextmanager
++def _adids_file_lock():
++    """Exclusive cross-process lock for the store's read-modify-write. The app runs several
++    gunicorn workers, so the thread lock alone can't stop two workers interleaving a
++    read-modify-write and losing an entry. Best-effort: if the OS lock can't be taken, the
++    thread lock still serializes writes within a worker."""
++    f = None
++    try:
++        f = open(_adids_file() + '.lock', 'w')
++        try:
++            import fcntl
++            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
++        except Exception:
++            pass
++        yield
++    finally:
++        if f is not None:
++            try:
++                f.close()   # closing the fd releases the flock
++            except Exception:
++                pass
++
++
++def _store_adid(address: str, entry: dict) -> bool:
++    """Merge one device's captured id into the store (read-modify-write), so a capture adds
++    to the file and never overwrites the other devices' entries. Returns True if it actually
++    changed, ignoring the capture timestamp. Guarded by the thread lock AND a cross-process
++    file lock, because the app runs multiple gunicorn workers: without the file lock two
++    workers capturing at once could interleave their read-modify-writes and lose an entry."""
++    keys = ('advertising_id', 'optout', 'source')
++    with _adid_lock, _adids_file_lock():
++        adids = _saved_adids()
++        prev = adids.get(address)
++        changed = not prev or any(prev.get(k) != entry.get(k) for k in keys)
++        adids[address] = entry
++        _save_adids(adids)
++    return changed
++
++
++def _adb_shell(address: str, shell_cmd: str, timeout: int = 20) -> str:
++    """Run one adb shell command on a bridge device; '' on any failure."""
++    try:
++        subprocess.run(['adb', 'connect', address], capture_output=True, timeout=8)
++        r = subprocess.run(['adb', '-s', address, 'shell', shell_cmd],
++                           capture_output=True, text=True, timeout=timeout)
++        return r.stdout or ''
++    except Exception as exc:
++        logger.debug('[directv-dai] adb command failed for %s: %s', address, exc)
++        return ''
++
++
++def _reachable(address: str) -> bool:
++    """A fast adb reachability check (short timeouts) so a powered-off box fails quickly, and
++    so the capture result can tell 'couldn't reach the box' apart from 'reachable but no
++    advertising id'."""
++    try:
++        subprocess.run(['adb', 'connect', address], capture_output=True, timeout=5)
++        r = subprocess.run(['adb', '-s', address, 'shell', 'echo ok'],
++                           capture_output=True, text=True, timeout=5)
++        return 'ok' in (r.stdout or '')
++    except Exception:
++        return False
++
++
++# Sentinel: the GMS screen read was skipped because the box is playing (defer, don't
++# interrupt). Distinct from None (no advertising id) so callers can report it.
++_PLAYING = object()
++
++
++def _is_playing(address: str) -> bool:
++    """True when the box is actively playing audio/video, so the GMS screen capture must
++    not run (it would interrupt playback). A box asleep or on its screensaver is not
++    playing. Signals: a media session in the PLAYING state, or an actively started media
++    audio player. Fail-safe is to NOT capture: on any doubt here, treat as playing."""
++    out = _adb_shell(address, 'dumpsys power 2>/dev/null | grep mWakefulness; echo ---; '
++                              'dumpsys media_session 2>/dev/null; echo ---; '
++                              'dumpsys audio 2>/dev/null', timeout=12)
++    if not out:
++        return True  # couldn't tell -> don't risk interrupting
++    power, _, rest = out.partition('---')
++    if 'Dreaming' in power or 'Asleep' in power or 'Dozing' in power:
++        return False  # screensaver / asleep: safe to capture
++    media_session, _, audio = rest.partition('---')
++    if 'state=PlaybackState {state=3' in media_session:  # PlaybackState.STATE_PLAYING
++        return True
++    # Any actively started audio player means something is playing. On a bridge box that
++    # only ever runs the stream, treat ANY started player (not just USAGE_MEDIA) as playing,
++    # so a muted or oddly-tagged stream can't slip through and get its screen interrupted.
++    if 'state:started' in audio:
++        return True
++    return False
++
++
++def _read_fire_advertising_id(address: str) -> dict | None:
++    """Fire OS (and any build that mirrors it): a silent Settings.Secure read."""
++    out = _adb_shell(address, 'echo A=$(settings get secure advertising_id); '
++                              'echo L=$(settings get secure limit_ad_tracking)')
++    aid = lat = ''
++    for ln in out.splitlines():
++        if ln.startswith('A='):
++            aid = ln[2:].strip().lower()
++        elif ln.startswith('L='):
++            lat = ln[2:].strip()
++    if not (_GAID_RE.fullmatch(aid) or aid == _ZERO_GAID):
++        return None
++    optout = aid == _ZERO_GAID or lat == '1'
++    return {'advertising_id': '' if optout else aid, 'optout': optout, 'source': 'fire'}
++
++
++def _read_gms_advertising_id(address: str):
++    """GMS (Google TV / plain Android with Play Services): read the id off the Ads settings
++    screen. Only attempted when that screen exists on the box. It briefly shows the screen
++    (~3s) and interrupts whatever the box is displaying, so it runs only from an explicit
++    action (DAI toggle-on or the admin capture button), never at tune time, and is GATED:
++    if the box is currently playing, it is skipped (returns the _PLAYING sentinel) so an
++    active stream is never interrupted. Returns a reading dict, None (no id), or _PLAYING."""
++    probe = _adb_shell(address, f'cmd package query-activities -a {_ADS_ACTION} 2>/dev/null')
++    if 'AdsSettingsActivity' not in probe:
++        return None
++    if _is_playing(address):
++        logger.info('[directv-dai] skipped advertising-id capture for %s: box is playing', address)
++        return _PLAYING
++    b64 = base64.b64encode(_GMS_CAPTURE_SH.encode()).decode()
++    out = _adb_shell(address, f'echo {b64} | base64 -d > /data/local/tmp/dai_cap.sh; '
++                              'sh /data/local/tmp/dai_cap.sh; rm -f /data/local/tmp/dai_cap.sh',
++                     timeout=45)
++    state = gaid = ''
++    for ln in out.splitlines():
++        if ln.startswith('STATE='):
++            state = ln[6:].strip()
++        elif ln.startswith('GAID='):
++            gaid = ln[5:].strip().lower()
++    if state == 'active' and _GAID_RE.fullmatch(gaid) and gaid != _ZERO_GAID:
++        return {'advertising_id': gaid, 'optout': False, 'source': 'gms'}
++    if state == 'deleted':
++        return {'advertising_id': '', 'optout': True, 'source': 'gms'}
++    return None
++
++
++def _capture_one(address: str):
++    """This bridge device's real advertising id + opt-out, trying each platform's own
++    channel in turn. Returns a reading dict, None (no id -> keep android_id), or the
++    _PLAYING sentinel (GMS read skipped because the box is in use). The silent Fire read
++    is never gated; only the GMS screen read is."""
++    return _read_fire_advertising_id(address) or _read_gms_advertising_id(address)
++
++
++def _capture_and_store(address: str) -> str:
++    """Capture one device and persist it, under the single-flight guard so the same box is
++    never captured twice at once (a batch and a button press can't double-run it). Returns
++    'captured', 'playing' (skipped, box in use), or 'none' (no advertising id readable)."""
++    if not address:
++        return 'none'
++    with _adid_lock:
++        if address in _adid_inflight:
++            return 'none'
++        _adid_inflight.add(address)
++    try:
++        if not _reachable(address):
++            return 'unreachable'   # box off / adb down; kept pending so a re-run picks it up
++        res = _capture_one(address)
++        if res is _PLAYING:
++            return 'playing'   # still pending: keep it, re-run when idle
++        if res is None:
++            with _adid_lock:
++                _adid_tried[address] = time.time()   # reachable but nothing readable: stop nagging a while
++            return 'none'
++        entry = {'advertising_id': res['advertising_id'], 'optout': res['optout'],
++                 'source': res['source'], 'captured_at': int(time.time())}
++        if _store_adid(address, entry):
++            logger.info('[directv-dai] captured advertising id for %s (%s, %s)',
++                        address, res['source'], 'optout' if res['optout'] else 'present')
++        with _adid_lock:
++            _adid_tried.pop(address, None)
++        return 'captured'
++    finally:
++        with _adid_lock:
++            _adid_inflight.discard(address)
++
++
++def _bridge_addresses() -> list[str]:
++    try:
++        from .. import bridge_devices
++        return [d['address'] for d in bridge_devices.known_devices()[0] if d.get('address')]
++    except Exception as exc:
++        logger.debug('[directv-dai] could not list bridge devices: %s', exc)
++        return []
++
++
++def _bust_playback_cache() -> None:
++    """Drop the DirecTV source's cached Yospace stream URLs so the next tune refetches with
++    the just-captured advertising id (a cached URL carries whatever id was current when it
++    was built). cached_url_usable already refetches on an id mismatch; this makes it
++    explicit so there's no window where a stale URL is served after a capture."""
++    try:
++        from ..config_store import persist_source_cache_updates
++        from ..models import Source
++        src = Source.query.filter_by(name='directv').first()
++        if src:
++            persist_source_cache_updates(src.id, {'directv_playback': {}})
++    except Exception as exc:
++        logger.debug('[directv-dai] could not clear playback cache after capture: %s', exc)
++
++
++def capture_registered_devices(addresses: list[str] | None = None) -> dict:
++    """Capture + persist the advertising id for every registered bridge device (or the
++    given ones), serially. Returns counts {'captured', 'playing', 'none'}. Runs ONLY from
++    an explicit action (DAI toggle-on, or the admin capture button) — never on a schedule
++    and never at tune time. Must run inside a Flask app context (device list + store)."""
++    addrs = addresses if addresses is not None else _bridge_addresses()
++    counts = {'captured': 0, 'playing': 0, 'unreachable': 0, 'none': 0}
++    for addr in addrs:
++        counts[_capture_and_store(addr)] += 1
++    if counts['captured']:
++        # A new advertising id was stored; clear cached stream URLs so the next tune uses it.
++        _bust_playback_cache()
++    return counts
++
++
++def capture_in_background(addresses: list[str] | None = None) -> int:
++    """Run capture_registered_devices in a daemon thread, carrying the current Flask app
++    context into it (the thread needs one for the DB-backed device list and the store
++    path). Resolves the device list in the calling request thread. Returns how many
++    devices it will visit."""
++    try:
++        from flask import current_app
++        app = current_app._get_current_object()
++    except Exception:
++        app = None
++    if addresses is None:
++        addresses = _bridge_addresses()
++    addresses = list(addresses or [])
++    if not addresses:
++        return 0
++
++    def _run():
++        try:
++            if app is not None:
++                with app.app_context():
++                    capture_registered_devices(addresses)
++            else:
++                capture_registered_devices(addresses)
++        except Exception as exc:
++            logger.warning('[directv-dai] background capture failed: %s', exc)
++    threading.Thread(target=_run, daemon=True).start()
++    return len(addresses)
++
++
++def uncaptured_addresses() -> list[str]:
++    """Registered bridge devices with no captured advertising id yet (new boxes), used to
++    show the admin capture button only when there is something to capture. Excludes a box
++    we recently tried and couldn't read (unreachable / non-English deleted) so the button
++    doesn't nag forever; it reappears after _ADID_TRIED_TTL. Needs an app context."""
++    saved = _saved_adids()
++    now = time.time()
++    with _adid_lock:
++        recent = {a for a, t in _adid_tried.items() if now - t < _ADID_TRIED_TTL}
++    return [a for a in _bridge_addresses() if a and a not in saved and a not in recent]
++
++
++def _current_bridge_address() -> str | None:
++    try:
++        from flask import has_request_context, request
++        ip = (request.remote_addr or '').strip() if has_request_context() else ''
++    except Exception:
++        ip = ''
++    return device._bridge_address(ip) if ip else None
++
++
++def _current_device_ad_flags() -> dict:
++    """device_ad_flags for the bridge device making the current request, using the
++    advertising id captured for it earlier. Reads the store only — a tune NEVER triggers a
++    capture (capture is explicit: DAI toggle-on or the admin button)."""
++    address = _current_bridge_address()
++    return device_ad_flags(device._client_device(), _saved_adids().get(address or ''))
++
++
++_ZIP_CACHE: dict[str, str] = {}
++
++
++def _account_zip(config: dict) -> str | None:
++    """The account's billing ZIP (for bZipCode) when login didn't store one yet,
++    fetched once per process with the stored sign-in."""
++    bearer = config.get('bearer_token')
++    if not bearer:
++        return None
++    if bearer in _ZIP_CACHE:
++        return _ZIP_CACHE[bearer] or None
++    session = requests.Session()
++    for c in config.get('cookies') or []:
++        try:
++            session.cookies.set(c['name'], c['value'], domain=c.get('domain') or None, path=c.get('path') or '/')
++        except Exception:
++            continue
++    _ZIP_CACHE[bearer] = fetch_account_context(session, bearer).get('zip') or ''
++    return _ZIP_CACHE[bearer] or None
++
++
++def gpp_targeted_ad_opt_out(gpp: str) -> bool | None:
++    """Decode the US-National (GPP section id 7) consent string and report whether
++    the account has opted OUT of targeted advertising.
++
++    Returns True (opted out), False (not opted out), or None if it can't be read.
++    The US-National section's opt-out fields use 0=N/A, 1=Opted Out, 2=Did Not
++    Opt Out. Validated against a real capture: an account with ad personalization
++    turned off decodes to TargetedAdvertisingOptOut=1, i.e. is_lat=1.
++    """
++    try:
++        section = (gpp or '').partition('~')[2]
++        if not section:
++            return None
++        b64 = section.replace('-', '+').replace('_', '/')
++        b64 += '=' * (-len(b64) % 4)
++        bits = ''.join(f'{byte:08b}' for byte in base64.b64decode(b64))
++        pos = 6  # Version(6)
++        # 6 notice fields (2 bits each), then SaleOptOut, SharingOptOut,
++        # TargetedAdvertisingOptOut (2 bits each).
++        pos += 6 * 2  # the notice fields
++        pos += 2 * 2  # SaleOptOut, SharingOptOut
++        tao = int(bits[pos:pos + 2], 2)
++        return tao == 1
++    except Exception:
++        return None
++
++
++# ── Scrape ───────────────────────────────────────────────────────────────────
++
++_CCID_KEYS = ('ccid', 'ccId', 'channelId', 'channel_id', 'id')
++
++
++def note_channels(scraper, rows) -> None:
++    """Record each lineup row's DAI "net" tag (daiChannelName) in the scraper's cache,
++    where a tune reads it. Called with every AllChannels page of rows; writes the cache
++    only when something changed."""
++    names = scraper.cache.get('dai_channel_names')
++    names = dict(names) if isinstance(names, dict) else {}
++    changed = False
++    for row in rows or []:
++        if not isinstance(row, dict):
++            continue
++        ccid = next((str(row[k]).strip() for k in _CCID_KEYS if row.get(k) not in (None, '')), '')
++        value = row.get('daiChannelName')
++        if isinstance(value, (int, float)) and not isinstance(value, bool):
++            value = str(value)
++        if not ccid or not isinstance(value, str) or not value.strip():
++            continue
++        if names.get(ccid) != value.strip():
++            names[ccid] = value.strip()
++            changed = True
++    if changed:
++        scraper._update_cache('dai_channel_names', names)
++
++
++# ── Login ────────────────────────────────────────────────────────────────────
++
++def store_login_result(cfg: dict, result: dict) -> None:
++    """Persist the account's own DAI values from a login result into the source
++    config (used only when the toggle is on). Runs after upstream's apply_auth_result
++    on every sign-in and refresh (see directv_dai_install).
++
++    Upstream's code sign-in (directv_device_auth) returns a bare session, so the DAI
++    targeting context (DMA/ZIP/consent) is fetched here with its bearer, once: a refresh
++    reuses what's stored. Best-effort: a failed fetch never breaks the sign-in."""
++    if ('dai_context' not in result and result.get('bearer_token')
++            and (result.get('auth_method') == 'device_code' or not cfg.get('dai_dma_id'))):
++        try:
++            from . import directv_device_auth
++            account = requests.Session()
++            account.headers.update(directv_device_auth.app_headers())
++            result = {**result, 'dai_context': fetch_account_context(account, result['bearer_token'])}
++        except Exception as exc:
++            logger.warning('[directv-dai] could not fetch DAI context at login: %s', exc)
++    partner_profile_id = result.get('partner_profile_id')
++    profile_id = result.get('profile_id')
++    # Paths with no token-exchange valuePairs fall back to the bearer JWT's own claims
++    # (the code sign-in's tokens are opaque, so there it's the valuePairs or nothing).
++    if not partner_profile_id or not profile_id:
++        jwt_pp, jwt_pf = ids_from_bearer_jwt(result.get('bearer_token') or '')
++        partner_profile_id = partner_profile_id or jwt_pp
++        profile_id = profile_id or jwt_pf
++    if partner_profile_id:
++        cfg['dai_partner_profile_id'] = partner_profile_id
++    if profile_id:
++        cfg['dai_profile_id'] = profile_id
++    for k, v in (result.get('dai_context') or {}).items():
++        if v:
++            cfg[f'dai_{k}'] = v
++
++
++def fetch_account_context(session, bearer: str) -> dict:
++    """Best-effort fetch of the account's real DMA and privacy-consent string, the
++    values the web client puts on its DAI session request. Uses the already-authed
++    login session. Any failure returns {} — DAI playback still works, it just
++    omits the fields we couldn't source rather than inventing them."""
++    ctx: dict = {}
++    hdrs = {
++        'Authorization': f'Bearer {bearer}',
++        'Accept': 'application/json, text/plain, */*',
++        'Origin': 'https://stream.directv.com',
++        'Referer': 'https://stream.directv.com/',
++    }
++    try:
++        r = session.get(_LOCATION_URL, params={'includeTVOD': 'false'}, headers=hdrs, timeout=15)
++        if r.ok:
++            data = r.json()
++            dma = _find_first_key(data, 'dmaId')
++            if dma:
++                ctx['dma_id'] = str(dma)
++            billing = data.get('billingDmas') if isinstance(data, dict) else None
++            zip_code = _find_first_key(billing, 'zipcode') or _find_first_key(data, 'zipcode')
++            if zip_code:
++                ctx['zip'] = str(zip_code)
++    except Exception as exc:
++        logger.debug('[directv-dai] location lookup failed: %s', exc)
++    try:
++        r = session.get(_BASICINFO_URL, params={'requestIds': 'true', 'requestShortIds': 'true'},
++                        headers=hdrs, timeout=15)
++        if r.ok:
++            data = r.json()
++            gpp = _find_first_key(data, 'gpp')
++            gpp_sid = _find_first_key(data, 'gpp_sid')
++            if gpp:
++                ctx['gpp'] = str(gpp)
++            if gpp_sid is not None:
++                ctx['gpp_sid'] = str(gpp_sid)
++    except Exception as exc:
++        logger.debug('[directv-dai] basicinfo lookup failed: %s', exc)
++    return ctx
++
++
++def ids_from_bearer_jwt(bearer: str) -> tuple[str | None, str | None]:
++    """Best-effort (partnerProfileId, profileId) read from the bearer JWT's own
++    claims, for auth paths that don't surface the token-exchange valuePairs (the
++    Playwright fallback). No signature verification — we only read claims from a
++    token DirecTV issued to us, never trusting it for authorization — and no value
++    is logged. Returns (None, None) if the token can't be parsed or lacks them."""
++    try:
++        seg = bearer.split('.')[1]
++        seg += '=' * (-len(seg) % 4)
++        claims = json.loads(base64.urlsafe_b64decode(seg))
++    except Exception:
++        return None, None
++    flat = {k.lower(): v for k, v in claims.items() if isinstance(v, (str, int))}
++
++    def pick(*names: str) -> str | None:
++        for n in names:
++            v = flat.get(n.lower())
++            if v is not None and str(v).strip():
++                return str(v).strip()
++        return None
++
++    return (pick('partnerProfileId', 'partnerprofileid', 'ppid'),
++            pick('profileId', 'profileid', 'pid'))
++
++
++def _find_first_key(obj, key):
++    """Depth-first search for the first value under `key` anywhere in a JSON tree."""
++    if isinstance(obj, dict):
++        if key in obj and not isinstance(obj[key], (dict, list)):
++            return obj[key]
++        for v in obj.values():
++            found = _find_first_key(v, key)
++            if found is not None:
++                return found
++    elif isinstance(obj, list):
++        for v in obj:
++            found = _find_first_key(v, key)
++            if found is not None:
++                return found
++    return None
++
++
++# ── Settings ─────────────────────────────────────────────────────────────────
++
++def clear_cache_if_toggled(source, old: dict, current: dict) -> None:
++    """The toggle picks which stream URL resolve() caches (for 55 minutes), so
++    drop every cached one when it changes; the next tune fetches under the new setting."""
++    if getattr(source, 'name', None) != 'directv':
++        return
++    if enabled(old) != enabled(current):
++        from ..config_store import persist_source_cache_updates
++        persist_source_cache_updates(source.id, {'directv_playback': {}})
++    if enabled(current):
++        # Whenever DAI is on, capture the advertising id of any bridge device that doesn't
++        # have one yet: all of them right after turning DAI on, or a newly-added box on a
++        # later save. Background, skipping any box that's currently playing. This save-time
++        # pass is the ONLY automatic trigger -- a tune never captures (no new upstream hook,
++        # and a Google TV box is never interrupted mid-stream).
++        capture_in_background(uncaptured_addresses())
+diff --git a/app/scrapers/directv_dai_device.py b/app/scrapers/directv_dai_device.py
+new file mode 100644
+index 0000000..2e4ee89
+--- /dev/null
++++ b/app/scrapers/directv_dai_device.py
+@@ -0,0 +1,177 @@
++"""The bridge device a DirecTV DAI tune plays on: its identity and app User-Agent.
++
++DAI targets the playback device the way DirecTV's Android TV app does, so this reads
++the bridge device behind the current request (matched by IP to bridge_devices) over
++adb: Android ID, limit_ad_tracking, Android version, model, board, manufacturer. Each
++device's values are saved in directv_dai_devices.json beside the database, so a device
++keeps one stable identity while it's asleep or adb is down.
++
++The same properties build the app's player User-Agent, which the relay sends on the
++Yospace master fetch and every playlist and segment (A/B tested for inserted ads).
++
++Sign-in, refresh and DRM are upstream's (directv_device_auth); nothing here touches them.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import subprocess
++import threading
++import time
++
++logger = logging.getLogger(__name__)
++
++_DEVICE_CACHE: dict[str, tuple[float, dict]] = {}
++_DEVICE_TTL = 3600
++
++# One adb read per bridge device per hour; every device-derived value below
++# (Android ID, is_lat, comscore_device, User-Agent) comes from these properties.
++_DEVICE_PROPS = (
++    ('android_id', 'settings get secure android_id'),
++    ('limit_ad_tracking', 'settings get secure limit_ad_tracking'),
++    ('release', 'getprop ro.build.version.release'),
++    ('model', 'getprop ro.product.model'),
++    ('board', 'getprop ro.product.board'),
++    ('manufacturer', 'getprop ro.product.manufacturer'),
++)
++
++
++def _client_device() -> dict:
++    """Build properties of the bridge device making the current request.
++
++    Each device's values are saved on disk (directv_dai_devices.json) and every
++    session uses the saved values, so a device keeps one stable identity even
++    while it's asleep or adb is down. A device seen for the first time is read
++    over adb right away. After that it's re-checked in the background about once
++    an hour; if it really changed (factory reset gives a new Android ID, ad
++    tracking toggled, firmware update), the saved values are updated and logged.
++    A failed re-check changes nothing. {} when the request isn't from a known
++    bridge device, or outside a request."""
++    try:
++        from flask import has_request_context, request
++        ip = (request.remote_addr or '').strip() if has_request_context() else ''
++    except Exception:
++        ip = ''
++    if not ip:
++        return {}
++    address = _bridge_address(ip)
++    if not address:
++        return {}
++    now = time.time()
++    hit = _DEVICE_CACHE.get(address)
++    if hit and now < hit[0]:
++        return hit[1]
++    props = _saved_devices().get(address) or {}
++    if props:
++        _DEVICE_CACHE[address] = (now + _DEVICE_TTL, props)
++        threading.Thread(target=_recheck_device, args=(address, props), daemon=True).start()
++        return props
++    props = _read_device(address)
++    if props:
++        _store_device(address, props)
++        logger.info('[directv-dai] saved device values for %s', address)
++    else:
++        logger.warning('[directv-dai] adb read failed for %s; this session has no device id', address)
++    _DEVICE_CACHE[address] = (now + (_DEVICE_TTL if props else _RETRY_TTL), props)
++    return props
++
++
++def _recheck_device(address: str, saved: dict) -> None:
++    """Background re-check: update the saved values only if the device changed."""
++    fresh = _read_device(address)
++    if fresh and fresh != saved:
++        changed = sorted(k for k in fresh if fresh.get(k) != saved.get(k))
++        _store_device(address, fresh)
++        _DEVICE_CACHE[address] = (time.time() + _DEVICE_TTL, fresh)
++        logger.info('[directv-dai] device %s changed (%s); saved values updated', address, ', '.join(changed))
++
++
++def _store_device(address: str, props: dict) -> None:
++    devices = _saved_devices()
++    devices[address] = props
++    _save_devices(devices)
++
++
++_RETRY_TTL = 60
++
++
++def _bridge_address(ip: str) -> str | None:
++    try:
++        from .. import bridge_devices
++        return next((d['address'] for d in bridge_devices.known_devices()[0]
++                     if d.get('host') == ip or d.get('address', '').split(':')[0] == ip), None)
++    except Exception as exc:
++        logger.debug('[directv-dai] bridge device lookup failed: %s', exc)
++        return None
++
++
++def _read_device(address: str) -> dict:
++    try:
++        subprocess.run(['adb', 'connect', address], capture_output=True, timeout=8)
++        r = subprocess.run(['adb', '-s', address, 'shell', '; '.join(cmd for _, cmd in _DEVICE_PROPS)],
++                           capture_output=True, text=True, timeout=10)
++    except Exception as exc:
++        logger.debug('[directv-dai] adb read failed for %s: %s', address, exc)
++        return {}
++    values = [ln.strip() for ln in (r.stdout or '').splitlines()]
++    props = {key: (values[i] if i < len(values) and values[i] != 'null' else '')
++             for i, (key, _) in enumerate(_DEVICE_PROPS)}
++    return props if props['model'] and len(props['android_id']) >= 8 else {}
++
++
++def _devices_file() -> str:
++    """directv_dai_devices.json next to FastChannels' SQLite database (the /data
++    volume), so saved device values survive restarts and image updates."""
++    uri = ''
++    try:
++        from flask import current_app
++        uri = current_app.config.get('SQLALCHEMY_DATABASE_URI') or ''
++    except Exception:
++        pass
++    folder = os.path.dirname(uri[len('sqlite:///'):]) if uri.startswith('sqlite:///') else ''
++    return os.path.join(folder or '/data', 'directv_dai_devices.json')
++
++
++def _saved_devices() -> dict:
++    try:
++        with open(_devices_file(), encoding='utf-8') as f:
++            data = json.load(f)
++        return data if isinstance(data, dict) else {}
++    except Exception:
++        return {}
++
++
++def _save_devices(devices: dict) -> None:
++    path = _devices_file()
++    try:
++        tmp = f'{path}.{os.getpid()}.tmp'
++        with open(tmp, 'w', encoding='utf-8') as f:
++            json.dump(devices, f)
++        os.replace(tmp, path)
++    except Exception as exc:
++        logger.debug('[directv-dai] could not save device values: %s', exc)
++
++
++# DirecTV's Android TV app sends this User-Agent on its player's requests (Cronet,
++# which the app has on): AnalyticsService::generateUserAgent() in libcpp_core.so,
++# from Build.VERSION.RELEASE, Build.MODEL and Build.BOARD. APP_PROJECT_NAME is
++# literal (DirecTV never fills that placeholder in) and there are two spaces
++# before PureRN. 5.0.136.2002113867 is the app's versionName.
++_APP_USER_AGENT = 'APP_PROJECT_NAME/5.0.136.2002113867 (Android {release}; {model}; {board})  PureRN/0.79.5'
++
++
++def player_headers() -> dict:
++    """{'User-Agent': <the DirecTV app UA>} for a bridge device, else {}."""
++    ua = player_user_agent()
++    return {'User-Agent': ua} if ua else {}
++
++
++def player_user_agent() -> str | None:
++    """The DirecTV app's User-Agent for the bridge device making the current
++    request, or None when it isn't a known bridge device."""
++    props = _client_device()
++    if props.get('release') and props.get('model') and props.get('board'):
++        return _APP_USER_AGENT.format(release=props['release'], model=props['model'], board=props['board'])
++    return None
++
+diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
+new file mode 100644
+index 0000000..f5e988b
+--- /dev/null
++++ b/app/scrapers/directv_dai_install.py
+@@ -0,0 +1,586 @@
++"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
++
++Upstream's files carry a single hook (``directv_dai_install.install(app)`` at the end
++of ``create_app``). Everything else is attached here by wrapping upstream's own
++functions and views after they're defined, so upstream can rewrite the bodies of
++those functions freely without a patch conflict. Rules every wrapper follows:
++
++- DAI off -> the wrapper calls upstream's function untouched.
++- Any error in our code -> log it and fall back to upstream's function, so drift
++  degrades to "DAI off", never to broken playback.
++- A target that's gone is logged at ERROR by install() and listed by ``missing()``;
++  CI (validate.sh / smoke_test.py) fails loudly on it. Fix a moved target HERE.
++
++Module-level patches are applied once per process (create_app runs several times:
++the web app, the RQ worker, run_directv_auth's own app); per-app pieces (views, the
++blueprint, the admin-page script) once per app.
++
++TARGETS lists every upstream name this touches.
++"""
++from __future__ import annotations
++
++import contextvars
++import functools
++import inspect
++import logging
++import time
++from urllib.parse import quote, urljoin, urlsplit
++
++import requests
++
++logger = logging.getLogger(__name__)
++
++# Every upstream name install() depends on: (module, attribute path). validate.sh and
++# smoke_test.py check each one, so an upstream rename fails CI with its name.
++TARGETS = (
++    ('app.scrapers.directv', '_fetch_channel_playback'),
++    ('app.scrapers.directv', '_license_content_id_from_stream_url'),
++    ('app.scrapers.directv', 'DirectvAuthExpiredError'),
++    ('app.scrapers.directv', 'apply_auth_result'),
++    ('app.scrapers.directv', 'DirectvScraper.config_schema'),
++    ('app.scrapers.directv', 'DirectvScraper.resolve'),
++    ('app.scrapers.directv', 'DirectvScraper.prepare_license_request'),
++    ('app.scrapers.directv', 'DirectvScraper._fetch_allchannels_rows'),
++    ('app.scrapers.directv_device_auth', '_result'),
++    ('app.scrapers.directv_device_auth', 'is_device_session'),
++    ('app.routes.directv_proxy', '_requests'),
++    ('app.routes.directv_proxy', '_DIRECTV_BROWSER_CDN_SUFFIXES'),
++    ('app.routes.directv_proxy', '_directv_browser_cdn_allowed'),
++    ('app.routes.directv_proxy', '_directv_browser_proxyable_url'),
++    ('app.routes.directv_proxy', '_directv_browser_asset_proxy_url'),
++    ('app.routes.directv_proxy', '_rewrite_directv_browser_playlist'),
++    ('app.routes.directv_proxy', 'directv_browser_asset'),
++)
++# Views found by URL rule (more stable than function names).
++SAVE_CONFIG_RULE = '/api/sources/<int:source_id>/config'
++# The admin sources page bits the injected script relies on.
++TEMPLATE_MARKERS = ('function renderDirectvConfig', 'class="config-actions"')
++
++_CHANNEL_AUTH_V2 = 'https://api.cld.dtvce.com/right/authorization/channel/v2'
++
++# The scraper (config + cache) behind the current _fetch_channel_playback call. Set by
++# the resolve()/prepare_license_request() wrappers, since upstream's fetch takes no config.
++_TUNE = contextvars.ContextVar('directv_dai_tune', default=None)
++
++_process_patched = False
++_missing: list[str] = []
++
++
++def _resolve(module_name: str, path: str):
++    import importlib
++    obj = importlib.import_module(module_name)
++    for part in path.split('.'):
++        obj = getattr(obj, part)
++    return obj
++
++
++def missing() -> list[str]:
++    """TARGETS that don't exist in this upstream (empty = everything wired)."""
++    gone = []
++    for module_name, path in TARGETS:
++        try:
++            _resolve(module_name, path)
++        except Exception:
++            gone.append(f'{module_name}.{path}')
++    return gone
++
++
++def install(app) -> None:
++    """The one hook. Never raises: a failure here leaves upstream exactly as it was."""
++    global _process_patched
++    try:
++        _missing[:] = missing()
++        for name in _missing:
++            logger.error('[directv-dai] upstream moved %s; that part of DAI is not wired', name)
++        if not _process_patched:
++            _process_patched = True
++            for step in (_patch_scraper, _patch_device_auth, _patch_relay):
++                _try(step)
++        if 'directv_dai' not in app.extensions:
++            app.extensions['directv_dai'] = True
++            for step in (_patch_asset_view, _patch_save_view, _register_admin):
++                _try(step, app)
++    except Exception:
++        logger.exception('[directv-dai] install failed; DAI is off')
++
++
++def _try(step, *args) -> None:
++    try:
++        step(*args)
++    except Exception:
++        logger.exception('[directv-dai] could not wire %s', step.__name__)
++
++
++def _wraps(original, wrapper):
++    wrapper = functools.wraps(original)(wrapper)
++    wrapper.__directv_dai__ = True
++    return wrapper
++
++
++def _already(fn) -> bool:
++    return getattr(fn, '__directv_dai__', False) or getattr(getattr(fn, '__func__', None), '__directv_dai__', False)
++
++
++# ── Scraper (app/scrapers/directv.py) ───────────────────────────────────────────
++
++def _patch_scraper() -> None:
++    from . import directv, directv_dai
++    cls = directv.DirectvScraper
++
++    if not any(getattr(f, 'key', None) == 'use_dai' for f in cls.config_schema):
++        cls.config_schema = [*cls.config_schema, *directv_dai.CONFIG_FIELDS]
++
++    # resolve(): drop a cached URL from the other DAI setting (or, with DAI on, another
++    # device), then run upstream's resolve with this scraper as the tune context.
++    orig_resolve = cls.resolve
++    if not _already(orig_resolve):
++        def resolve(self, raw_url, *a, **kw):
++            try:
++                dai = directv_dai.enabled(self.config)
++                playback = self.cache.get('directv_playback') or {}
++                stale = [k for k, v in playback.items()
++                         if isinstance(v, dict) and not directv_dai.cached_url_usable(v, dai)]
++                if stale:
++                    self.cache['directv_playback'] = {k: v for k, v in playback.items() if k not in stale}
++            except Exception:
++                logger.exception('[directv-dai] cache check failed')
++            token = _TUNE.set((self.config, self.cache.get('dai_channel_names')))
++            try:
++                return orig_resolve(self, raw_url, *a, **kw)
++            finally:
++                _TUNE.reset(token)
++        cls.resolve = _wraps(orig_resolve, resolve)
++
++    # prepare_license_request() (a classmethod): its fallback fetch uses the same session type.
++    orig_license = cls.__dict__.get('prepare_license_request')
++    if isinstance(orig_license, classmethod) and not _already(orig_license):
++        fn = orig_license.__func__
++
++        def prepare_license_request(klass, challenge, config, *a, **kw):
++            token = _TUNE.set((config, None))
++            try:
++                return fn(klass, challenge, config, *a, **kw)
++            finally:
++                _TUNE.reset(token)
++        cls.prepare_license_request = classmethod(_wraps(fn, prepare_license_request))
++
++    # The lineup rows carry each channel's daiChannelName (the Yospace `net` flag).
++    orig_rows = cls._fetch_allchannels_rows
++    if not _already(orig_rows):
++        def _fetch_allchannels_rows(self, *a, **kw):
++            rows = orig_rows(self, *a, **kw)
++            try:
++                directv_dai.note_channels(self, rows)
++            except Exception:
++                logger.exception('[directv-dai] could not record channel names')
++            return rows
++        cls._fetch_allchannels_rows = _wraps(orig_rows, _fetch_allchannels_rows)
++
++    # The channel authorization: with DAI on, the Android TV app's channel/v2 request.
++    orig_fetch = directv._fetch_channel_playback
++    if not _already(orig_fetch):
++        sig = inspect.signature(orig_fetch)
++
++        def _fetch_channel_playback(*args, **kwargs):
++            tune = _TUNE.get()
++            flags = None
++            try:
++                if tune:
++                    bound = sig.bind(*args, **kwargs).arguments
++                    flags = directv_dai.request_flags(tune[0], tune[1], bound['ccid'])
++            except Exception:
++                logger.exception('[directv-dai] could not build the DAI request; playing without DAI')
++            if not flags:
++                return orig_fetch(*args, **kwargs)
++            try:
++                result = _fetch_dai_playback(directv, bound, flags)
++            except directv.DirectvAuthExpiredError:
++                raise
++            except Exception:
++                logger.exception('[directv-dai] DAI authorization failed')
++                result = None
++            if result:
++                return result
++            logger.warning('[directv-dai] no DAI stream for this tune; playing without DAI')
++            return orig_fetch(*args, **kwargs)
++        directv._fetch_channel_playback = _wraps(orig_fetch, _fetch_channel_playback)
++
++    # Every sign-in and refresh goes through apply_auth_result: add the DAI account values.
++    orig_apply = directv.apply_auth_result
++    if not _already(orig_apply):
++        def apply_auth_result(cfg, result, *a, **kw):
++            out = orig_apply(cfg, result, *a, **kw)
++            try:
++                directv_dai.store_login_result(cfg, result)
++            except Exception:
++                logger.exception('[directv-dai] could not store the DAI login values')
++            return out
++        directv.apply_auth_result = _wraps(orig_apply, apply_auth_result)
++
++
++def _fetch_dai_playback(directv, args: dict, flags: dict) -> dict | None:
++    """The Android TV app's channel authorization (channel/v2): its query, the device's
++    app User-Agent, no browser Origin/Referer. Returns upstream's playback dict shape
++    plus 'dai': True. Raises upstream's DirectvAuthExpiredError on an expired token,
++    so upstream's re-auth runs exactly as on its own request."""
++    from . import directv_dai, directv_dai_device
++    ccid = args['ccid']
++    session = requests.Session()
++    session.headers.update({
++        'Accept': '*/*',
++        'Authorization': f"Bearer {args.get('bearer_token') or ''}",
++        'User-Agent': directv_dai_device.player_user_agent() or getattr(directv, '_UA', 'okhttp'),
++    })
++    for c in args.get('cookies') or []:
++        try:
++            session.cookies.set(c['name'], c['value'], domain=c.get('domain') or None, path=c.get('path') or '/')
++        except Exception:
++            continue
++    params = {'ccid': ccid, 'proximity': 'O', 'reserveCTicket': 'true', 'daiEnabled': 'true',
++              'startOver': 'false', 'abrEnabled': 'true'}
++    if args.get('client_context'):
++        params['clientContext'] = args['client_context']
++    r = session.get(_CHANNEL_AUTH_V2, params=params, timeout=15)
++    if r.status_code != 200:
++        logger.warning('[directv-dai] channel/v2 HTTP %s for ccid=%s', r.status_code, ccid)
++        return None
++    data = r.json()
++    if not data.get('authorized'):
++        status = data.get('responseStatus') or {}
++        code = str(status.get('errorCode') or '').strip()
++        text = str(status.get('errorText') or status.get('message') or '').strip()
++        logger.warning('[directv-dai] channel/v2 not authorized for ccid=%s errorCode=%s', ccid, code or '?')
++        if code == '0015' or 'access token has expired' in text.lower():
++            raise directv.DirectvAuthExpiredError(text or 'access token has expired')
++        return None
++    url = directv_dai.pick_stream_url(data.get('playbackData') or {}, flags)
++    play_token = (data.get('dRights') or {}).get('playToken')
++    if not url or not play_token:
++        return None
++    return {
++        'fallback_url': url,
++        'play_token': play_token,
++        'license_content_id': directv._license_content_id_from_stream_url(url, ccid),
++        'cached_at': time.time(),
++        'dai': True,
++    }
++
++
++def _patch_device_auth() -> None:
++    from . import directv_device_auth as auth
++
++    # The grant's valuePairs carry the household id (hhid/u); upstream keeps only the
++    # activation token from them, so carry the ids through for store_login_result.
++    orig_result = auth._result
++    if not _already(orig_result):
++        def _result(token_data, *a, **kw):
++            out = orig_result(token_data, *a, **kw)
++            try:
++                vp = (token_data or {}).get('valuePairs')
++                vp = vp if isinstance(vp, dict) else {}
++                for src, dst in (('partnerProfileId', 'partner_profile_id'), ('profileId', 'profile_id')):
++                    if str(vp.get(src) or '').strip():
++                        out[dst] = str(vp[src]).strip()
++            except Exception:
++                logger.exception('[directv-dai] could not read the sign-in ids')
++            return out
++        auth._result = _wraps(orig_result, _result)
++
++    # A session signed in by the old overlay (auth_method 'dtv_android') is the same
++    # UNIFIED_Android_TV_02 grant: let upstream refresh it, which re-tags it 'device_code'.
++    orig_is = auth.is_device_session
++    if not _already(orig_is):
++        def is_device_session(config, *a, **kw):
++            cfg = config or {}
++            return bool(orig_is(config, *a, **kw)
++                        or (cfg.get('auth_method') == 'dtv_android' and cfg.get('refresh_token')))
++        auth.is_device_session = _wraps(orig_is, is_device_session)
++
++
++# ── Relay (app/routes/directv_proxy.py) ─────────────────────────────────────────
++
++class _RelayRequests:
++    """Stands in for directv_proxy's ``requests`` module: identical, except a GET to a
++    DirecTV relay host from a bridge device carries the DirecTV app's User-Agent for that
++    device (the Yospace master fetch and every playlist and segment)."""
++
++    def __init__(self, real, allowed):
++        self._real = real
++        self._allowed = allowed
++
++    def __getattr__(self, name):
++        return getattr(self._real, name)
++
++    def get(self, url, *args, **kwargs):
++        try:
++            from . import directv_dai_device
++            ua = directv_dai_device.player_headers()
++            if ua and self._allowed(urlsplit(str(url)).hostname or ''):
++                kwargs['headers'] = {**(kwargs.get('headers') or {}), **ua}
++        except Exception:
++            logger.exception('[directv-dai] could not add the app User-Agent')
++        return self._real.get(url, *args, **kwargs)
++
++
++def _patch_relay() -> None:
++    from ..routes import directv_proxy as proxy
++    from . import dtv_aac_ads, dtv_aac_gain
++
++    if 'yospace.com' not in proxy._DIRECTV_BROWSER_CDN_SUFFIXES:
++        proxy._DIRECTV_BROWSER_CDN_SUFFIXES = (*proxy._DIRECTV_BROWSER_CDN_SUFFIXES, 'yospace.com')
++
++    if not isinstance(proxy._requests, _RelayRequests):
++        proxy._requests = _RelayRequests(proxy._requests, proxy._directv_browser_cdn_allowed)
++
++    # Every DAI audio playlist: swap each inserted AC-3 ad for its full-range AAC twin.
++    orig_rewrite = proxy._rewrite_directv_browser_playlist
++    if not _already(orig_rewrite):
++        def _rewrite_directv_browser_playlist(text, *a, **kw):
++            try:
++                text = dtv_aac_ads.swap_muffled_ads(text)
++            except Exception:
++                logger.exception('[directv-dai] ad swap failed')
++            return orig_rewrite(text, *a, **kw)
++        proxy._rewrite_directv_browser_playlist = _wraps(orig_rewrite, _rewrite_directv_browser_playlist)
++
++    # An inserted-ad creative always takes the relay (so its loudness cut runs), whatever CDN.
++    orig_proxyable = proxy._directv_browser_proxyable_url
++    if not _already(orig_proxyable):
++        def _directv_browser_proxyable_url(raw_url, playlist_url, *a, **kw):
++            try:
++                resolved = urljoin(playlist_url, raw_url)
++                if urlsplit(resolved).scheme in ('http', 'https') and dtv_aac_gain.is_ad_segment(resolved):
++                    return proxy._directv_browser_asset_proxy_url(resolved)
++            except Exception:
++                logger.exception('[directv-dai] ad routing failed')
++            return orig_proxyable(raw_url, playlist_url, *a, **kw)
++        proxy._directv_browser_proxyable_url = _wraps(orig_proxyable, _directv_browser_proxyable_url)
++
++
++def _find_endpoint(app, func=None, rule: str | None = None, method: str = 'GET') -> str | None:
++    if rule:
++        for r in app.url_map.iter_rules():
++            if r.rule == rule and method in (r.methods or ()):
++                return r.endpoint
++    if func is not None:
++        for endpoint, view in app.view_functions.items():
++            if view is func or getattr(view, '__wrapped__', None) is func:
++                return endpoint
++    return None
++
++
++def _patch_asset_view(app) -> None:
++    """browser-asset: an inserted-ad AAC segment is fetched and cut here (−12 dB, lossless);
++    every other asset goes to upstream's view untouched."""
++    from flask import Response, abort, request
++    from ..routes import directv_proxy as proxy
++    from . import directv_dai_device, dtv_aac_gain
++
++    endpoint = _find_endpoint(app, func=proxy.directv_browser_asset)
++    if not endpoint:
++        logger.error('[directv-dai] browser-asset view not found; ad loudness cut is off')
++        return
++    orig_view = app.view_functions[endpoint]
++    if _already(orig_view):
++        return
++
++    def directv_browser_asset(*a, **kw):
++        raw_url = (request.args.get('url') or '').strip()
++        if not (raw_url and dtv_aac_gain.is_ad_segment(raw_url)
++                and urlsplit(raw_url).scheme == 'https' and not request.headers.get('Range')):
++            return orig_view(*a, **kw)
++        headers = {'User-Agent': getattr(proxy, '_BROWSER_UA', 'Mozilla/5.0'), **directv_dai_device.player_headers()}
++        try:
++            r = requests.get(raw_url, headers=headers, timeout=(5, 30))
++        except Exception as exc:
++            logger.warning('[directv-dai] ad segment fetch failed: %s', exc)
++            abort(502)
++        body = r.content
++        try:
++            if r.status_code == 200:
++                body = dtv_aac_gain.attenuate_ad_segment(body)
++        except Exception:
++            logger.exception('[directv-dai] ad loudness cut failed; sending the segment as is')
++        return Response(body, status=r.status_code,
++                        content_type=r.headers.get('Content-Type') or 'application/octet-stream',
++                        headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'})
++    app.view_functions[endpoint] = _wraps(orig_view, directv_browser_asset)
++
++
++def _patch_save_view(app) -> None:
++    """Saving the DirecTV settings: drop cached stream URLs when the DAI toggle flips, and
++    capture the advertising id of any bridge device that doesn't have one yet."""
++    from . import directv_dai
++
++    endpoint = _find_endpoint(app, rule=SAVE_CONFIG_RULE, method='POST')
++    if not endpoint:
++        logger.error('[directv-dai] save-config view not found; the toggle will not clear the cache')
++        return
++    orig_view = app.view_functions[endpoint]
++    if _already(orig_view):
++        return
++
++    def save_source_config(*a, **kw):
++        source_id = kw.get('source_id') or (a[0] if a else None)
++        old = None
++        try:
++            from ..models import Source
++            src = Source.query.get(source_id)
++            if src is not None and src.name == 'directv':
++                old = dict(src.config or {})
++        except Exception:
++            logger.exception('[directv-dai] could not read the old DirecTV settings')
++        resp = orig_view(*a, **kw)
++        if old is not None:
++            try:
++                from ..models import Source
++                src = Source.query.get(source_id)
++                status = getattr(resp, 'status_code', None) or (resp[1] if isinstance(resp, tuple) and len(resp) > 1 else 200)
++                if src is not None and int(status) < 400:
++                    directv_dai.clear_cache_if_toggled(src, old, dict(src.config or {}))
++            except Exception:
++                logger.exception('[directv-dai] post-save step failed')
++        return resp
++    app.view_functions[endpoint] = _wraps(orig_view, save_source_config)
++
++
++# ── Admin UI: our own blueprint + one script tag on the sources page ────────────
++
++def _register_admin(app) -> None:
++    from flask import Blueprint, Response, jsonify, request
++    from . import directv_dai
++
++    bp = Blueprint('directv_dai', __name__)
++
++    @bp.route('/directv-dai/admin.js')
++    def admin_js():
++        return Response(_ADMIN_JS, mimetype='application/javascript',
++                        headers={'Cache-Control': 'no-cache'})
++
++    @bp.route('/api/sources/<int:source_id>/directv-capture-adids', methods=['GET', 'POST'])
++    def directv_capture_adids(source_id):
++        """GET: how many bridge devices still need an advertising-id capture. POST: capture
++        them (a playing box is skipped, so a stream is never interrupted)."""
++        from ..models import Source
++        source = Source.query.get_or_404(source_id)
++        if source.name != 'directv':
++            return jsonify({'error': 'not a directv source'}), 400
++        if not directv_dai.enabled(dict(source.config or {})):
++            return jsonify({'enabled': False, 'ok': True, 'pending': 0})
++        if request.method == 'GET':
++            return jsonify({'enabled': True, 'pending': len(directv_dai.uncaptured_addresses())})
++        counts = directv_dai.capture_registered_devices(directv_dai.uncaptured_addresses())
++        return jsonify({'enabled': True, 'ok': True, **counts,
++                        'pending': len(directv_dai.uncaptured_addresses())})
++
++    app.register_blueprint(bp)
++
++    tag = b'<script src="/directv-dai/admin.js"></script>'
++
++    @app.after_request
++    def _inject_admin_script(resp):
++        try:
++            if (resp.status_code == 200 and resp.mimetype == 'text/html'
++                    and not resp.direct_passthrough and not resp.is_streamed):
++                body = resp.get_data()
++                if b'function renderDirectvConfig' in body and tag not in body:
++                    i = body.rfind(b'</body>')
++                    resp.set_data(body[:i] + tag + body[i:] if i >= 0 else body + tag)
++        except Exception:
++            logger.exception('[directv-dai] could not add the admin script')
++        return resp
++
++
++_ADMIN_JS = r"""
++// DirecTV DAI: adds the DAI toggle and the "Capture advertising IDs" button to the
++// DirecTV source settings by wrapping upstream's renderDirectvConfig (no template edit).
++(function () {
++  const orig = window.renderDirectvConfig;
++  if (typeof orig !== 'function') { console.warn('[directv-dai] renderDirectvConfig not found'); return; }
++  const esc = s => (typeof escapeHtml === 'function') ? escapeHtml(String(s))
++    : String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
++
++  function daiHtml(sourceId, schema, values) {
++    const field = (schema || []).find(f => f.key === 'use_dai') || {};
++    const checked = ['1', 'true', 'yes', 'on'].includes(String((values || {}).use_dai ?? field.default ?? '').trim().toLowerCase());
++    const label = field.label || 'Use DirecTV ad insertion (DAI)';
++    return `
++      <div class="fields-grid" style="margin-top:0.9rem" id="directv-dai-${sourceId}">
++        <div class="field field-full">
++          <div class="config-toggle-field">
++            <div class="config-toggle-text">
++              <label for="cfg-${sourceId}-use_dai">${esc(label)}</label>
++              <div class="help">${esc(field.help_text || '')}</div>
++            </div>
++            <label class="toggle" title="${esc(label)}">
++              <input type="checkbox" id="cfg-${sourceId}-use_dai" data-key="use_dai" data-secret="false"${checked ? ' checked' : ''}>
++              <span class="slider"></span>
++            </label>
++          </div>
++        </div>
++        <div class="field field-full">
++          <button class="btn btn-run" type="button" id="directv-adid-btn-${sourceId}" style="display:none"
++                  onclick="directvCaptureAdids(${sourceId})">Capture advertising IDs</button>
++          <span id="directv-adid-status-${sourceId}" style="color:var(--text-muted)"></span>
++        </div>
++      </div>`;
++  }
++
++  window.renderDirectvConfig = function (sourceId, schema, values) {
++    let html = orig.apply(this, arguments);
++    try {
++      const extra = daiHtml(sourceId, schema, values);
++      const at = html.lastIndexOf('<div class="config-actions">');
++      html = at >= 0 ? html.slice(0, at) + extra + html.slice(at) : html + extra;
++      setTimeout(() => directvLoadAdidStatus(sourceId), 0);
++    } catch (e) { console.warn('[directv-dai]', e); }
++    return html;
++  };
++
++  window.directvLoadAdidStatus = async function (sourceId) {
++    const btn = document.getElementById(`directv-adid-btn-${sourceId}`);
++    if (!btn) return;
++    try {
++      const r = await fetch(`/api/sources/${sourceId}/directv-capture-adids`);
++      const d = await r.json().catch(() => ({}));
++      if (d.enabled && d.pending > 0) {
++        btn.textContent = `Capture advertising IDs (${d.pending} new device${d.pending > 1 ? 's' : ''})`;
++        btn.style.display = '';
++      } else {
++        btn.style.display = 'none';
++      }
++    } catch (e) { btn.style.display = 'none'; }
++  };
++
++  window.directvCaptureAdids = async function (sourceId) {
++    const btn = document.getElementById(`directv-adid-btn-${sourceId}`);
++    const statusEl = document.getElementById(`directv-adid-status-${sourceId}`);
++    if (btn) btn.disabled = true;
++    if (statusEl) statusEl.textContent = 'Capturing… (a Google TV/Android TV device briefly shows its Ads screen; a playing device is skipped)';
++    try {
++      const r = await fetch(`/api/sources/${sourceId}/directv-capture-adids`, {method: 'POST'});
++      const d = await r.json().catch(() => ({}));
++      if (d.enabled === false) { directvLoadAdidStatus(sourceId); return; }
++      if (!r.ok || !d.ok) {
++        if (statusEl) statusEl.innerHTML = `<span style="color:var(--danger)">${esc((d && d.error) || 'Capture failed')}</span>`;
++        return;
++      }
++      const parts = [`Captured ${d.captured} device${d.captured === 1 ? '' : 's'}`];
++      if (d.playing) parts.push(`${d.playing} skipped — ${d.playing === 1 ? 'a device is' : 'devices are'} playing (re-run when idle)`);
++      if (d.unreachable) parts.push(`${d.unreachable} couldn't be reached (check ${d.unreachable === 1 ? "it's" : "they're"} on and connected)`);
++      if (d.none) parts.push(`${d.none} with no advertising ID`);
++      if (statusEl) {
++        const ok = !d.playing && !d.unreachable && !d.none;
++        statusEl.innerHTML = ok
++          ? '<span style="color:var(--success-soft)">&#10003; ' + esc(parts.join('; ')) + '.</span>'
++          : esc(parts.join('; ')) + '.';
++      }
++    } catch (e) {
++      if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">Network error</span>';
++    } finally {
++      if (btn) btn.disabled = false;
++      directvLoadAdidStatus(sourceId);
++    }
++  };
++})();
++"""
+diff --git a/app/scrapers/dtv_aac_ads.py b/app/scrapers/dtv_aac_ads.py
+new file mode 100644
+index 0000000..8d4dbac
+--- /dev/null
++++ b/app/scrapers/dtv_aac_ads.py
+@@ -0,0 +1,49 @@
++"""DirecTV DAI: play the full-range HE-AAC rendition of each inserted ad.
++
++Many of DirecTV's inserted-ad creatives are band-limited (~7 kHz, "AM radio")
++in their AC-3 (Dolby Digital) encode while the *same* creative's HE-AAC encode
++is full range. DirecTV ships the muffle itself — the Osprey and upstream play
++the same AC-3 files — so no request flag, header or identity changes which file
++is served. The only server-side lever is which *rendition* of the already-chosen
++ad we hand the player.
++
++A Yospace server-side ad-insertion session names each inserted creative
++``u-<id>-c-<bitrate>-<n>-<seg|i>.mp4`` on the ad CDN
++(``yospace01-directv.akamaized.net/dtv-prd/...``), where ``c`` is the AC-3
++rendition and ``-i`` is that creative's own fMP4 init. The matching full-range
++twin lives at the same path with ``a-96`` (HE-AAC 96 kbps) in place of
++``c-<bitrate>``, and Yospace emits its own ``#EXT-X-MAP:URI`` for the ad init —
++so swapping is purely a URI rewrite in the AC-3 audio media playlist: every ad
++segment line and the ad's own EXT-X-MAP flip from the ``c`` twin to the ``a``
++twin. Live programming segments live on ``dfwlive-*`` hosts with different
++names and never match, so channel audio is untouched. The inserted ads stay
++clear — Yospace's ``EXT-X-KEY:METHOD=NONE`` is left in place — so the swapped
++AAC segments play as clear samples.
++
++This is consistent with the overlay's fairness rules: it is the same creative,
++DirecTV's own rendition of it, delivered and counted the same way — nothing is
++skipped, suppressed or fabricated. The one trade-off is that swapped ads play
++in stereo (the HE-AAC twin is 2.0); every measured AAC twin was full range, so
++all inserted AC-3 ads are swapped rather than decoding each to detect the
++muffle in the request path.
++"""
++from __future__ import annotations
++
++import re
++
++# An inserted Yospace ad segment or its init, in the AC-3 ('c') rendition.
++# e.g. u-6600-c-384-1-0.mp4 (segment) / u-6600-c-384-1-i.mp4 (init).
++_AD_AC3_FILE = re.compile(r'u-\d+-c-\d+-\d+-(?:\d+|i)\.mp4')
++# The AC-3 rendition tag inside such a name; the full-range HE-AAC twin is a-96.
++_AC3_RENDITION = re.compile(r'-c-\d+-')
++
++
++def swap_muffled_ads(playlist: str) -> str:
++    """Rewrite every inserted AC-3 ad URI in a DirecTV DAI media playlist — each
++    ad segment and the ad's own ``#EXT-X-MAP`` init — to the creative's
++    full-range HE-AAC twin. Returns the playlist unchanged when it contains no
++    inserted AC-3 ad files (non-DAI, content-only, video, or the AAC playlist),
++    so it is a safe no-op on every other stream."""
++    if not playlist or not _AD_AC3_FILE.search(playlist):
++        return playlist
++    return _AD_AC3_FILE.sub(lambda m: _AC3_RENDITION.sub('-a-96-', m.group(0)), playlist)
+diff --git a/app/scrapers/dtv_aac_gain.py b/app/scrapers/dtv_aac_gain.py
+new file mode 100644
+index 0000000..ce2e9a2
+--- /dev/null
++++ b/app/scrapers/dtv_aac_gain.py
+@@ -0,0 +1,663 @@
++"""DirecTV DAI: attenuate inserted AAC ads a fixed amount, losslessly.
++
++The inserted-ad AAC twins (see dtv_aac_ads) play a few dB hotter than the
++stock 5.1 AC-3 programming, so breaks blast. This drops every inserted
++ad's loudness by editing the HE-AAC ``global_gain`` field of every channel of
++every frame -- the same lossless lever mp3gain/aacgain use -- implemented here
++from the ISO/IEC 14496-3 bitstream syntax. 8 steps x 1.5 dB = -12 dB (calibrated to
++the bridge's actual feed -- see _DEFAULT_STEPS); no re-encoding, no dependencies.
++
++A stereo ad is a channel_pair_element whose second channel's ``global_gain``
++sits *after* the first channel's Huffman-coded spectral data, so each frame is
++parsed in full to locate it. Safety is absolute: a frame is edited only if the
++whole raw_data_block parses cleanly to END and byte-aligns at the frame
++boundary under a detected sample rate; on any mismatch or error the original
++bytes are returned unchanged, so a mis-parse can never emit a corrupt segment.
++"""
++from __future__ import annotations
++
++import logging
++import re
++from urllib.parse import urlsplit
++
++logger = logging.getLogger(__name__)
++
++# AAC Huffman + scalefactor-band tables, ISO/IEC 14496-3. Generated; do not hand-edit.
++_SCF_LENS = [
++    18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 18, 19, 18,
++    17, 17, 16, 17, 16, 16, 16, 16, 15, 15, 14, 14, 14, 14, 14, 14, 13, 13, 12, 12, 12, 11,
++    12, 11, 10, 10, 10, 9, 9, 8, 8, 8, 7, 6, 6, 5, 4, 3, 1, 4, 4, 5, 6, 6, 7, 7, 8, 8, 9, 9,
++    10, 10, 10, 11, 11, 11, 11, 12, 12, 13, 13, 13, 14, 14, 16, 15, 16, 15, 18, 19, 19, 19,
++    19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
++    19, 19, 19, 19, 19
++]
++_SCF_CODES = [
++    262120, 262118, 262119, 262117, 524277, 524273, 524269, 524278, 524270, 524271, 524272,
++    524284, 524285, 524287, 524286, 524279, 524280, 524283, 524281, 262116, 524282, 262115,
++    131055, 131056, 65525, 131054, 65522, 65523, 65524, 65521, 32758, 32759, 16377, 16373,
++    16375, 16371, 16374, 16370, 8183, 8181, 4089, 4087, 4086, 2041, 4084, 2040, 1017, 1015,
++    1013, 504, 503, 250, 248, 246, 121, 58, 56, 26, 11, 4, 0, 10, 12, 27, 57, 59, 120, 122,
++    247, 249, 502, 505, 1012, 1014, 1016, 2037, 2036, 2038, 2039, 4085, 4088, 8180, 8182,
++    8184, 16376, 16372, 65520, 32756, 65526, 32757, 262114, 524249, 524250, 524251, 524252,
++    524253, 524254, 524248, 524242, 524243, 524244, 524245, 524246, 524274, 524255, 524263,
++    524264, 524265, 524266, 524267, 524262, 524256, 524257, 524258, 524259, 524260, 524261,
++    524247, 524268, 524276, 524275
++]
++_SPEC_LENS = [
++    [11, 9, 11, 10, 7, 10, 11, 9, 11, 10, 7, 10, 7, 5, 7, 9, 7, 10, 11, 9, 11, 9, 7, 9, 11, 9, 11, 9, 7, 9, 7, 5, 7, 9, 7, 9, 7, 5, 7, 5, 1, 5, 7, 5, 7, 9, 7, 9, 7, 5, 7, 9, 7, 9, 11, 9, 11, 9, 7, 9, 11, 9, 11, 10, 7, 9, 7, 5, 7, 9, 7, 10, 11, 9, 11, 10, 7, 9, 11, 9, 11],
++    [9, 7, 9, 8, 6, 8, 9, 8, 9, 8, 6, 7, 6, 5, 6, 7, 6, 8, 9, 7, 8, 8, 6, 8, 9, 7, 9, 8, 6, 7, 6, 5, 6, 7, 6, 8, 6, 5, 6, 5, 3, 5, 6, 5, 6, 8, 6, 7, 6, 5, 6, 8, 6, 8, 9, 7, 9, 8, 6, 8, 8, 7, 9, 8, 6, 7, 6, 4, 6, 8, 6, 7, 9, 7, 9, 7, 6, 8, 9, 7, 9],
++    [1, 4, 8, 4, 5, 8, 9, 9, 10, 4, 6, 9, 6, 6, 9, 9, 9, 10, 9, 10, 13, 9, 9, 11, 11, 10, 12, 4, 6, 10, 6, 7, 10, 10, 10, 12, 5, 7, 11, 6, 7, 10, 9, 9, 11, 9, 10, 13, 8, 9, 12, 10, 11, 12, 8, 10, 15, 9, 11, 15, 13, 14, 16, 8, 10, 14, 9, 10, 14, 12, 12, 15, 11, 12, 16, 10, 11, 15, 12, 12, 15],
++    [4, 5, 8, 5, 4, 8, 9, 8, 11, 5, 5, 8, 5, 4, 8, 8, 7, 10, 9, 8, 11, 8, 8, 10, 11, 10, 11, 4, 5, 8, 4, 4, 8, 8, 8, 10, 4, 4, 8, 4, 4, 7, 8, 7, 9, 8, 8, 10, 7, 7, 9, 10, 9, 10, 8, 8, 11, 8, 7, 10, 11, 10, 12, 8, 7, 10, 7, 7, 9, 10, 9, 11, 11, 10, 12, 10, 9, 11, 11, 10, 11],
++    [13, 12, 11, 11, 10, 11, 11, 12, 13, 12, 11, 10, 9, 8, 9, 10, 11, 12, 12, 10, 9, 8, 7, 8, 9, 10, 11, 11, 9, 8, 5, 4, 5, 8, 9, 11, 10, 8, 7, 4, 1, 4, 7, 8, 11, 11, 9, 8, 5, 4, 5, 8, 9, 11, 11, 10, 9, 8, 7, 8, 9, 10, 11, 12, 11, 10, 9, 8, 9, 10, 11, 12, 13, 12, 12, 11, 10, 10, 11, 12, 13],
++    [11, 10, 9, 9, 9, 9, 9, 10, 11, 10, 9, 8, 7, 7, 7, 8, 9, 10, 9, 8, 6, 6, 6, 6, 6, 8, 9, 9, 7, 6, 4, 4, 4, 6, 7, 9, 9, 7, 6, 4, 4, 4, 6, 7, 9, 9, 7, 6, 4, 4, 4, 6, 7, 9, 9, 8, 6, 6, 6, 6, 6, 8, 9, 10, 9, 8, 7, 7, 7, 7, 8, 10, 11, 10, 9, 9, 9, 9, 9, 10, 11],
++    [1, 3, 6, 7, 8, 9, 10, 11, 3, 4, 6, 7, 8, 8, 9, 9, 6, 6, 7, 8, 8, 9, 9, 10, 7, 7, 8, 8, 9, 9, 10, 10, 8, 8, 9, 9, 10, 10, 10, 11, 9, 8, 9, 9, 10, 10, 11, 11, 10, 9, 9, 10, 10, 11, 12, 12, 11, 10, 10, 10, 11, 11, 12, 12],
++    [5, 4, 5, 6, 7, 8, 9, 10, 4, 3, 4, 5, 6, 7, 7, 8, 5, 4, 4, 5, 6, 7, 7, 8, 6, 5, 5, 6, 6, 7, 8, 8, 7, 6, 6, 6, 7, 7, 8, 9, 8, 7, 6, 7, 7, 8, 8, 10, 9, 7, 7, 8, 8, 8, 9, 9, 10, 8, 8, 8, 9, 9, 9, 10],
++    [1, 3, 6, 8, 9, 10, 10, 11, 11, 12, 12, 13, 13, 3, 4, 6, 7, 8, 8, 9, 10, 10, 10, 11, 12, 12, 6, 6, 7, 8, 8, 9, 10, 10, 10, 11, 12, 12, 12, 8, 7, 8, 9, 9, 10, 10, 11, 11, 11, 12, 12, 13, 9, 8, 9, 9, 10, 10, 11, 11, 11, 12, 12, 12, 13, 10, 9, 9, 10, 11, 11, 11, 12, 11, 12, 12, 13, 13, 11, 9, 10, 11, 11, 11, 12, 12, 12, 12, 13, 13, 13, 11, 10, 10, 11, 11, 12, 12, 13, 13, 13, 13, 13, 13, 11, 10, 10, 11, 11, 11, 12, 12, 13, 13, 14, 13, 14, 11, 10, 11, 11, 12, 12, 12, 12, 13, 13, 14, 14, 14, 12, 11, 11, 12, 12, 12, 13, 13, 13, 14, 14, 14, 15, 12, 11, 12, 12, 12, 13, 13, 13, 13, 14, 14, 15, 15, 13, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15],
++    [6, 5, 6, 6, 7, 8, 9, 10, 10, 10, 11, 11, 12, 5, 4, 4, 5, 6, 7, 7, 8, 8, 9, 10, 10, 11, 6, 4, 5, 5, 6, 6, 7, 8, 8, 9, 9, 10, 10, 6, 5, 5, 5, 6, 7, 7, 8, 8, 9, 9, 10, 10, 7, 6, 6, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 8, 7, 6, 7, 7, 7, 8, 8, 8, 9, 10, 10, 11, 9, 7, 7, 7, 7, 8, 8, 9, 9, 9, 10, 10, 11, 9, 8, 8, 8, 8, 8, 9, 9, 9, 10, 10, 11, 11, 9, 8, 8, 8, 8, 8, 9, 9, 10, 10, 10, 11, 11, 10, 9, 9, 9, 9, 9, 9, 10, 10, 10, 11, 11, 12, 10, 9, 9, 9, 9, 10, 10, 10, 10, 11, 11, 11, 12, 11, 10, 9, 10, 10, 10, 10, 10, 11, 11, 11, 11, 12, 11, 10, 10, 10, 10, 10, 10, 11, 11, 12, 12, 12, 12],
++    [4, 5, 6, 7, 8, 8, 9, 10, 10, 10, 11, 11, 12, 11, 12, 12, 10, 5, 4, 5, 6, 7, 7, 8, 8, 9, 9, 9, 10, 10, 10, 10, 11, 8, 6, 5, 5, 6, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 10, 8, 7, 6, 6, 6, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 10, 8, 8, 7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9, 10, 10, 10, 10, 8, 8, 7, 7, 7, 7, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 8, 9, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 10, 10, 10, 10, 10, 8, 9, 8, 8, 8, 8, 8, 8, 9, 9, 9, 10, 10, 10, 10, 10, 10, 8, 10, 9, 8, 8, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 11, 8, 10, 9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 11, 11, 8, 11, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 11, 10, 11, 11, 8, 11, 10, 9, 9, 10, 9, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 8, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 9, 11, 10, 9, 9, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 9, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 9, 12, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 12, 12, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 5],
++]
++_SPEC_CODES = [
++    [2040, 497, 2045, 1013, 104, 1008, 2039, 492, 2037, 1009, 114, 1012, 116, 17, 118, 491, 108, 1014, 2044, 481, 2033, 496, 97, 502, 2034, 490, 2043, 498, 105, 493, 119, 23, 111, 486, 100, 485, 103, 21, 98, 18, 0, 20, 101, 22, 109, 489, 99, 484, 107, 19, 113, 483, 112, 499, 2046, 487, 2035, 495, 96, 494, 2032, 482, 2042, 1011, 106, 488, 117, 16, 115, 500, 110, 1015, 2038, 480, 2041, 1010, 102, 501, 2047, 503, 2036],
++    [499, 111, 509, 235, 35, 234, 503, 232, 506, 242, 45, 112, 32, 6, 43, 110, 40, 233, 505, 102, 248, 231, 27, 241, 500, 107, 501, 236, 42, 108, 44, 10, 39, 103, 26, 245, 36, 8, 31, 9, 0, 7, 29, 11, 48, 239, 28, 100, 30, 12, 41, 243, 47, 240, 508, 113, 498, 244, 33, 230, 247, 104, 504, 238, 34, 101, 49, 2, 38, 237, 37, 106, 507, 114, 510, 105, 46, 246, 511, 109, 502],
++    [0, 9, 239, 11, 25, 240, 491, 486, 1010, 10, 53, 495, 52, 55, 489, 493, 487, 1011, 494, 1005, 8186, 492, 498, 2041, 2040, 1016, 4088, 8, 56, 1014, 54, 117, 1009, 1003, 1004, 4084, 24, 118, 2036, 57, 116, 1007, 499, 500, 2038, 488, 1002, 8188, 242, 497, 4091, 1013, 2035, 4092, 238, 1015, 32766, 496, 2037, 32765, 8187, 16378, 65535, 241, 1008, 16380, 490, 1006, 16379, 4086, 4090, 32764, 2034, 4085, 65534, 1012, 2039, 32763, 4087, 4089, 32762],
++    [7, 22, 246, 24, 8, 239, 495, 243, 2040, 25, 23, 237, 21, 1, 226, 240, 112, 1008, 494, 241, 2042, 238, 228, 1010, 2038, 1007, 2045, 5, 20, 242, 9, 4, 229, 244, 232, 1012, 6, 2, 231, 3, 0, 107, 227, 105, 499, 235, 230, 1014, 110, 106, 500, 1004, 496, 1017, 245, 236, 2043, 234, 111, 1015, 2041, 1011, 4095, 233, 109, 1016, 108, 104, 501, 1006, 498, 2036, 2039, 1009, 4094, 1005, 497, 2037, 2046, 1013, 2044],
++    [8191, 4087, 2036, 2024, 1009, 2030, 2041, 4088, 8189, 4093, 2033, 1000, 488, 240, 492, 1006, 2034, 4090, 4084, 1007, 498, 232, 112, 236, 496, 1002, 2035, 2027, 491, 234, 26, 8, 25, 238, 495, 2029, 1008, 242, 115, 11, 0, 10, 113, 243, 2025, 2031, 494, 239, 24, 9, 27, 235, 489, 2028, 2038, 1003, 499, 237, 114, 233, 497, 1005, 2039, 4086, 2032, 1001, 493, 241, 490, 1004, 2040, 4089, 8188, 4092, 4085, 2026, 1011, 1010, 2037, 4091, 8190],
++    [2046, 1021, 497, 491, 500, 490, 496, 1020, 2045, 1014, 485, 234, 108, 113, 104, 240, 486, 1015, 499, 239, 50, 39, 40, 38, 49, 235, 503, 488, 111, 46, 8, 4, 6, 41, 107, 494, 495, 114, 45, 2, 0, 3, 47, 115, 506, 487, 110, 43, 7, 1, 5, 44, 109, 492, 505, 238, 48, 36, 42, 37, 51, 236, 498, 1016, 484, 237, 106, 112, 105, 116, 241, 1018, 2047, 1017, 502, 493, 504, 489, 501, 1019, 2044],
++    [0, 5, 55, 116, 242, 491, 1005, 2039, 4, 12, 53, 113, 236, 238, 494, 501, 54, 52, 114, 234, 241, 489, 499, 1013, 115, 112, 235, 240, 497, 496, 1004, 1018, 243, 237, 488, 495, 1007, 1009, 1017, 2043, 493, 239, 490, 498, 1011, 1016, 2041, 2044, 1006, 492, 500, 1012, 1015, 2040, 4093, 4094, 2038, 1008, 1010, 1014, 2042, 2045, 4092, 4095],
++    [14, 5, 16, 48, 111, 241, 506, 1022, 3, 0, 4, 18, 44, 106, 117, 248, 15, 2, 6, 20, 46, 105, 114, 245, 47, 17, 19, 42, 50, 108, 236, 250, 113, 43, 45, 49, 109, 112, 242, 505, 239, 104, 51, 107, 110, 238, 249, 1020, 504, 116, 115, 237, 240, 246, 502, 509, 1021, 243, 244, 247, 503, 507, 508, 1023],
++    [0, 5, 55, 231, 478, 974, 985, 1992, 1997, 4040, 4061, 8164, 8172, 4, 12, 53, 114, 234, 237, 482, 977, 979, 992, 2008, 4047, 4053, 54, 52, 113, 232, 236, 481, 975, 989, 987, 2000, 4039, 4052, 4068, 230, 112, 233, 477, 483, 978, 988, 1996, 1994, 2014, 4056, 4074, 8155, 479, 235, 476, 486, 981, 990, 1995, 2013, 2012, 4045, 4066, 4071, 8161, 976, 480, 484, 982, 1989, 2001, 2011, 4050, 2016, 4057, 4075, 8163, 8169, 1988, 485, 983, 1990, 1999, 2010, 4043, 4058, 4067, 4073, 8166, 8179, 8183, 2003, 984, 993, 2004, 2009, 4051, 4062, 8157, 8153, 8162, 8170, 8177, 8182, 2002, 980, 986, 1991, 2007, 2018, 4046, 4059, 8152, 8174, 16368, 8180, 16370, 2017, 991, 1993, 2006, 4042, 4048, 4069, 4070, 8171, 8175, 16371, 16372, 16373, 4064, 1998, 2005, 4038, 4049, 4065, 8160, 8168, 8176, 16369, 16376, 16374, 32764, 4072, 2015, 4041, 4055, 4060, 8156, 8159, 8173, 8181, 16377, 16379, 32765, 32766, 8167, 4044, 4054, 4063, 8158, 8154, 8165, 8178, 16378, 16375, 16380, 16381, 32767],
++    [34, 8, 29, 38, 95, 211, 463, 976, 983, 1005, 2032, 2038, 4093, 7, 0, 1, 9, 32, 84, 96, 213, 220, 468, 973, 990, 2023, 28, 2, 6, 12, 30, 40, 91, 205, 217, 462, 476, 985, 1009, 37, 11, 10, 13, 36, 87, 97, 204, 221, 460, 478, 979, 999, 93, 33, 31, 35, 39, 89, 100, 216, 223, 466, 482, 989, 1006, 209, 85, 41, 86, 88, 98, 206, 224, 226, 474, 980, 995, 2027, 457, 94, 90, 92, 99, 202, 218, 455, 458, 480, 987, 1000, 2028, 483, 210, 203, 208, 215, 219, 454, 469, 472, 970, 986, 2026, 2033, 481, 212, 207, 214, 222, 225, 464, 470, 977, 981, 1010, 2030, 2043, 1001, 461, 456, 459, 465, 471, 479, 975, 992, 1007, 2022, 2040, 4090, 1003, 477, 467, 473, 475, 978, 972, 988, 1002, 2029, 2035, 2041, 4089, 2034, 974, 484, 971, 984, 982, 994, 997, 2024, 2036, 2037, 2039, 4091, 2042, 1004, 991, 993, 996, 998, 1008, 2025, 2031, 4088, 4094, 4092, 4095],
++    [0, 6, 25, 61, 156, 198, 423, 912, 962, 991, 2022, 2035, 4091, 2028, 4090, 4094, 910, 5, 1, 8, 20, 55, 66, 146, 175, 401, 421, 437, 926, 960, 930, 973, 2006, 174, 23, 7, 9, 24, 57, 64, 142, 163, 184, 409, 428, 449, 945, 918, 958, 970, 157, 60, 21, 22, 26, 59, 68, 145, 165, 190, 406, 430, 441, 929, 913, 933, 981, 148, 154, 54, 56, 58, 65, 140, 155, 176, 195, 414, 427, 444, 927, 911, 937, 975, 147, 191, 62, 63, 67, 69, 158, 167, 185, 404, 418, 442, 451, 934, 935, 955, 980, 159, 416, 143, 141, 144, 152, 166, 182, 196, 415, 431, 447, 921, 959, 948, 969, 999, 168, 438, 171, 164, 170, 178, 194, 197, 408, 420, 440, 908, 932, 964, 966, 989, 1000, 173, 943, 402, 189, 188, 398, 407, 410, 419, 433, 909, 920, 951, 979, 977, 987, 2013, 180, 990, 425, 411, 412, 417, 426, 429, 435, 907, 946, 952, 974, 993, 992, 2002, 2021, 183, 2019, 443, 424, 422, 432, 434, 439, 923, 922, 954, 949, 982, 2007, 996, 2008, 2026, 186, 2024, 928, 445, 436, 906, 452, 914, 938, 944, 956, 983, 2004, 2012, 2011, 2005, 2032, 193, 2043, 968, 931, 917, 925, 940, 942, 965, 984, 994, 998, 2020, 2023, 2016, 2025, 2039, 400, 2034, 915, 446, 448, 916, 919, 941, 963, 961, 978, 2010, 2009, 2015, 2027, 2036, 2042, 405, 2040, 957, 924, 939, 936, 947, 953, 976, 995, 997, 2018, 2014, 2029, 2033, 2041, 2044, 403, 4093, 988, 950, 967, 972, 971, 985, 986, 2003, 2017, 2030, 2031, 2037, 2038, 4092, 4095, 413, 450, 181, 161, 150, 151, 149, 153, 160, 162, 172, 169, 177, 179, 187, 192, 399, 4],
++]
++_QUADS = [(0,0,0,0), (0,0,0,1), (0,0,0,2), (0,0,1,0), (0,0,1,1), (0,0,1,2), (0,0,2,0), (0,0,2,1), (0,0,2,2), (0,1,0,0), (0,1,0,1), (0,1,0,2), (0,1,1,0), (0,1,1,1), (0,1,1,2), (0,1,2,0), (0,1,2,1), (0,1,2,2), (0,2,0,0), (0,2,0,1), (0,2,0,2), (0,2,1,0), (0,2,1,1), (0,2,1,2), (0,2,2,0), (0,2,2,1), (0,2,2,2), (1,0,0,0), (1,0,0,1), (1,0,0,2), (1,0,1,0), (1,0,1,1), (1,0,1,2), (1,0,2,0), (1,0,2,1), (1,0,2,2), (1,1,0,0), (1,1,0,1), (1,1,0,2), (1,1,1,0), (1,1,1,1), (1,1,1,2), (1,1,2,0), (1,1,2,1), (1,1,2,2), (1,2,0,0), (1,2,0,1), (1,2,0,2), (1,2,1,0), (1,2,1,1), (1,2,1,2), (1,2,2,0), (1,2,2,1), (1,2,2,2), (2,0,0,0), (2,0,0,1), (2,0,0,2), (2,0,1,0), (2,0,1,1), (2,0,1,2), (2,0,2,0), (2,0,2,1), (2,0,2,2), (2,1,0,0), (2,1,0,1), (2,1,0,2), (2,1,1,0), (2,1,1,1), (2,1,1,2), (2,1,2,0), (2,1,2,1), (2,1,2,2), (2,2,0,0), (2,2,0,1), (2,2,0,2), (2,2,1,0), (2,2,1,1), (2,2,1,2), (2,2,2,0), (2,2,2,1), (2,2,2,2)]
++_SWB = {
++    '96L': [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 156, 172, 188, 212, 240, 276, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024],
++    '64L': [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 64, 72, 80, 88, 100, 112, 124, 140, 156, 172, 192, 216, 240, 268, 304, 344, 384, 424, 464, 504, 544, 584, 624, 664, 704, 744, 784, 824, 864, 904, 944, 984, 1024],
++    '64S': [0, 4, 8, 12, 16, 20, 24, 32, 40, 48, 64, 92, 128],
++    '48L': [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 160, 176, 196, 216, 240, 264, 292, 320, 352, 384, 416, 448, 480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800, 832, 864, 896, 928, 1024],
++    '48S': [0, 4, 8, 12, 16, 20, 28, 36, 44, 56, 68, 80, 96, 112, 128],
++    '32L': [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 160, 176, 196, 216, 240, 264, 292, 320, 352, 384, 416, 448, 480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800, 832, 864, 896, 928, 960, 992, 1024],
++    '24L': [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 52, 60, 68, 76, 84, 92, 100, 108, 116, 124, 136, 148, 160, 172, 188, 204, 220, 240, 260, 284, 308, 336, 364, 396, 432, 468, 508, 552, 600, 652, 704, 768, 832, 896, 960, 1024],
++    '24S': [0, 4, 8, 12, 16, 20, 24, 28, 36, 44, 52, 64, 76, 92, 108, 128],
++    '16L': [0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 100, 112, 124, 136, 148, 160, 172, 184, 196, 212, 228, 244, 260, 280, 300, 320, 344, 368, 396, 424, 456, 492, 532, 572, 616, 664, 716, 772, 832, 896, 960, 1024],
++    '16S': [0, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 60, 72, 88, 108, 128],
++    '8L': [0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120, 132, 144, 156, 172, 188, 204, 220, 236, 252, 268, 288, 308, 328, 348, 372, 396, 420, 448, 476, 508, 544, 580, 620, 664, 712, 764, 820, 880, 944, 1024],
++    '8S': [0, 4, 8, 12, 16, 20, 24, 28, 36, 44, 52, 60, 72, 88, 108, 128],
++}
++
++
++# Spectrum codebook metadata: (dimension, is_unsigned, mod_value, max_len).
++_CB_META = [
++    (4, 0, 3, 11), (4, 0, 3, 9), (4, 1, 3, 16), (4, 1, 3, 12),
++    (2, 0, 9, 13), (2, 0, 9, 11), (2, 1, 8, 12), (2, 1, 8, 10),
++    (2, 1, 13, 15), (2, 1, 13, 12), (2, 1, 17, 12),
++]
++_SCF_MAX_LEN = 19
++
++ZERO_HCB = 0
++NOISE_HCB = 13
++INTENSITY_HCB2 = 14
++INTENSITY_HCB = 15
++ESC_HCB = 11
++EIGHT_SHORT = 2
++
++ID_SCE, ID_CPE, ID_CCE, ID_LFE, ID_DSE, ID_PCE, ID_FIL, ID_END = range(8)
++
++# Any inserted-ad AAC media segment (Yospace creative u-<id>-a-<rate>-...<seg>.mp4) on ANY
++# CDN host, with any segment numbering (e.g. u-6600-a-96-1-1.mp4 or u-6600-a-128-1-1-2.mp4).
++# Deliberately broad: the only thing it must NOT match is the -i init (no audio frames). It is
++# safe to over-match because attenuate_ad_segment is a no-op on anything that is not a clean
++# HE-AAC media fragment (AC-3 content, video, inits, live dfwlive-* segments all pass through
++# untouched). The old narrow u-\d+-a-96-\d+-\d+\.mp4 missed ads whose URL/numbering differed.
++_AD_SEG = re.compile(r'(?:^|/)u-\d+-a-\d+-[\d-]*\d\.mp4$')
++
++# Candidate sample rates to probe (48 kHz covers 44.1 kHz too -- same band
++# tables). The ad must parse cleanly under one of them or it is left untouched.
++_RATES = (48000, 32000, 24000, 16000, 8000)
++
++_STEP_DB = 1.5  # one global_gain step
++
++# How many steps to cut each inserted ad. Calibrated to the bridge's actual LinkPi feed:
++# the inserted AAC ads measure ~-20.6 LUFS, the stock 5.1 AC-3 programming ~-32 LUFS
++# (box 16, 2026-10-03, integrated -32.2, never above -32.4 short-term over 4 min). 8 steps
++# = -12 dB lands a break at ~-32.6, matching the programming instead of ~7 dB over it. The
++# per-segment log line reports the actual dB, so this is easy to re-tune against a live ad.
++_DEFAULT_STEPS = 8
++
++
++class _PE(Exception):
++    pass
++
++
++def is_ad_segment(url: str) -> bool:
++    """True for an inserted-ad AAC media segment URL (the attenuation target).
++
++    Matched against the URL path only (never the host or query string), anchored to
++    the filename: the relay routes on this, so a looser match on the whole URL would
++    let a crafted query turn the public relay into an open proxy."""
++    if not url:
++        return False
++    return _AD_SEG.search(urlsplit(url).path) is not None
++
++
++# ---------------------------------------------------------------------------
++# Huffman lookup tables, built once from the ISO codebooks.
++# Flat table: index = peek(max_len) bits, value = (symbol << 5) | code_len,
++# 0 = no code. code_len <= 19 fits in 5 bits; symbol <= 288 fits above it.
++# ---------------------------------------------------------------------------
++
++def _build_table(lens, codes, max_len):
++    table = [0] * (1 << max_len)
++    for sym, (ln, code) in enumerate(zip(lens, codes)):
++        if ln == 0:
++            continue
++        prefix = code << (max_len - ln)
++        packed = (sym << 5) | ln
++        for j in range(prefix, prefix + (1 << (max_len - ln))):
++            table[j] = packed
++    return table
++
++
++_SCF_TABLE = _build_table(_SCF_LENS, _SCF_CODES, _SCF_MAX_LEN)
++_SPEC_TABLES = [
++    _build_table(_SPEC_LENS[i], _SPEC_CODES[i], _CB_META[i][3]) for i in range(11)
++]
++
++
++class _BR:
++    """MSB-first bit reader over a bytes-like frame."""
++    __slots__ = ('d', 'n', 'pos')
++
++    def __init__(self, data):
++        self.d = data
++        self.n = len(data) * 8
++        self.pos = 0
++
++    def read_bit(self):
++        p = self.pos
++        if p >= self.n:
++            raise _PE()
++        self.pos = p + 1
++        return (self.d[p >> 3] >> (7 - (p & 7))) & 1
++
++    def read_bits(self, k):
++        if k == 0:
++            return 0
++        p = self.pos
++        if p + k > self.n:
++            raise _PE()
++        v = self._peek(p, k)
++        self.pos = p + k
++        return v
++
++    def peek_bits(self, k):
++        return self._peek(self.pos, k)
++
++    def _peek(self, p, k):
++        d = self.d
++        byte = p >> 3
++        bitoff = p & 7
++        nbytes = (bitoff + k + 7) >> 3
++        val = 0
++        end = len(d)
++        for i in range(nbytes):
++            j = byte + i
++            val = (val << 8) | (d[j] if j < end else 0)
++        val >>= (nbytes * 8 - bitoff - k)
++        return val & ((1 << k) - 1)
++
++    def skip(self, k):
++        if self.pos + k > self.n:
++            raise _PE()
++        self.pos += k
++
++    def remaining(self):
++        return self.n - self.pos
++
++
++def _decode(br, table, max_len):
++    e = table[br.peek_bits(max_len)]
++    if e == 0:
++        raise _PE()
++    ln = e & 31
++    if br.pos + ln > br.n:
++        raise _PE()
++    br.pos += ln
++    return e >> 5
++
++
++def _swb(rate):
++    if rate >= 75132:
++        return _SWB['96L'], _SWB['64S']
++    if rate >= 55426:
++        return _SWB['64L'], _SWB['64S']
++    if rate >= 37566:
++        return _SWB['48L'], _SWB['48S']
++    if rate >= 27713:
++        return _SWB['32L'], _SWB['48S']
++    if rate >= 18783:
++        return _SWB['24L'], _SWB['24S']
++    if rate >= 9391:
++        return _SWB['16L'], _SWB['16S']
++    return _SWB['8L'], _SWB['8S']
++
++
++# ---------------------------------------------------------------------------
++# HE-AAC bitstream syntax (ISO/IEC 14496-3, 4.4-4.5).
++# ---------------------------------------------------------------------------
++
++def _skip_ltp(br, max_sfb):
++    # ltp_data() for a long window (HE-AAC long-term prediction): ltp_lag (11) +
++    # ltp_coef (3) + ltp_long_used[min(max_sfb, MAX_LTP_LONG_SFB=40)] (1 bit each).
++    br.skip(14)
++    br.skip(max_sfb if max_sfb < 40 else 40)
++
++
++def _parse_ics_info(br):
++    br.read_bits(1)                     # ics_reserved_bit
++    window_sequence = br.read_bits(2)
++    br.read_bits(1)                     # window_shape
++    long_win = window_sequence != EIGHT_SHORT
++    if long_win:
++        max_sfb = br.read_bits(6)
++        pred = br.read_bit()            # predictor_data_present
++        if pred:
++            # HE-AAC signals LTP here (not AAC-MAIN prediction): skip this channel's
++            # ltp_data when present. DirecTV's HE-AAC uses LTP, so this must be parsed,
++            # not rejected.
++            if br.read_bit():           # ltp_data_present
++                _skip_ltp(br, max_sfb)
++        return max_sfb, True, 1, [1], pred
++    max_sfb = br.read_bits(4)
++    grouping = br.read_bits(7)
++    groups = 1
++    group_len = [1]
++    for i in range(7):
++        if (grouping >> (6 - i)) & 1 == 0:
++            groups += 1
++            group_len.append(1)
++        else:
++            group_len[groups - 1] += 1
++    return max_sfb, False, groups, group_len, 0
++
++
++def _parse_section_data(br, max_sfb, long_win, groups):
++    sect_bits = 5 if long_win else 3
++    esc = (1 << sect_bits) - 1
++    out = []
++    for _ in range(groups):
++        cbs = [0] * max_sfb
++        k = 0
++        while k < max_sfb:
++            cb = br.read_bits(4)
++            if cb == 12:
++                raise _PE()
++            length = 0
++            while True:
++                incr = br.read_bits(sect_bits)
++                length += incr
++                if incr < esc:
++                    break
++            if length == 0 or k + length > max_sfb:
++                raise _PE()
++            for s in range(k, k + length):
++                cbs[s] = cb
++            k += length
++        out.append(cbs)
++    return out
++
++
++def _parse_scale_factors(br, max_sfb, groups, sfb_cb):
++    noise_pcm = True
++    for g in range(groups):
++        for sfb in range(max_sfb):
++            cb = sfb_cb[g][sfb]
++            if cb == ZERO_HCB:
++                continue
++            if cb == NOISE_HCB and noise_pcm:
++                br.read_bits(9)
++                noise_pcm = False
++                continue
++            _decode(br, _SCF_TABLE, _SCF_MAX_LEN)
++
++
++def _read_escape(br):
++    n = 0
++    while br.read_bit():
++        n += 1
++        if n >= 9:
++            raise _PE()
++    br.skip(n + 4)
++
++
++def _parse_spectral(br, max_sfb, groups, group_len, sfb_cb, bands):
++    for g in range(groups):
++        for sfb in range(max_sfb):
++            cb = sfb_cb[g][sfb]
++            if cb in (ZERO_HCB, NOISE_HCB, INTENSITY_HCB, INTENSITY_HCB2):
++                continue
++            width = bands[sfb + 1] - bands[sfb]
++            dim, unsigned, mod, mx = _CB_META[cb - 1]
++            table = _SPEC_TABLES[cb - 1]
++            ncw = width // dim
++            for _w in range(group_len[g]):
++                for _ in range(ncw):
++                    sym = _decode(br, table, mx)
++                    if not unsigned:
++                        continue
++                    if dim == 4:
++                        for v in _QUADS[sym]:
++                            if v != 0:
++                                br.read_bit()
++                    else:
++                        x = sym // mod
++                        y = sym % mod
++                        if x != 0:
++                            br.read_bit()
++                        if y != 0:
++                            br.read_bit()
++                        if cb == ESC_HCB:
++                            if x == 16:
++                                _read_escape(br)
++                            if y == 16:
++                                _read_escape(br)
++
++
++def _parse_pulse(br):
++    n = br.read_bits(2)
++    br.read_bits(6)
++    for _ in range(n + 1):
++        br.read_bits(5)
++        br.read_bits(4)
++
++
++def _parse_tns(br, max_sfb, long_win):
++    nfb = 2 if long_win else 1
++    lenb = 6 if long_win else 4
++    ordb = 5 if long_win else 3
++    nwin = 1 if long_win else 8
++    for _ in range(nwin):
++        n_filt = br.read_bits(nfb)
++        if n_filt <= 0:
++            continue
++        coef_res = br.read_bits(1)
++        for _ in range(n_filt):
++            br.read_bits(lenb)                       # filter SFB length (value unused for skipping)
++            order = br.read_bits(ordb)
++            if order > 0:
++                br.read_bits(1)                      # direction
++                coef_compress = br.read_bits(1)
++                br.skip(order * (coef_res + 3 - coef_compress))
++
++
++def _parse_ics(br, shared, bands_long, bands_short, gains):
++    gains.append([br.pos, br.peek_bits(8)])  # global_gain location + value
++    br.skip(8)
++    if shared is None:
++        info = _parse_ics_info(br)
++    else:
++        info = shared
++    max_sfb, long_win, groups, group_len, _pred = info
++    bands = bands_long if long_win else bands_short
++    if max_sfb >= len(bands):
++        raise _PE()
++    sfb_cb = _parse_section_data(br, max_sfb, long_win, groups)
++    _parse_scale_factors(br, max_sfb, groups, sfb_cb)
++    if br.read_bit():                        # pulse_data_present
++        if not long_win:
++            raise _PE()
++        _parse_pulse(br)
++    if br.read_bit():                        # tns_data_present
++        _parse_tns(br, max_sfb, long_win)
++    if br.read_bit():                        # gain_control_data_present
++        raise _PE()
++    _parse_spectral(br, max_sfb, groups, group_len, sfb_cb, bands)
++    return info
++
++
++def _parse_sce(br, bl, bs, gains):
++    br.read_bits(4)                          # element_instance_tag
++    _parse_ics(br, None, bl, bs, gains)
++
++
++def _parse_cpe(br, bl, bs, gains):
++    br.read_bits(4)
++    common = br.read_bit()
++    shared = None
++    if common:
++        shared = _parse_ics_info(br)
++        if br.read_bits(2) == 1:             # ms_mask_present == 1
++            br.skip(shared[2] * shared[0])   # groups * max_sfb ms_used bits
++        if shared[4] and shared[1]:          # predictor present + long: 2nd channel's LTP
++            if br.read_bit():                # ltp_data_present (channel 1)
++                _skip_ltp(br, shared[0])
++    _parse_ics(br, shared, bl, bs, gains)
++    _parse_ics(br, shared, bl, bs, gains)
++
++
++def _skip_dse(br):
++    br.read_bits(4)
++    align = br.read_bit()
++    count = br.read_bits(8)
++    if count == 255:
++        count += br.read_bits(8)
++    if align and (br.pos & 7):
++        br.pos = (br.pos + 7) & ~7
++    br.skip(count * 8)
++
++
++def _skip_fil(br):
++    count = br.read_bits(4)
++    if count == 15:
++        count += br.read_bits(8) - 1
++        if count < 0:
++            count = 0
++    br.skip(count * 8)
++
++
++def _skip_pce(br):
++    raise _PE()  # PCE is unexpected in a media fragment; bail -> leave frame untouched
++
++
++def _parse_frame(frame, bl, bs):
++    """Return (gain_locations, saw_end). Raises _PE on any malformed element."""
++    br = _BR(frame)
++    gains = []
++    saw_end = False
++    while True:
++        if br.remaining() < 3:
++            break
++        el = br.read_bits(3)
++        if el in (ID_SCE, ID_LFE):
++            _parse_sce(br, bl, bs, gains)
++        elif el == ID_CPE:
++            _parse_cpe(br, bl, bs, gains)
++        elif el == ID_DSE:
++            _skip_dse(br)
++        elif el == ID_PCE:
++            _skip_pce(br)
++        elif el == ID_FIL:
++            _skip_fil(br)
++        elif el == ID_END:
++            saw_end = True
++            break
++        else:                                # ID_CCE or unknown
++            raise _PE()
++    # A well-formed sample is one byte-aligned raw_data_block: after END only
++    # sub-byte padding is left. Anything else means this rate desynced.
++    return gains, saw_end, br.remaining()
++
++
++# ---------------------------------------------------------------------------
++# Fragmented-MP4 container (ISO/IEC 14496-12): moof -> traf -> trun sizes.
++# ---------------------------------------------------------------------------
++
++def _boxes(buf, start, end):
++    i = start
++    while i + 8 <= end:
++        size = int.from_bytes(buf[i:i + 4], 'big')
++        typ = buf[i + 4:i + 8]
++        hdr = 8
++        if size == 1:
++            size = int.from_bytes(buf[i + 8:i + 16], 'big')
++            hdr = 16
++        elif size == 0:
++            size = end - i
++        if size < hdr or i + size > end:
++            return
++        yield typ, i + hdr, i + size
++        i += size
++
++
++def _find(buf, start, end, want):
++    for typ, ds, de in _boxes(buf, start, end):
++        if typ == want:
++            return ds, de
++    return None
++
++
++def _trun_sizes(buf, ds, de):
++    flags = int.from_bytes(buf[ds + 1:ds + 4], 'big')
++    count = int.from_bytes(buf[ds + 4:ds + 8], 'big')
++    off = ds + 8
++    if flags & 0x1:
++        off += 4
++    if flags & 0x4:
++        off += 4
++    sizes = []
++    for _ in range(count):
++        if flags & 0x100:
++            off += 4
++        if flags & 0x200:
++            sizes.append(int.from_bytes(buf[off:off + 4], 'big'))
++            off += 4
++        else:
++            sizes.append(None)
++        if flags & 0x400:
++            off += 4
++        if flags & 0x800:
++            off += 4
++    if off > de:
++        raise _PE()
++    return sizes
++
++
++def _tfhd_default_size(buf, ds):
++    flags = int.from_bytes(buf[ds + 1:ds + 4], 'big')
++    p = ds + 4 + 4                           # version/flags + track_ID
++    if flags & 0x1:
++        p += 8
++    if flags & 0x2:
++        p += 4
++    if flags & 0x8:
++        p += 4
++    if flags & 0x10:
++        return int.from_bytes(buf[p:p + 4], 'big')
++    return None
++
++
++def _write_u8(buf, bitpos, val):
++    for i in range(8):
++        p = bitpos + i
++        bi = p >> 3
++        mask = 1 << (7 - (p & 7))
++        if (val >> (7 - i)) & 1:
++            buf[bi] |= mask
++        else:
++            buf[bi] &= ~mask
++
++
++def attenuate_ad_segment(data: bytes, steps: int = _DEFAULT_STEPS) -> bytes:
++    """Return ``data`` with every HE-AAC global_gain lowered by ``steps`` (1.5 dB
++    each), or the original bytes unchanged if it is not a cleanly-parseable AAC
++    fMP4 media fragment. Never raises; never returns a corrupted segment. Both the
++    normal cut and a no-op (an inserted ad that went out un-attenuated — e.g. a
++    creative that doesn't parse as clean HE-AAC) log at DEBUG, so a running relay
++    stays quiet; turn on DEBUG to see per-segment detail."""
++    body, reason = _attenuate_impl(data, steps)
++    if reason.startswith('attenuated'):
++        logger.debug('[dtv-aac-gain] inserted-ad AAC segment: %d bytes -> %s',
++                     len(data or b''), reason)
++    else:
++        logger.debug('[dtv-aac-gain] inserted-ad AAC segment left unchanged: %d bytes -> %s',
++                     len(data or b''), reason)
++    return body
++
++
++def _attenuate_impl(data: bytes, steps: int):
++    """Returns (bytes, reason). reason is a short human string for the log."""
++    try:
++        if steps <= 0 or not data:
++            return data, 'skipped (no data)'
++        buf = bytearray(data)
++        # A segment may carry more than one fragment (moof+mdat). Pair each moof with the
++        # mdat that follows it and attenuate EVERY fragment. The old code edited only the
++        # first moof/mdat, so the rest of a multi-fragment ad played at full volume — that
++        # was the "some ads are still a little loud" bug (a single-fragment segment, the
++        # common case, behaves exactly as before: one pair).
++        pairs = []
++        pending = None
++        for typ, ds, de in _boxes(buf, 0, len(buf)):
++            if typ == b'moof':
++                pending = (ds, de)
++            elif typ == b'mdat' and pending is not None:
++                pairs.append((pending, (ds, de)))
++                pending = None
++        if not pairs:
++            return data, 'no-op: not a fragmented MP4 (no moof/mdat — init segment?)'
++
++        frames = []
++        for (moof_ds, moof_de), (mdat_ds, mdat_de) in pairs:
++            sizes = []
++            for typ, ds, de in _boxes(buf, moof_ds, moof_de):
++                if typ != b'traf':
++                    continue
++                default = None
++                tf = _find(buf, ds, de, b'tfhd')
++                if tf:
++                    default = _tfhd_default_size(buf, tf[0])
++                for t2, ds2, de2 in _boxes(buf, ds, de):
++                    if t2 == b'trun':
++                        for sz in _trun_sizes(buf, ds2, de2):
++                            sizes.append(sz if sz is not None else default)
++            if not sizes or any(s is None for s in sizes):
++                return data, 'no-op: could not read trun sample sizes'
++            if sum(sizes) != mdat_de - mdat_ds:
++                return data, 'no-op: trun sizes != mdat length (unexpected layout)'
++            cum = mdat_ds
++            for sz in sizes:
++                frames.append((cum, sz))
++                cum += sz
++
++        parsed_rate = None
++        for rate in _RATES:
++            bl, bs = _swb(rate)
++            collected = []
++            ok = True
++            for start, sz in frames:
++                try:
++                    gains, saw_end, rem = _parse_frame(data[start:start + sz], bl, bs)
++                except Exception:
++                    ok = False
++                    break
++                if not saw_end or not gains or rem >= 8:
++                    ok = False
++                    break
++                collected.append((start, gains))
++            if ok:
++                parsed_rate = rate
++                break
++        else:
++            return data, ('no-op: no sample rate parsed every frame as clean HE-AAC '
++                          '(an unexpected element or signaling we do not handle)')
++
++        for start, gains in collected:
++            for bitpos, old in gains:
++                new = old - steps
++                if new < 0:
++                    new = 0
++                _write_u8(buf, start * 8 + bitpos, new)
++        return bytes(buf), ('attenuated %d frames @ %d Hz (-%.1f dB)'
++                            % (len(collected), parsed_rate, steps * _STEP_DB))
++    except Exception as exc:  # pragma: no cover - defensive
++        return data, 'no-op: %s' % type(exc).__name__

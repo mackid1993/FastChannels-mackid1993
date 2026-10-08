@@ -79,14 +79,17 @@ truly no real source left to rebuild it from.
 
 The files you can edit are the FastChannels DirecTV overlay: a PATCH on upstream
 kineticman/FastChannels. The patch is exactly two things:
-  OURS (whole files, change freely): app/scrapers/directv_dai.py, dtv_android.py,
-    dtv_aac_ads.py, dtv_aac_gain.py
-  HOOKS (one-line injections into UPSTREAM files: api_sources.py, directv_proxy.py,
-    directv.py, source_config.py, templates/admin/sources.html). A hook is one line that
-    wires our code in -- `from . import dtv_android`, a `dai=directv_dai.request_flags(...)`
-    argument, a `dtv_android.sign_in(...)` call, or the `dai: dict | None = None` parameter
-    we add to an upstream function. Every other line in those files, every function name
-    included, is UPSTREAM's.
+  OURS (whole files, change freely): app/scrapers/directv_dai.py, directv_dai_device.py,
+    directv_dai_install.py, dtv_aac_ads.py, dtv_aac_gain.py
+  ONE HOOK: a single line at the end of create_app in UPSTREAM's app/__init__.py,
+    `from .scrapers import directv_dai_install; directv_dai_install.install(app)`.
+    Every other line of every upstream file is UPSTREAM's; never add code to one.
+install() wires the feature in at RUNTIME by wrapping upstream functions BY NAME; the names
+it depends on are listed in directv_dai_install.TARGETS (plus SAVE_CONFIG_RULE and
+TEMPLATE_MARKERS). So the normal drift is: upstream renamed or moved one of those names.
+The fix goes in directv_dai_install.py (and TARGETS): point the wrapper at upstream's
+current name/location, keeping the wrapper's behavior. Never edit an upstream file to put
+the old name back.
 
 A build check is failing, almost always because upstream renamed or moved something a hook
 sits in or calls. reproduce.log holds the failing output. AGENTS.md explains every hook.

@@ -35,7 +35,7 @@ ruff check --select "$rules" --output-format=json --exit-zero "${targets[@]}" > 
 python "$root/scripts/ruff_diff.py" "$tmp/base.json" "$tmp/patched.json" "$PWD" "$tmp/base"
 
 echo "== templates (${#html_files[@]} patched template(s))"
-python - "${html_files[@]}" <<'PY'
+python - ${html_files[@]+"${html_files[@]}"} <<'PY'
 import sys
 import jinja2
 env = jinja2.Environment(extensions=['jinja2.ext.do', 'jinja2.ext.loopcontrols'])
@@ -50,60 +50,73 @@ print(f'{len(sys.argv) - 1} template(s) parsed, {errors} errors')
 sys.exit(1 if errors else 0)
 PY
 
-echo "== overlay modules and hooks present"
-# Most of the overlay's code lives in its own app/scrapers/*.py modules, files upstream
-# doesn't have. What sits in upstream's files is a set of one-line hooks; a merge
-# (or an AI conflict fix) must not lose any of them. Only the call targets are
-# checked, not their arguments, so a correct port that adapts to an upstream
-# rename still passes. The smoke test checks the upstream APIs the hooks rely on.
-missing=0
-check() { grep -qF -- "$2" "$1" || { echo "::error file=$1::missing DAI hook: $2"; missing=1; }; }
-check_re() { grep -qE -- "$2" "$1" || { echo "::error file=$1::missing DAI hook: $3"; missing=1; }; }
-d=app/scrapers/directv.py
-[ -f app/scrapers/directv_dai.py ] || { echo "::error::app/scrapers/directv_dai.py is missing"; missing=1; }
-check $d "from . import directv_dai"
-check_re $d 'dai: *dict' "the dai parameter of _fetch_channel_playback"
-check $d "directv_dai.pick_stream_url("
-check $d "'dai': bool(dai)"
-check $d "directv_dai.login_fields("
-check $d "directv_dai.login_fields_from_cookies("
-check $d "directv_dai.store_login_result("
-check $d "directv_dai.CONFIG_FIELD"
-check $d "directv_dai.note_channel("
-check $d "directv_dai.cached_url_usable("
-# The Android TV client logic (channel/v2 request, app User-Agent, device reading) lives
-# in dtv_android so the Android login is portable; DAI depends on it, not the reverse.
-check $d "dtv_android.android_auth_request("
-# pre_run_setup keeps the DRM session warm on the app's ~55-min refresh cadence (re-minting
-# the activation token) so a tune never meets a dead token; logic lives in dtv_android.
-check $d "dtv_android.background_refresh_due("
-# The Android TV session is the playback identity: sign-in/refresh (run_directv_auth), the
-# DRM license headers, the staleness check, and the inline tune-time refresh all route
-# through dtv_android.
-check $d "dtv_android.sign_in("
-check $d "dtv_android.license_headers("
-check $d "dtv_android.token_stale("
-check $d "dtv_android.refresh_in_place("
-# Two callers pass dai=: resolve() and the license path.
-[ "$(grep -cE -- 'dai=directv_dai\.request_flags\(' $d)" -ge 2 ] \
-    || { echo "::error file=$d::missing DAI hook: dai=directv_dai.request_flags(...) in resolve() and the license path"; missing=1; }
-check app/routes/api_sources.py "directv_dai.clear_cache_if_toggled("
-# The viewer-profile picker: the directv-profile route lists/selects DirecTV viewer profiles.
-check app/routes/api_sources.py "directv-profile"
-check app/routes/api_sources.py "dtv_android.list_profiles("
-check app/routes/api_sources.py "dtv_android.select_profile("
-check app/routes/directv_proxy.py "dtv_android.player_headers()"
-# DRM-failure recovery for an Android TV session delegates to dtv_android (no token wipe, no storm).
-check app/routes/directv_proxy.py "dtv_android.drm_reauth("
-check app/routes/directv_proxy.py "dtv_aac_ads.swap_muffled_ads("
-# Inserted-ad AAC loudness attenuation (own module): the relay hook + the module itself.
-check app/routes/directv_proxy.py "dtv_aac_gain.attenuate_ad_segment("
-check app/scrapers/dtv_aac_gain.py "def attenuate_ad_segment("
-# An inserted-ad creative takes the relay path regardless of CDN host (so the cut always
-# runs); both the routing decision and the attenuation gate go through is_ad_segment.
-check app/routes/directv_proxy.py "dtv_aac_gain.is_ad_segment("
-check app/scrapers/dtv_aac_gain.py "def is_ad_segment("
-check app/routes/directv_proxy.py "'yospace.com',  # DAI"
-check app/templates/admin/sources.html "toggleHtml('use_dai'"
-[ "$missing" -eq 0 ]
+echo "== overlay modules, the one hook, and the upstream names it wires into"
+# The overlay's code lives in its own modules (files upstream doesn't have). Upstream's
+# files carry exactly ONE line: directv_dai_install.install(app) in create_app. install()
+# then wraps upstream functions by name at runtime, so the thing that can drift is a NAME
+# upstream renames or removes. This lists every such name from directv_dai_install.TARGETS
+# and fails with the exact name, before any image is built. Fix a moved name in
+# directv_dai_install.py, never by editing upstream's files.
+python - "$root" <<'PY'
+import ast, os, sys
+ok = True
+def err(msg):
+    global ok
+    ok = False
+    print(f'::error::{msg}')
+for f in ('directv_dai.py', 'directv_dai_device.py', 'directv_dai_install.py', 'dtv_aac_ads.py', 'dtv_aac_gain.py'):
+    if not os.path.isfile(f'app/scrapers/{f}'):
+        err(f'app/scrapers/{f} is missing')
+init = open('app/__init__.py', encoding='utf-8').read()
+if 'directv_dai_install.install(app)' not in init:
+    err('app/__init__.py: the one DAI hook (directv_dai_install.install(app) in create_app) is missing')
+for f in ('app/scrapers/directv_dai_install.py',):
+    if not os.path.isfile(f):
+        sys.exit(1)
+tree = ast.parse(open('app/scrapers/directv_dai_install.py', encoding='utf-8').read())
+consts = {t.id: ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+          for t in n.targets if isinstance(t, ast.Name) and t.id in ('TARGETS', 'TEMPLATE_MARKERS', 'SAVE_CONFIG_RULE')}
+
+def names(body):
+    out = set()
+    for n in body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(n.name)
+        elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                if isinstance(t, ast.Name):
+                    out.add(t.id)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            out.update((a.asname or a.name).split('.')[0] for a in n.names)
+        elif isinstance(n, (ast.If, ast.Try)):
+            out |= names(n.body) | names(getattr(n, 'orelse', []))
+            for h in getattr(n, 'handlers', []):
+                out |= names(h.body)
+    return out
+
+parsed = {}
+for module, path in consts['TARGETS']:
+    f = module.replace('.', '/') + '.py'
+    if not os.path.isfile(f):
+        err(f'upstream module {module} is gone (DAI wires into {module}.{path})')
+        continue
+    mod = parsed.setdefault(f, ast.parse(open(f, encoding='utf-8').read()))
+    head, _, attr = path.partition('.')
+    if head not in names(mod.body):
+        err(f'upstream renamed or removed {module}.{head} (DAI wires into it; update directv_dai_install.py)')
+        continue
+    if attr:
+        cls = next(n for n in mod.body if isinstance(n, ast.ClassDef) and n.name == head)
+        if attr not in names(cls.body):
+            err(f'upstream renamed or removed {module}.{path} (DAI wires into it; update directv_dai_install.py)')
+tpl = open('app/templates/admin/sources.html', encoding='utf-8').read()
+for marker in consts['TEMPLATE_MARKERS']:
+    if marker not in tpl:
+        err(f'sources.html no longer has {marker!r} (the DAI settings script relies on it)')
+rule = consts['SAVE_CONFIG_RULE'].removeprefix('/api')
+if f"route('{rule}', methods=['POST']" not in open('app/routes/api_sources.py', encoding='utf-8').read():
+    err(f'the save-config route {rule} (POST) moved (DAI clears its cache / captures ad ids on save)')
+print('all DAI wiring targets present' if ok else 'DAI wiring targets missing')
+sys.exit(0 if ok else 1)
+PY
 echo "All static checks passed."

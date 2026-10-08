@@ -6,8 +6,8 @@ the account's own ad-targeting values (DMA, privacy consent, household/profile
 ids) plus this device's own ad ids.
 When off, everything behaves exactly as before.
 
-Everything lives in this module (plus directv_dai_device for the bridge device);
-directv_dai_install wires it into upstream at runtime from one line in create_app.
+Everything lives in this module so the hooks in directv.py, api_sources.py and
+the sources page stay one-liners.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from urllib.parse import quote
 import requests
 
 from .base import ConfigField
-from . import directv_dai_device as device
+from . import dtv_android
 
 logger = logging.getLogger(__name__)
 
@@ -188,9 +188,9 @@ def build_query(config: dict, dai_channel_names: dict, ccid: str) -> dict:
     if pid:
         q['hhid'] = pid
         q['u'] = pid
-    # profid is the viewer profile's id. dtv_android_profid is the one the old overlay's
-    # profile picker stored (kept in the config, still honored); dai_profile_id is the
-    # web-login value. Omitted when unknown (fairness rule).
+    # profid is the chosen viewer profile's id. On the Android TV login it comes from the
+    # profiletoken exchange (dtv_android.select_profile → dtv_android_profid); dai_profile_id
+    # is the old web-login value, kept as a fallback. Omitted when unknown (fairness rule).
     profid = config.get('dtv_android_profid') or config.get('dai_profile_id')
     if profid:
         q['profid'] = profid
@@ -332,9 +332,9 @@ _ADID_TRIED_TTL = 6 * 3600
 
 def _adids_file() -> str:
     """directv_dai_adids.json, beside the device store. Kept separate from
-    the device-identity store (directv_dai_device) so that store's hourly re-read can
-    never clobber a captured id."""
-    return os.path.join(os.path.dirname(device._devices_file()), 'directv_dai_adids.json')
+    dtv_android's device-identity store so that store's hourly re-read can never
+    clobber a captured id (and so no advertising-id logic lives in dtv_android)."""
+    return os.path.join(os.path.dirname(dtv_android._devices_file()), 'directv_dai_adids.json')
 
 
 def _saved_adids() -> dict:
@@ -629,7 +629,7 @@ def _current_bridge_address() -> str | None:
         ip = (request.remote_addr or '').strip() if has_request_context() else ''
     except Exception:
         ip = ''
-    return device._bridge_address(ip) if ip else None
+    return dtv_android._bridge_address(ip) if ip else None
 
 
 def _current_device_ad_flags() -> dict:
@@ -637,7 +637,7 @@ def _current_device_ad_flags() -> dict:
     advertising id captured for it earlier. Reads the store only — a tune NEVER triggers a
     capture (capture is explicit: DAI toggle-on or the admin button)."""
     address = _current_bridge_address()
-    return device_ad_flags(device._client_device(), _saved_adids().get(address or ''))
+    return device_ad_flags(dtv_android._client_device(), _saved_adids().get(address or ''))
 
 
 _ZIP_CACHE: dict[str, str] = {}
@@ -690,55 +690,71 @@ def gpp_targeted_ad_opt_out(gpp: str) -> bool | None:
 
 # ── Scrape ───────────────────────────────────────────────────────────────────
 
-_CCID_KEYS = ('ccid', 'ccId', 'channelId', 'channel_id', 'id')
-
-
-def note_channels(scraper, rows) -> None:
-    """Record each lineup row's DAI "net" tag (daiChannelName) in the scraper's cache,
-    where a tune reads it. Called with every AllChannels page of rows; writes the cache
-    only when something changed."""
+def note_channel(scraper, row: dict, ccid: str) -> None:
+    """Record the per-channel DAI "net" tag (the lineup's daiChannelName) in the
+    scraper's cache, where resolve() reads it. Called once per lineup row."""
+    value = (row or {}).get('daiChannelName')
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str) or not value.strip():
+        return
     names = scraper.cache.get('dai_channel_names')
-    names = dict(names) if isinstance(names, dict) else {}
-    changed = False
-    for row in rows or []:
-        if not isinstance(row, dict):
-            continue
-        ccid = next((str(row[k]).strip() for k in _CCID_KEYS if row.get(k) not in (None, '')), '')
-        value = row.get('daiChannelName')
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            value = str(value)
-        if not ccid or not isinstance(value, str) or not value.strip():
-            continue
-        if names.get(ccid) != value.strip():
-            names[ccid] = value.strip()
-            changed = True
-    if changed:
-        scraper._update_cache('dai_channel_names', names)
+    names = names if isinstance(names, dict) else {}
+    if names.get(ccid) != value.strip():
+        scraper._update_cache('dai_channel_names', {**names, ccid: value.strip()})
 
 
 # ── Login ────────────────────────────────────────────────────────────────────
 
+def login_fields(session, bearer: str, token_data: dict | None) -> dict:
+    """DAI values captured at login on the curl_cffi path: the household/profile
+    ids the web client sends (hhid == u == partnerProfileId in real captures) from
+    the token exchange's valuePairs, plus the account's DMA and consent string."""
+    vp = (token_data or {}).get('valuePairs')
+    vp = vp if isinstance(vp, dict) else {}
+    return {
+        'partner_profile_id': (vp.get('partnerProfileId') or '').strip() or None,
+        'profile_id': (vp.get('profileId') or '').strip() or None,
+        'dai_context': fetch_account_context(session, bearer),
+    }
+
+
+def login_fields_from_cookies(captured: dict) -> dict:
+    """The same account context for the Playwright login path, fetched with the
+    captured bearer and cookies in a throwaway requests session. hhid/u/profid
+    come from the bearer's own claims later (see store_login_result)."""
+    bearer = captured.get('bearer_token')
+    if not bearer:
+        return {}
+    session = requests.Session()
+    for c in captured.get('cookies') or []:
+        try:
+            session.cookies.set(c['name'], c['value'],
+                                domain=c.get('domain') or None, path=c.get('path') or '/')
+        except Exception:
+            continue
+    return {'dai_context': fetch_account_context(session, bearer)}
+
+
 def store_login_result(cfg: dict, result: dict) -> None:
     """Persist the account's own DAI values from a login result into the source
-    config (used only when the toggle is on). Runs after upstream's apply_auth_result
-    on every sign-in and refresh (see directv_dai_install).
+    config (used only when the toggle is on).
 
-    Upstream's code sign-in (directv_device_auth) returns a bare session, so the DAI
-    targeting context (DMA/ZIP/consent) is fetched here with its bearer, once: a refresh
-    reuses what's stored. Best-effort: a failed fetch never breaks the sign-in."""
-    if ('dai_context' not in result and result.get('bearer_token')
-            and (result.get('auth_method') == 'device_code' or not cfg.get('dai_dma_id'))):
+    The Android TV login (dtv_android) returns a pure session with no DAI fields, so
+    that it stays independent of DAI. This is the one place DAI persistence happens, so
+    the DAI targeting context (DMA/consent/profile ids) is fetched here for such a login
+    rather than inside dtv_android. Best-effort: a failed fetch never breaks the sign-in."""
+    if result.get('auth_method') == 'dtv_android' and 'dai_context' not in result and result.get('bearer_token'):
         try:
-            from . import directv_device_auth
             account = requests.Session()
-            account.headers.update(directv_device_auth.app_headers())
-            result = {**result, 'dai_context': fetch_account_context(account, result['bearer_token'])}
+            account.headers.update(dtv_android._app_headers())
+            result = {**result, **login_fields(account, result['bearer_token'], result.get('token_data'))}
         except Exception as exc:
             logger.warning('[directv-dai] could not fetch DAI context at login: %s', exc)
     partner_profile_id = result.get('partner_profile_id')
     profile_id = result.get('profile_id')
-    # Paths with no token-exchange valuePairs fall back to the bearer JWT's own claims
-    # (the code sign-in's tokens are opaque, so there it's the valuePairs or nothing).
+    # The Playwright path has no token-exchange valuePairs, so fall back to the
+    # same ids from the bearer JWT's own claims. Also a safety net for curl_cffi.
     if not partner_profile_id or not profile_id:
         jwt_pp, jwt_pf = ids_from_bearer_jwt(result.get('bearer_token') or '')
         partner_profile_id = partner_profile_id or jwt_pp
@@ -748,8 +764,19 @@ def store_login_result(cfg: dict, result: dict) -> None:
     if profile_id:
         cfg['dai_profile_id'] = profile_id
     for k, v in (result.get('dai_context') or {}).items():
-        if v:
-            cfg[f'dai_{k}'] = v
+        cfg[f'dai_{k}'] = v
+    # The Android TV sign-in's stable device id, so later refreshes reuse the same
+    # registered device instead of granting a new one each time.
+    if result.get('dtv_android_device_id'):
+        cfg['dtv_android_device_id'] = result['dtv_android_device_id']
+    # The access token's expiry, so we refresh just before it lapses (dtv_android.
+    # token_stale) rather than on a fixed clock. Cleared when a login can't parse one,
+    # so a stale expiry never pins the staleness check.
+    if 'token_expires_at' in result:
+        if result.get('token_expires_at'):
+            cfg['dtv_android_expires_at'] = result['token_expires_at']
+        else:
+            cfg.pop('dtv_android_expires_at', None)
 
 
 def fetch_account_context(session, bearer: str) -> dict:

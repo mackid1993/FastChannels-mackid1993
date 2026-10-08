@@ -21,8 +21,11 @@ name: Upstream watch (development)
 # hands-off. The notification on the PR is FYI only; there is never anything for you to do.
 
 on:
-  schedule:
-    - cron: "30 */6 * * *"   # every 6h, offset 30 min from build.yml's main watch
+  # Schedule paused 2026-10-08: production (build.yml) now builds from development itself,
+  # so this early-warning watch would only duplicate it. Restore the schedule if build.yml
+  # goes back to main (repo variable UPSTREAM_BRANCH=main):
+  #   schedule:
+  #     - cron: "30 */6 * * *"
   workflow_dispatch:
 
 permissions:

@@ -1,22 +1,22 @@
 name: Build patched image
 
 # Every 6 hours (and on a push to this repo's patches/scripts/workflow): take
-# kineticman/FastChannels' main branch (his releases) as it is right now, apply the patches
+# kineticman/FastChannels' development branch as it is right now (the repo variable
+# UPSTREAM_BRANCH overrides it; set it to `main` to go back to his releases), apply the patches
 # in patches/, validate, build, smoke-test and boot-test the image, then publish that tested
 # image to GHCR. Nothing is published unless every check passes, and the build-key dedup makes
 # a run a no-op when upstream, the patches and the Player APK are all unchanged — so this
-# builds + publishes promptly when his main moves, not just weekly. Run it by hand
+# builds + publishes promptly when his branch moves, not just weekly. Run it by hand
 # (Actions > Build patched image > Run workflow) for a build sooner.
 #
-# The DEVELOPMENT branch is watched separately (upstream-watch.yml): it dispatches this
-# workflow in drift-check mode (drift_only=true, upstream_branch=development) to warn — and
-# prepare a GLM 5.3 Flash fix — ahead of a release, without ever building or publishing.
+# Production tracks development since 2026-10-08 (upstream merged the Android TV code
+# sign-in there first; the DAI patch builds on it). upstream-watch.yml's schedule is paused
+# while that's so, since this workflow already watches development.
 
 on:
   schedule:
-    # Every 6 hours: build + publish when kineticman's main (his releases) has a new commit;
-    # otherwise the build-key dedup turns the run into a no-op. The development watcher
-    # (upstream-watch.yml) warns ahead of a release; this is the real build + publish.
+    # Every 6 hours: build + publish when kineticman's tracked branch has a new commit;
+    # otherwise the build-key dedup turns the run into a no-op.
     - cron: "0 */6 * * *"
   push:
     branches: [main]
@@ -54,7 +54,7 @@ permissions:
 
 env:
   UPSTREAM_REPO: ${{ inputs.upstream_repo || 'kineticman/FastChannels' }}
-  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || vars.UPSTREAM_BRANCH || 'development' }}
   # A test run (against another repo/branch) builds and checks but never publishes,
   # refreshes the patches, or files issues.
   TEST_RUN: ${{ (inputs.upstream_repo != '' || inputs.upstream_branch != '') && 'true' || 'false' }}
@@ -205,7 +205,7 @@ jobs:
           tags: fastchannels:ci
           labels: |
             org.opencontainers.image.title=FastChannels (mackid1993)
-            org.opencontainers.image.description=kineticman/FastChannels main (releases) plus the DirecTV DAI patch
+            org.opencontainers.image.description=kineticman/FastChannels ${{ env.UPSTREAM_BRANCH }} plus the DirecTV DAI patch
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ steps.inputs.outputs.sha }}
             fastchannels.player-apk=${{ steps.inputs.outputs.apk_tag }}
@@ -454,12 +454,14 @@ jobs:
           adaptation -- effectively backporting the patch onto a different upstream).
 
           The files you can edit are the FastChannels DirecTV overlay: a PATCH on upstream
-          kineticman/FastChannels. The patch is our own modules (directv_dai.py, dtv_android.py,
-          dtv_aac_ads.py, dtv_aac_gain.py) plus one-line HOOKS injected into upstream files. A
-          hook is one line that wires our code into an upstream file (an import, a
-          `dai=directv_dai.request_flags(...)` argument, a `dtv_android.sign_in(...)` call, a
-          `dai: dict | None = None` parameter we add); every other line in those files, function
-          names included, is UPSTREAM's. The patch adds an opt-in "DirecTV ad insertion (DAI)"
+          kineticman/FastChannels. The patch is our own modules (directv_dai.py,
+          directv_dai_device.py, directv_dai_install.py, dtv_aac_ads.py, dtv_aac_gain.py) plus
+          exactly ONE line in upstream's app/__init__.py, at the end of create_app:
+          `from .scrapers import directv_dai_install; directv_dai_install.install(app)`.
+          Every other line of every upstream file is UPSTREAM's. install() wires the
+          feature in at runtime by wrapping upstream functions by name (see
+          directv_dai_install.TARGETS); a renamed target is fixed in directv_dai_install.py,
+          never by editing upstream code. The patch adds an opt-in "DirecTV ad insertion (DAI)"
           feature and no longer applied cleanly. Every part that applied cleanly is already in
           these files; where it conflicted the files hold upstream's code, and conflicts.md shows
           each spot: upstream's code, and what the patch wanted (written against an older
@@ -467,8 +469,8 @@ jobs:
           smoke_test.py and validate.sh are the overlay's own tests -- the spec your result must
           later pass, given to you to read (you cannot edit them).
 
-          For each conflict in conflicts.md, write code that keeps upstream's current behavior
-          AND re-wires the patch's hook. Rules:
+          The only possible conflict is that one line: keep upstream's current create_app and
+          put the line back just before create_app returns the app. Rules:
           - Edit only the conflicted files you were given; the tests and every other file are
             read-only.
           - Keep every upstream change. A HOOK FOLLOWS UPSTREAM: if upstream renamed or moved a
