@@ -156,11 +156,23 @@ def _bridge_address(ip: str) -> str | None:
     return address
 
 
+def known_bridge_devices() -> list[dict]:
+    """Every bridge device upstream knows (HDMI Capture, ah4c tuners, remembered boxes) as
+    [{'address': 'host:port', 'host': 'host'}]. The overlay's only read of upstream's
+    device list, so if upstream reshapes it, this is the one place to adapt."""
+    from .. import bridge_devices
+    out = []
+    for d in bridge_devices.known_devices()[0]:
+        address = str((d or {}).get('address') or '').strip()
+        if address:
+            out.append({'address': address, 'host': str(d.get('host') or address.rsplit(':', 1)[0])})
+    return out
+
+
 def _lookup_bridge_address(ip: str) -> str | None:
     try:
-        from .. import bridge_devices
-        return next((d['address'] for d in bridge_devices.known_devices()[0]
-                     if d.get('host') == ip or d.get('address', '').split(':')[0] == ip), None)
+        return next((d['address'] for d in known_bridge_devices()
+                     if d['host'] == ip or d['address'].split(':')[0] == ip), None)
     except Exception as exc:
         logger.debug('[directv-dai] bridge device lookup failed: %s', exc)
         return None

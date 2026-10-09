@@ -98,10 +98,17 @@ Rules, highest priority first:
 3. KEEP THE BEHAVIOR. If a wrapped function changed shape (new arguments, a different return
    value, a classmethod became something else), adapt the wrapper so it does the same job
    on the new shape. Wrappers bind arguments by name with inspect.signature.
-4. NEVER FABRICATE. Don't invent values, don't write a stub that returns nothing, don't
-   re-create removed upstream code inside the overlay. If what the overlay needs is truly
-   gone from upstream, make no edit and say so in one sentence.
-5. Minimal diff, valid Python, no refactoring or reformatting. Never write a secret (API
+4. REBUILD FROM REAL UPSTREAM DATA. A name in USES may be gone while the data it returned is
+   still in upstream. Example: bridge_devices.known_devices() is removed, but the bridge
+   devices are still in upstream's settings, its ah4c tuner list and its BridgeDevice rows
+   (find them in upstream_index.txt). Then re-implement that small read in OUR module (for
+   the device list: directv_dai_device.known_bridge_devices(), which returns
+   [{'address', 'host'}]), reading those real sources, and update the USES entry to the
+   upstream names it now reads. That is a port, not fabrication.
+5. NEVER FABRICATE. Don't invent or hard-code values (no made-up address/host), don't write
+   a stub that returns nothing, and don't copy removed upstream code wholesale. Make no edit
+   (and say why in one sentence) only when no real upstream source is left to read from.
+6. Minimal diff, valid Python, no refactoring or reformatting. Never write a secret (API
    key, bearer, token) into any file.
 PROMPT
   # Name the exact files the AI may edit, in the prompt itself.

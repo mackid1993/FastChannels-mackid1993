@@ -5,12 +5,12 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
  the inserted-ad audio fix, wired in by one hook
 
 ---
- app/scrapers/directv_dai.py         | 1070 +++++++++++++++++++++++++++
- app/scrapers/directv_dai_device.py  |  231 ++++++
- app/scrapers/directv_dai_install.py | 1034 ++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py         | 1069 ++++++++++++++++++++++++++
+ app/scrapers/directv_dai_device.py  |  243 ++++++
+ app/scrapers/directv_dai_install.py | 1099 +++++++++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 ++
- app/scrapers/dtv_aac_gain.py        |  663 +++++++++++++++++
- 5 files changed, 3047 insertions(+)
+ app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++++++
+ 5 files changed, 3123 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -19,10 +19,10 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..7a8dc1c
+index 0000000..bfd947d
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,1070 @@
+@@ -0,0 +1,1069 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -587,8 +587,7 @@ index 0000000..7a8dc1c
 +
 +def _bridge_addresses() -> list[str]:
 +    try:
-+        from .. import bridge_devices
-+        return [d['address'] for d in bridge_devices.known_devices()[0] if d.get('address')]
++        return [d['address'] for d in device.known_bridge_devices()]
 +    except Exception as exc:
 +        logger.debug('[directv-dai] could not list bridge devices: %s', exc)
 +        return []
@@ -604,7 +603,7 @@ index 0000000..7a8dc1c
 +        from ..models import Source
 +        src = Source.query.filter_by(name='directv').first()
 +        if src:
-+            persist_source_cache_updates(src.id, {'directv_playback': {}})
++            persist_source_cache_updates(src.id, {'directv_playback': {}, 'dai_playback_by_device': {}})
 +    except Exception as exc:
 +        logger.debug('[directv-dai] could not clear playback cache after capture: %s', exc)
 +
@@ -1035,7 +1034,7 @@ index 0000000..7a8dc1c
 +    # The next tune opens a session with the new profid.
 +    try:
 +        from ..config_store import persist_source_cache_updates
-+        persist_source_cache_updates(source.id, {'directv_playback': {}})
++        persist_source_cache_updates(source.id, {'directv_playback': {}, 'dai_playback_by_device': {}})
 +    except Exception:
 +        logger.debug('[directv-dai] could not clear cached streams after the profile switch', exc_info=True)
 +
@@ -1086,7 +1085,7 @@ index 0000000..7a8dc1c
 +        return
 +    if enabled(old) != enabled(current):
 +        from ..config_store import persist_source_cache_updates
-+        persist_source_cache_updates(source.id, {'directv_playback': {}})
++        persist_source_cache_updates(source.id, {'directv_playback': {}, 'dai_playback_by_device': {}})
 +    if enabled(current):
 +        # Whenever DAI is saved on, capture the advertising id of any bridge device that
 +        # doesn't have one yet (all of them right after turning DAI on). Background, skipping
@@ -1095,10 +1094,10 @@ index 0000000..7a8dc1c
 +        capture_in_background(uncaptured_addresses())
 diff --git a/app/scrapers/directv_dai_device.py b/app/scrapers/directv_dai_device.py
 new file mode 100644
-index 0000000..cccc7ab
+index 0000000..50b91e0
 --- /dev/null
 +++ b/app/scrapers/directv_dai_device.py
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,243 @@
 +"""The bridge device a DirecTV DAI tune plays on: its identity and app User-Agent.
 +
 +DAI targets the playback device the way DirecTV's Android TV app does, so this reads
@@ -1257,11 +1256,23 @@ index 0000000..cccc7ab
 +    return address
 +
 +
++def known_bridge_devices() -> list[dict]:
++    """Every bridge device upstream knows (HDMI Capture, ah4c tuners, remembered boxes) as
++    [{'address': 'host:port', 'host': 'host'}]. The overlay's only read of upstream's
++    device list, so if upstream reshapes it, this is the one place to adapt."""
++    from .. import bridge_devices
++    out = []
++    for d in bridge_devices.known_devices()[0]:
++        address = str((d or {}).get('address') or '').strip()
++        if address:
++            out.append({'address': address, 'host': str(d.get('host') or address.rsplit(':', 1)[0])})
++    return out
++
++
 +def _lookup_bridge_address(ip: str) -> str | None:
 +    try:
-+        from .. import bridge_devices
-+        return next((d['address'] for d in bridge_devices.known_devices()[0]
-+                     if d.get('host') == ip or d.get('address', '').split(':')[0] == ip), None)
++        return next((d['address'] for d in known_bridge_devices()
++                     if d['host'] == ip or d['address'].split(':')[0] == ip), None)
 +    except Exception as exc:
 +        logger.debug('[directv-dai] bridge device lookup failed: %s', exc)
 +        return None
@@ -1332,10 +1343,10 @@ index 0000000..cccc7ab
 +
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..5c466ed
+index 0000000..2f5d6c4
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,1034 @@
+@@ -0,0 +1,1099 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
@@ -1374,6 +1385,7 @@ index 0000000..5c466ed
 +
 +import contextvars
 +import functools
++import hashlib
 +import inspect
 +import logging
 +import re
@@ -1428,6 +1440,11 @@ index 0000000..5c466ed
 +_FETCH_ARGS = ('bearer_token', 'ccid')
 +
 +_CHANNEL_AUTH_V2 = 'https://api.cld.dtvce.com/right/authorization/channel/v2'
++# Each bridge device's own DAI session per channel ({address: {ccid: entry}}), beside
++# upstream's per-channel directv_playback, so two boxes on one channel don't keep
++# replacing each other's session (each needs its own: the device id is in the URL).
++DEVICE_SESSIONS = 'dai_playback_by_device'
++_DEVICE_SESSION_TTL = 3600
 +_ABS_URL = re.compile(r'https?://[^\s"]+')
 +
 +# The scraper (config + channel names + a result slot) behind the current
@@ -1645,6 +1662,11 @@ index 0000000..5c466ed
 +                # session) are left alone.
 +                ccid = _ccid(raw_url)
 +                playback = self.cache.get('directv_playback') or {}
++                if dai:
++                    mine = _device_session(self.cache, self.config, ccid)
++                    if mine:   # this box's own session: upstream's cache check reuses it
++                        playback = {**playback, ccid: mine}
++                        self.cache['directv_playback'] = playback
 +                cached = playback.get(ccid)
 +                if isinstance(cached, dict) and not directv_dai.cached_url_usable(cached, dai):
 +                    self.cache['directv_playback'] = {k: v for k, v in playback.items() if k != ccid}
@@ -1660,6 +1682,8 @@ index 0000000..5c466ed
 +            if dai:
 +                try:
 +                    _check_tune(self, raw_url, url, state)
++                    if state.get('dai'):
++                        _save_device_session(self, _ccid(raw_url))
 +                except Exception:
 +                    logger.exception('[directv-dai] tune check failed')
 +            return url
@@ -1679,7 +1703,17 @@ index 0000000..5c466ed
 +            def prepare_license_request(klass, *a, **kw):
 +                config = None
 +                try:
-+                    config = lic_sig.bind(klass, *a, **kw).arguments.get('config')
++                    bound = lic_sig.bind(klass, *a, **kw)
++                    config = bound.arguments.get('config')
++                    channel_id = bound.arguments.get('channel_id')
++                    # The license must carry the play token of the session THIS box plays.
++                    mine = (_device_session(config, config, str(channel_id))
++                            if channel_id and directv_dai.enabled(config) else None)
++                    if mine:
++                        config = {**config, 'directv_playback': {**(config.get('directv_playback') or {}),
++                                                                 str(channel_id): mine}}
++                        bound.arguments['config'] = config
++                        a, kw = bound.args[1:], bound.kwargs
 +                except Exception:
 +                    logger.exception('[directv-dai] could not read the license request config')
 +                token = _TUNE.set((config, None, {'called': False, 'dai': False}) if config else None)
@@ -1754,6 +1788,38 @@ index 0000000..5c466ed
 +                logger.exception('[directv-dai] could not store the DAI login values')
 +            return out
 +        directv.apply_auth_result = _wraps(orig_apply, apply_auth_result)
++
++
++def _bearer_tag(config) -> str:
++    """Ties a saved session to the sign-in it was made with (a new token = new sessions)."""
++    return hashlib.sha256(str((config or {}).get('bearer_token') or '').encode()).hexdigest()[:12]
++
++
++def _device_session(cache, config, ccid: str) -> dict | None:
++    """The requesting bridge box's own saved DAI session for this channel, if still good."""
++    from . import directv_dai
++    address = directv_dai._current_bridge_address()
++    mine = (((cache or {}).get(DEVICE_SESSIONS) or {}).get(address) or {}).get(ccid) if address else None
++    if (not isinstance(mine, dict) or mine.get('bearer_tag') != _bearer_tag(config)
++            or time.time() - float(mine.get('cached_at') or 0) > _DEVICE_SESSION_TTL
++            or not directv_dai.cached_url_usable(mine, True)):
++        return None
++    return {k: v for k, v in mine.items() if k != 'bearer_tag'}
++
++
++def _save_device_session(scraper, ccid: str) -> None:
++    """After a tune made a new DAI session, keep it under this box too (expired ones pruned)."""
++    from . import directv_dai
++    address = directv_dai._current_bridge_address()
++    entry = (scraper.cache.get('directv_playback') or {}).get(ccid)
++    if not address or not isinstance(entry, dict) or not entry.get('dai'):
++        return
++    now = time.time()
++    store = {a: {c: e for c, e in (m or {}).items()
++                 if isinstance(e, dict) and now - float(e.get('cached_at') or 0) <= _DEVICE_SESSION_TTL}
++             for a, m in (scraper.cache.get(DEVICE_SESSIONS) or {}).items()}
++    store.setdefault(address, {})[ccid] = {**entry, 'bearer_tag': _bearer_tag(scraper.config)}
++    scraper._update_cache(DEVICE_SESSIONS, {a: m for a, m in store.items() if m})
 +
 +
 +def _ccid(raw_url) -> str:
@@ -2000,11 +2066,21 @@ index 0000000..5c466ed
 +        try:
 +            from sqlalchemy import inspect as sa_inspect
 +            from ..models import Source
-+            if sa_inspect(db.engine).has_table(Source.__tablename__):
-+                migrate_old_sessions()
-+                done[0] = True
++            ready = sa_inspect(db.engine).has_table(Source.__tablename__)
 +        except Exception:
-+            logger.debug('[directv-dai] session re-tag not run yet', exc_info=True)
++            logger.debug('[directv-dai] database not ready; session re-tag deferred', exc_info=True)
++            return
++        if not ready:
++            return
++        try:
++            migrate_old_sessions()
++            done[0] = True
++            _failed[:] = [f for f in _failed if not f.startswith('migrate_old_sessions')]
++        except Exception:
++            # Reported (status()/the panel): an old 'dtv_android' session that isn't
++            # re-tagged won't refresh through upstream's code sign-in.
++            _fail("migrate_old_sessions (an old 'dtv_android' sign-in could not be re-tagged; see the server log)")
++            logger.exception('[directv-dai] could not re-tag the old overlay sign-in')
 +            try:
 +                db.session.rollback()
 +            except Exception:

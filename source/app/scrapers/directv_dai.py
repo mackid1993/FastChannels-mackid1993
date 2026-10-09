@@ -562,8 +562,7 @@ def _capture_and_store(address: str) -> str:
 
 def _bridge_addresses() -> list[str]:
     try:
-        from .. import bridge_devices
-        return [d['address'] for d in bridge_devices.known_devices()[0] if d.get('address')]
+        return [d['address'] for d in device.known_bridge_devices()]
     except Exception as exc:
         logger.debug('[directv-dai] could not list bridge devices: %s', exc)
         return []
@@ -579,7 +578,7 @@ def _bust_playback_cache() -> None:
         from ..models import Source
         src = Source.query.filter_by(name='directv').first()
         if src:
-            persist_source_cache_updates(src.id, {'directv_playback': {}})
+            persist_source_cache_updates(src.id, {'directv_playback': {}, 'dai_playback_by_device': {}})
     except Exception as exc:
         logger.debug('[directv-dai] could not clear playback cache after capture: %s', exc)
 
@@ -1010,7 +1009,7 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
     # The next tune opens a session with the new profid.
     try:
         from ..config_store import persist_source_cache_updates
-        persist_source_cache_updates(source.id, {'directv_playback': {}})
+        persist_source_cache_updates(source.id, {'directv_playback': {}, 'dai_playback_by_device': {}})
     except Exception:
         logger.debug('[directv-dai] could not clear cached streams after the profile switch', exc_info=True)
 
@@ -1061,7 +1060,7 @@ def clear_cache_if_toggled(source, old: dict, current: dict) -> None:
         return
     if enabled(old) != enabled(current):
         from ..config_store import persist_source_cache_updates
-        persist_source_cache_updates(source.id, {'directv_playback': {}})
+        persist_source_cache_updates(source.id, {'directv_playback': {}, 'dai_playback_by_device': {}})
     if enabled(current):
         # Whenever DAI is saved on, capture the advertising id of any bridge device that
         # doesn't have one yet (all of them right after turning DAI on). Background, skipping

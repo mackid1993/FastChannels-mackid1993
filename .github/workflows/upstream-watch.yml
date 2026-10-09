@@ -63,6 +63,8 @@ jobs:
         run: |
           echo "New $UPSTREAM_BRANCH commit ${{ steps.head.outputs.sha }} — running a drift check; the agent fixes it if it drifts."
           gh workflow run build.yml --repo "$GITHUB_REPOSITORY" -f upstream_branch="$UPSTREAM_BRANCH" -f drift_only=true
+          # The full image test (smoke + boot) on the same commit; test only, no AI.
+          gh workflow run test-development.yml --repo "$GITHUB_REPOSITORY" -f upstream_ref="${{ steps.head.outputs.sha }}"
           # Mark seen only after a successful dispatch, so a failed dispatch is retried.
           mkdir -p .dev-watch-marker
           echo "${{ steps.head.outputs.sha }}" > .dev-watch-marker/sha

@@ -85,10 +85,9 @@ assert callable(getattr(BaseScraper, '_update_cache', None)), 'BaseScraper._upda
 assert isinstance(inspect.getattr_static(BaseScraper, 'cache'), property), 'BaseScraper.cache is no longer a property'
 # The device ad id reads upstream's bridge-device list; if it's renamed or reshaped the
 # patch would silently fall back to national-only ads, so fail the build instead.
-from app import bridge_devices  # noqa: E402
-assert callable(getattr(bridge_devices, 'known_devices', None)), 'bridge_devices.known_devices is gone'
-assert 'address' in inspect.getsource(bridge_devices.known_devices) and 'host' in inspect.getsource(bridge_devices.known_devices), \
-    'bridge_devices.known_devices no longer returns address/host entries'
+# (The overlay reads it only through directv_dai_device.known_bridge_devices(); the end-to-end
+# section below checks that returns a registered box.)
+assert callable(getattr(device, 'known_bridge_devices', None)), 'directv_dai_device.known_bridge_devices is gone'
 
 # The toggle is our panel's (config['use_dai']), not in upstream's schema; Yospace takes the relay.
 keys = [field.key for field in directv.DirectvScraper.config_schema]
@@ -541,6 +540,34 @@ try:
         sc.resolve('directv://123/res')
         assert '999' in sc.cache['directv_playback'], "a tune dropped another channel's cached session"
         assert 'directv_playback' not in sc._pending_cache_updates, 'a cache hit saved a cache rewrite'
+        # (e3) Two boxes on one channel each keep their own DAI session (each has its own
+        # device id in the URL): once both have tuned, re-tuning either reuses its own (no
+        # new authorization), and each box's license request carries its own play token.
+        _real_cba, _real_cdf = dai._current_bridge_address, dai._current_device_ad_flags
+        _box = {'addr': ''}
+        dai._current_bridge_address = lambda: _box['addr']
+        dai._current_device_ad_flags = lambda: {
+            'is_lat': '0', '_fw_did': 'android_id:' + _box['addr'].replace('.', '').replace(':', '').ljust(16, '0')}
+        try:
+            sc._cache = {}
+            _boxes = (('10.0.0.1:5555', 'PT-A'), ('10.0.0.2:5555', 'PT-B'))
+            for _addr, _tok in _boxes:
+                _box['addr'] = _addr
+                _Session.reply = _Resp(data={**_v2_ok, 'dRights': {'playToken': _tok}})
+                sc.resolve('directv://123/res')
+            _Session.calls.clear()
+            for _addr, _tok in _boxes:
+                _box['addr'] = _addr
+                _u = sc.resolve('directv://123/res')
+                assert dai._current_device_ad_flags()['_fw_did'] in _u, f'box {_addr} got another box\'s session'
+            assert not _Session.calls, f'a box re-authorized although its own DAI session was saved: {_Session.calls}'
+            _lic_cfg = {**sc.config, **sc.cache}
+            for _addr, _tok in _boxes:
+                _box['addr'] = _addr
+                _body, _ = directv.DirectvScraper.prepare_license_request(b'challenge', _lic_cfg, channel_id='123')
+                assert json.loads(_body)['authorizationToken'] == _tok, f'box {_addr} licensed with another session\'s token'
+        finally:
+            dai._current_bridge_address, dai._current_device_ad_flags = _real_cba, _real_cdf
 finally:
     directv.requests.Session = _real_session
 
@@ -709,6 +736,17 @@ try:
         assert db.session.get(Source, _sid).config['auth_method'] == directv_device_auth.AUTH_METHOD, \
             "an old overlay session was not re-tagged as upstream's code sign-in"
         assert directv_device_auth.is_device_session(db.session.get(Source, _sid).config)
+    # The overlay's one read of upstream's bridge-device list returns a registered box.
+    with app.app_context():
+        from app import models as _models  # noqa: E402
+        if hasattr(_models, 'BridgeDevice'):
+            db.session.add(_models.BridgeDevice(address='10.0.0.9:5555', added_manually=True))
+            db.session.commit()
+        _devs = device.known_bridge_devices()
+        assert all(d.get('address') and d.get('host') for d in _devs), _devs
+        if hasattr(_models, 'BridgeDevice'):
+            assert any(d['address'] == '10.0.0.9:5555' and d['host'] == '10.0.0.9' for d in _devs), \
+                f'known_bridge_devices() misses a registered bridge device: {_devs}'
     _pg = _client.get(f'/api/sources/{_sid}/directv-dai')
     assert _pg.status_code == 200 and _pg.get_json()['code_signed_in'] is True and _pg.get_json()['use_dai'] is False, _pg.get_data()
     assert _client.post(f'/api/sources/{_sid}/directv-dai', data={'use_dai': 'true'}).status_code == 415, \

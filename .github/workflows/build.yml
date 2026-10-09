@@ -80,6 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       conflict: ${{ steps.apply.outputs.conflict }}
+      hook_failed: ${{ steps.apply.outputs.hook_failed }}
       sha: ${{ steps.inputs.outputs.sha }}
       short: ${{ steps.inputs.outputs.short }}
       apk: ${{ steps.inputs.outputs.apk }}
@@ -168,7 +169,10 @@ jobs:
         continue-on-error: true
         # Exit 3 = the DAI hook line couldn't be placed in create_app: not a patch conflict
         # (the build fails and reports it; scripts/insert_hook.py needs a human update).
-        run: overlay/scripts/apply-patches.sh upstream || { rc=$?; [ "$rc" = 3 ] || echo "conflict=true" >> "$GITHUB_OUTPUT"; exit 1; }
+        run: |
+          overlay/scripts/apply-patches.sh upstream && exit 0
+          if [ $? = 3 ]; then echo "hook_failed=true" >> "$GITHUB_OUTPUT"; else echo "conflict=true" >> "$GITHUB_OUTPUT"; fi
+          exit 1
 
       - name: Report a patch conflict
         if: steps.skip.outputs.skip != 'true' && steps.apply.outputs.conflict == 'true' && env.TEST_RUN != 'true'
@@ -322,12 +326,13 @@ jobs:
           echo "Posted to the persistent 'Build notifications' issue."
 
       - name: Report a failed build
-        if: failure() && steps.apply.outcome != 'failure' && env.TEST_RUN != 'true'
+        if: failure() && steps.apply.outputs.conflict != 'true' && env.TEST_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          HOOK_FAILED: ${{ steps.apply.outputs.hook_failed }}
         run: |
           cat > body.md <<BODY
-          Upstream \`${{ steps.inputs.outputs.short }}\` with the patches failed a check (the patch applied cleanly — this isn't a merge conflict). No image was published; \`:latest\` still points at the last good build.
+          Upstream \`${{ steps.inputs.outputs.short }}\` with the patches failed a check (this isn't a merge conflict). No image was published; \`:latest\` still points at the last good build.
 
           On the unattended scheduled runs an AI tries to fix this automatically: it reproduces the failing check, adapts the patch to upstream's current code (editing only the patch's own files), and must pass a full image build, Player APK check, smoke test and boot test before anything is merged and published. If it can't, you'll get a comment here. (A failure from a manual run isn't auto-fixed — re-run on schedule or fix by hand.) Until this is resolved the daily drift check does a full build instead, so a one-off failure is retried daily.
 
@@ -335,6 +340,9 @@ jobs:
 
           cc @${{ github.repository_owner }}
           BODY
+          if [ "$HOOK_FAILED" = true ]; then
+            printf '\n**The DAI hook line could not be placed in upstream'"'"'s `create_app`** (he changed the app factory'"'"'s shape). This needs a human: update `scripts/insert_hook.py` to where the app is returned now. The AI repair does not run for this.\n' >> body.md
+          fi
           overlay/scripts/issue.sh open "$FAILED_TITLE" body.md
 
       - name: Keep the schedule alive
@@ -613,7 +621,8 @@ jobs:
     needs: build
     if: >-
       always() && needs.build.result == 'failure' &&
-      needs.build.outputs.conflict != 'true' && needs.build.outputs.sha != '' &&
+      needs.build.outputs.conflict != 'true' && needs.build.outputs.hook_failed != 'true' &&
+      needs.build.outputs.sha != '' &&
       (github.event_name == 'schedule' ||
        (github.event_name == 'workflow_dispatch' &&
         ((inputs.upstream_repo || '') != '' || (inputs.upstream_branch || '') != '')))

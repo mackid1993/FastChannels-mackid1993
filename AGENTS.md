@@ -50,7 +50,7 @@ If either path can't produce a passing fix, `ai-failed` comments on the matching
 Two more workflows keep the whole thing hands-off by fixing drift *before* it reaches a release:
 
 - **`upstream-watch.yml`** polls kineticman's `development` branch every 6 hours. On a new commit (deduped via the Actions cache) it dispatches `build.yml` in drift-check mode against development (`upstream_branch=development`, `drift_only=true`). Because `upstream_branch` is set, that run is a test run: it never builds an image, publishes, refreshes the patch, or merges. If the patch drifts there, the AI adapts it and `open-pr` opens a **held** PR (branch `auto/drift-*`). That's the agent's prepared fix, left open and worded as FYI, not "merge me".
-- **`test-development.yml`** runs the full gauntlet (static checks, image, APK, smoke, boot) against `development` on every push here, daily, and by hand (any upstream ref). Test only: no publish, no commits, no AI. It's how a change here is proven on his newest code while `main` builds wait.
+- **`test-development.yml`** runs the full gauntlet (static checks, image, APK, smoke, boot) against `development` on every push here, on each new development commit (dispatched by `upstream-watch.yml`), and by hand (any upstream ref). Test only: no publish, no commits, no AI. It's how a change here is proven on his newest code while `main` builds wait.
 - **`reconcile-drift.yml`** polls every 6 hours. For each open `auto/drift-*` PR it re-tests that PR's patch against the *current* upstream `main`. The moment a fix is proven valid for production, it merges the PR and dispatches the publishing build, which re-runs the full gauntlet, so a wrong fix can't reach `:latest`. It merges at most one per run and shares the `build` concurrency group so it can't race a publish.
 
 **Wait gate (2026-10-08):** `build.yml`'s skip step skips any upstream commit that lacks `app/scrapers/directv_device_auth.py` (his code sign-in, development-only for now), with a notice, so `main` builds wait for his release instead of failing into AI repair. Delete the gate once `main` has the file.
@@ -89,9 +89,9 @@ What the overlay relies on in upstream, all listed at the top of `directv_dai_in
 
 | Upstream name | Kind | What it's for |
 |---|---|---|
-| `directv.DirectvScraper.resolve` | wrap | Drops a cached URL from the other DAI setting (or another device), runs upstream's resolve with the scraper as the tune context (a `ContextVar`), then records whether the tune really got DAI. |
+| `directv.DirectvScraper.resolve` | wrap | Offers the requesting box its own saved DAI session for the channel (`dai_playback_by_device`), else drops a cached URL from the other DAI setting or another box (that channel only, in memory); runs upstream's resolve with the scraper as the tune context (a `ContextVar`); records whether the tune really got DAI and saves a new session under the box. |
 | `directv._fetch_channel_playback` | wrap | With DAI flags for this tune, makes the Android TV app's `channel/v2` request (`_fetch_dai_playback`) and returns upstream's dict shape plus `'dai': True`. Raises upstream's `DirectvAuthExpiredError` on `0015`; any other failure falls back to upstream's v1 request. Arguments bound by name (`bearer_token`, `cookies`, `client_context`, `ccid`); a missing one is reported. |
-| `directv.DirectvScraper.prepare_license_request` (classmethod) | wrap | The same tune context for the license path's fallback fetch. |
+| `directv.DirectvScraper.prepare_license_request` (classmethod) | wrap | The same tune context for the license path's fallback fetch, and the requesting box's own DAI session (play token) when it has one. |
 | `directv.DirectvScraper._fetch_allchannels_rows` | wrap | Records each row's `daiChannelName` (the `net` flag). |
 | `directv.apply_auth_result` | wrap | After upstream writes the session, `store_login_result` adds the DAI account values (DMA/ZIP/GPP fetched with the bearer, DAI on only; hhid/u). |
 | `directv_device_auth._result` | wrap | Carries `valuePairs.partnerProfileId`/`profileId` into the result (upstream keeps only the activation token). |

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import contextvars
 import functools
+import hashlib
 import inspect
 import logging
 import re
@@ -90,6 +91,11 @@ SOURCE_MARKERS = (
 _FETCH_ARGS = ('bearer_token', 'ccid')
 
 _CHANNEL_AUTH_V2 = 'https://api.cld.dtvce.com/right/authorization/channel/v2'
+# Each bridge device's own DAI session per channel ({address: {ccid: entry}}), beside
+# upstream's per-channel directv_playback, so two boxes on one channel don't keep
+# replacing each other's session (each needs its own: the device id is in the URL).
+DEVICE_SESSIONS = 'dai_playback_by_device'
+_DEVICE_SESSION_TTL = 3600
 _ABS_URL = re.compile(r'https?://[^\s"]+')
 
 # The scraper (config + channel names + a result slot) behind the current
@@ -307,6 +313,11 @@ def _patch_scraper() -> None:
                 # session) are left alone.
                 ccid = _ccid(raw_url)
                 playback = self.cache.get('directv_playback') or {}
+                if dai:
+                    mine = _device_session(self.cache, self.config, ccid)
+                    if mine:   # this box's own session: upstream's cache check reuses it
+                        playback = {**playback, ccid: mine}
+                        self.cache['directv_playback'] = playback
                 cached = playback.get(ccid)
                 if isinstance(cached, dict) and not directv_dai.cached_url_usable(cached, dai):
                     self.cache['directv_playback'] = {k: v for k, v in playback.items() if k != ccid}
@@ -322,6 +333,8 @@ def _patch_scraper() -> None:
             if dai:
                 try:
                     _check_tune(self, raw_url, url, state)
+                    if state.get('dai'):
+                        _save_device_session(self, _ccid(raw_url))
                 except Exception:
                     logger.exception('[directv-dai] tune check failed')
             return url
@@ -341,7 +354,17 @@ def _patch_scraper() -> None:
             def prepare_license_request(klass, *a, **kw):
                 config = None
                 try:
-                    config = lic_sig.bind(klass, *a, **kw).arguments.get('config')
+                    bound = lic_sig.bind(klass, *a, **kw)
+                    config = bound.arguments.get('config')
+                    channel_id = bound.arguments.get('channel_id')
+                    # The license must carry the play token of the session THIS box plays.
+                    mine = (_device_session(config, config, str(channel_id))
+                            if channel_id and directv_dai.enabled(config) else None)
+                    if mine:
+                        config = {**config, 'directv_playback': {**(config.get('directv_playback') or {}),
+                                                                 str(channel_id): mine}}
+                        bound.arguments['config'] = config
+                        a, kw = bound.args[1:], bound.kwargs
                 except Exception:
                     logger.exception('[directv-dai] could not read the license request config')
                 token = _TUNE.set((config, None, {'called': False, 'dai': False}) if config else None)
@@ -416,6 +439,38 @@ def _patch_scraper() -> None:
                 logger.exception('[directv-dai] could not store the DAI login values')
             return out
         directv.apply_auth_result = _wraps(orig_apply, apply_auth_result)
+
+
+def _bearer_tag(config) -> str:
+    """Ties a saved session to the sign-in it was made with (a new token = new sessions)."""
+    return hashlib.sha256(str((config or {}).get('bearer_token') or '').encode()).hexdigest()[:12]
+
+
+def _device_session(cache, config, ccid: str) -> dict | None:
+    """The requesting bridge box's own saved DAI session for this channel, if still good."""
+    from . import directv_dai
+    address = directv_dai._current_bridge_address()
+    mine = (((cache or {}).get(DEVICE_SESSIONS) or {}).get(address) or {}).get(ccid) if address else None
+    if (not isinstance(mine, dict) or mine.get('bearer_tag') != _bearer_tag(config)
+            or time.time() - float(mine.get('cached_at') or 0) > _DEVICE_SESSION_TTL
+            or not directv_dai.cached_url_usable(mine, True)):
+        return None
+    return {k: v for k, v in mine.items() if k != 'bearer_tag'}
+
+
+def _save_device_session(scraper, ccid: str) -> None:
+    """After a tune made a new DAI session, keep it under this box too (expired ones pruned)."""
+    from . import directv_dai
+    address = directv_dai._current_bridge_address()
+    entry = (scraper.cache.get('directv_playback') or {}).get(ccid)
+    if not address or not isinstance(entry, dict) or not entry.get('dai'):
+        return
+    now = time.time()
+    store = {a: {c: e for c, e in (m or {}).items()
+                 if isinstance(e, dict) and now - float(e.get('cached_at') or 0) <= _DEVICE_SESSION_TTL}
+             for a, m in (scraper.cache.get(DEVICE_SESSIONS) or {}).items()}
+    store.setdefault(address, {})[ccid] = {**entry, 'bearer_tag': _bearer_tag(scraper.config)}
+    scraper._update_cache(DEVICE_SESSIONS, {a: m for a, m in store.items() if m})
 
 
 def _ccid(raw_url) -> str:
@@ -662,11 +717,21 @@ def _register_migration(app) -> None:
         try:
             from sqlalchemy import inspect as sa_inspect
             from ..models import Source
-            if sa_inspect(db.engine).has_table(Source.__tablename__):
-                migrate_old_sessions()
-                done[0] = True
+            ready = sa_inspect(db.engine).has_table(Source.__tablename__)
         except Exception:
-            logger.debug('[directv-dai] session re-tag not run yet', exc_info=True)
+            logger.debug('[directv-dai] database not ready; session re-tag deferred', exc_info=True)
+            return
+        if not ready:
+            return
+        try:
+            migrate_old_sessions()
+            done[0] = True
+            _failed[:] = [f for f in _failed if not f.startswith('migrate_old_sessions')]
+        except Exception:
+            # Reported (status()/the panel): an old 'dtv_android' session that isn't
+            # re-tagged won't refresh through upstream's code sign-in.
+            _fail("migrate_old_sessions (an old 'dtv_android' sign-in could not be re-tagged; see the server log)")
+            logger.exception('[directv-dai] could not re-tag the old overlay sign-in')
             try:
                 db.session.rollback()
             except Exception:

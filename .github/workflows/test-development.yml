@@ -4,7 +4,8 @@ name: Test against upstream development
 # the full gauntlet (static checks, image build, Player APK check, smoke test, boot test).
 # It never publishes, never commits, never opens issues or PRs, and never calls the AI —
 # it just says whether the overlay works on his newest code. The release build (build.yml)
-# stays on his main; upstream-watch.yml keeps watching development for drift to auto-fix.
+# stays on his main. upstream-watch.yml dispatches this on every new development commit
+# (alongside its AI drift check), so there is no separate schedule here.
 
 on:
   push:
@@ -13,8 +14,6 @@ on:
       - "patches/**"
       - "scripts/**"
       - ".github/workflows/test-development.yml"
-  schedule:
-    - cron: "15 7 * * *"   # daily, so a development change that breaks the overlay shows up
   workflow_dispatch:
     inputs:
       upstream_ref:
