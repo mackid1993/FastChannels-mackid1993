@@ -803,4 +803,121 @@ try:
 finally:
     dai.list_profiles, dai.capture_in_background = _real_list, _real_capture
 
+# (m) The real Fire TV path, end to end. With DAI on, a tune of a DRM-bridge channel goes:
+# ah4c -> the server's /play/fc-player/directv/<ccid>.m3u8 -> FC Player is told to open the
+# SERVER's browser.m3u8 -> every playlist, segment and license request comes back through
+# the server, which applies the ad swap, the loudness cut and the app User-Agent. This
+# checks that whole walk: nothing in a playlist the player gets points straight at
+# DirecTV, the inserted ad is swapped and cut on the way through, live segments pass
+# through untouched, and every fetch to DirecTV carries the box's app User-Agent with the
+# DAI flags on the Yospace session. (Upstream's own bridge route is driven when its
+# names are there; if upstream reshapes it, that one step is skipped with a note, since
+# it isn't the overlay's code.)
+_m_master = ('#EXTM3U\n'
+             '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",CHANNELS="6",URI="audio.m3u8"\n'
+             '#EXT-X-STREAM-INF:BANDWIDTH=6500000,CODECS="avc1.640028,ac-3",AUDIO="aud"\n'
+             'video-1080.m3u8\n')
+_m_audio = ('#EXTM3U\n#EXT-X-TARGETDURATION:6\n'
+            '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://live"\n'
+            '#EXTINF:6.0,\nhttps://dfwlive-v2-c0p7-ms.directv.fastly-edge.com/live/seg-1.mp4\n'
+            '#EXT-X-KEY:METHOD=NONE\n'
+            '#EXT-X-MAP:URI="https://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/u-6600-c-384-1-i.mp4"\n'
+            '#EXTINF:6.0,\nhttps://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/u-6600-c-384-1-0.mp4\n')
+_m_yo = 'https://csm-e.tls1.yospace.com/csm/extlive/x/'
+_m_ad = 'https://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/u-6600-a-96-1-0.mp4'
+_m_live = 'https://dfwlive-v2-c0p7-ms.directv.fastly-edge.com/live/seg-1.mp4'
+_m_raw_ad, _m_live_bytes = b'\xff\xf1raw-ad', b'LIVE-ENCRYPTED-BYTES'
+_wire.update({
+    'https://api.cld.dtvce.com/right/authorization/channel/v2': (200, 'application/json', json.dumps(_v2_ok).encode()),
+    _m_yo + 'master.m3u8': (200, 'application/vnd.apple.mpegurl', _m_master.encode()),
+    _m_yo + 'audio.m3u8': (200, 'application/vnd.apple.mpegurl', _m_audio.encode()),
+    _m_ad: (200, 'video/mp4', _m_raw_ad),
+    _m_live: (200, 'video/mp4', _m_live_bytes),
+})
+_BOX = {'REMOTE_ADDR': '10.0.0.9'}
+_real_att = dtv_aac_gain.attenuate_ad_segment
+_cut = []
+_HTTPAdapter.send, device._client_device = _fake_send, (lambda: fire)
+dtv_aac_gain.attenuate_ad_segment = lambda data, *a, **k: (_cut.append(data) or b'CUT:' + data)
+try:
+    with app.app_context():
+        _s = db.session.get(Source, _sid)
+        _s.config = {**(_s.config or {}), 'use_dai': 'true'}
+        _ch = Channel.query.filter_by(source_id=_sid, source_channel_id='123').first()
+        if hasattr(_ch, 'requires_drm_bridge'):
+            _ch.requires_drm_bridge = True
+        db.session.commit()
+    dai._DAI_ON[0] = 0.0
+    from app.config_store import persist_source_cache_updates as _pscu  # noqa: E402
+    with app.app_context():
+        _pscu(_sid, {'directv_playback': {}, 'dai_playback_by_device': {}})
+
+    # 1. The bridge hands FC Player the server's own browser.m3u8 (not a DirecTV URL).
+    _manifest = '/play/directv/123/browser.m3u8'
+    try:
+        from app import fc_player_bridge as _fcb  # noqa: E402
+        from app.models import AppSettings as _AS  # noqa: E402
+        _given = {}
+        _orig_fcb = (_fcb.trigger_channel, _fcb.hardware_bridge_active)
+        _fcb.trigger_channel = lambda manifest_url, license_url=None, **kw: (_given.update(url=manifest_url, lic=license_url) or True)
+        _fcb.hardware_bridge_active = lambda *a, **k: True
+        _orig_enc = _AS.effective_fc_player_bridge_encoder_url
+        _AS.effective_fc_player_bridge_encoder_url = lambda self: 'http://encoder.local/stream1'
+        try:
+            _client.get('/play/fc-player/directv/123.m3u8?adb=10.0.0.9:5555', environ_base=_BOX)
+        finally:
+            _fcb.trigger_channel, _fcb.hardware_bridge_active = _orig_fcb
+            _AS.effective_fc_player_bridge_encoder_url = _orig_enc
+        if _given.get('url'):
+            _parts = urlsplit(_given['url'])
+            assert _parts.path.startswith('/play/directv/'), f'the bridge no longer hands FC Player a server URL: {_given["url"]}'
+            _manifest = _parts.path + (f'?{_parts.query}' if _parts.query else '')
+        else:
+            print('note: upstream\'s bridge route did not trigger in the throwaway setup; walking from browser.m3u8')
+    except (ImportError, AttributeError) as _exc:
+        print(f'note: upstream\'s bridge route changed shape ({_exc}); walking from browser.m3u8')
+
+    def _lines_and_uris(text):
+        uris = [m for m in __import__('re').findall(r'URI="([^"]+)"', text)]
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith('#')]
+        return lines + [u for u in uris if not u.startswith('skd://')]
+
+    # 2. The master the player gets: every reference goes back through the server.
+    _wire_log.clear()
+    _mr = _client.get(_manifest, environ_base=_BOX)
+    assert _mr.status_code == 200, (_mr.status_code, _mr.get_data()[:200])
+    _mtext = _mr.get_data(as_text=True)
+    _refs = _lines_and_uris(_mtext)
+    assert _refs and all(r.startswith('/') for r in _refs), f'the master points the player straight at DirecTV: {_refs}'
+    _yo_req = next(u for u, _ in _wire_log if u.startswith(_m_yo + 'master.m3u8'))
+    _q = parse_qs(urlsplit(_yo_req).query)
+    for _k, _v in (('d', 'android_tv'), ('yospace.pool', 'livepause'), ('is_lat', '0'), ('dma_location', '501')):
+        assert _q.get(_k) == [_v], f'the Yospace session lost {_k}={_v}: {_q.get(_k)}'
+    assert _q.get('_fw_did') and _q.get('comscore_device') == ['Android_Amazon_AFTKRT'], _q
+
+    # 3. The audio playlist: the inserted AC-3 ad (and its init) became the AAC twin, and
+    # everything, live and ad, still goes through the server.
+    _audio_ref = next(r for r in _refs if 'audio.m3u8' in __import__('urllib.parse').parse.unquote(r))
+    _atext = _client.get(_audio_ref, environ_base=_BOX).get_data(as_text=True)
+    _arefs = _lines_and_uris(_atext)
+    assert all(r.startswith('/') for r in _arefs), f'the audio playlist points the player straight at DirecTV: {_arefs}'
+    assert 'u-6600-c-384' not in _atext and 'u-6600-a-96-1-0.mp4' in _atext and 'u-6600-a-96-1-i.mp4' in _atext, _atext
+    _ad_ref = next(r for r in _arefs if 'u-6600-a-96-1-0.mp4' in r)
+    _live_ref = next(r for r in _arefs if 'seg-1.mp4' in r)
+
+    # 4. The ad segment comes back cut (once); 5. the live segment comes back untouched.
+    _wire_log.clear()
+    assert _client.get(_ad_ref, environ_base=_BOX).get_data() == b'CUT:' + _m_raw_ad, 'the ad segment was not cut on the server'
+    assert _cut == [_m_raw_ad], f'the loudness cut must run exactly once: {_cut}'
+    assert _client.get(_live_ref, environ_base=_BOX).get_data() == _m_live_bytes, 'a live segment was altered'
+
+    # 6. Every fetch the server made to DirecTV on the player's behalf carried the box's
+    # app User-Agent.
+    for _u, _h in _wire_log:
+        assert (_h.get('User-Agent') or '').startswith('APP_PROJECT_NAME/'), f'{_u} went out without the app User-Agent'
+    assert install.runtime_warnings() == [], install.runtime_warnings()
+finally:
+    _HTTPAdapter.send, device._client_device = _real_send, _real_client_device
+    dtv_aac_gain.attenuate_ad_segment = _real_att
+
 print('Overlay smoke test passed.')
