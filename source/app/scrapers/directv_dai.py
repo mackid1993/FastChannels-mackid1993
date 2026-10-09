@@ -112,8 +112,7 @@ def dai_on() -> bool:
         return _DAI_ON[1]
     try:
         from ..models import Source
-        src = Source.query.filter_by(name='directv').first()
-        on = bool(src is not None and enabled(src.config))
+        on = any(enabled(src.config) for src in Source.query.filter_by(name='directv').all())
     except Exception:
         on = _DAI_ON[1]
     _DAI_ON[:] = [now + _DAI_ON_TTL, on]
@@ -601,31 +600,14 @@ def capture_registered_devices(addresses: list[str] | None = None) -> dict:
 
 
 def capture_in_background(addresses: list[str] | None = None) -> int:
-    """Run capture_registered_devices in a daemon thread, carrying the current Flask app
-    context into it (the thread needs one for the DB-backed device list and the store
-    path). Resolves the device list in the calling request thread. Returns how many
-    devices it will visit."""
-    try:
-        from flask import current_app
-        app = current_app._get_current_object()
-    except Exception:
-        app = None
+    """Run capture_registered_devices in a daemon thread with the current Flask app
+    context (the device list and the store need one). Resolves the device list in the
+    calling request thread. Returns how many devices it will visit."""
     if addresses is None:
         addresses = _bridge_addresses()
     addresses = list(addresses or [])
-    if not addresses:
-        return 0
-
-    def _run():
-        try:
-            if app is not None:
-                with app.app_context():
-                    capture_registered_devices(addresses)
-            else:
-                capture_registered_devices(addresses)
-        except Exception as exc:
-            logger.warning('[directv-dai] background capture failed: %s', exc)
-    threading.Thread(target=_run, daemon=True).start()
+    if addresses:
+        device.spawn(capture_registered_devices, addresses)
     return len(addresses)
 
 
@@ -980,7 +962,6 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
         return {'ok': False, 'profid': False, 'error': 'no refresh token: sign in first'}
 
     from ..extensions import db
-    from ..models import SourceCache
     rdb = _redis()
     lock_key = f'directv:auth:refreshing:{source.name}'
     have_lock = True
@@ -1012,7 +993,6 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
             if new_refresh:
                 fresh['refresh_token'] = new_refresh
             source.config = fresh
-            SourceCache.query.filter_by(source_id=source.id, cache_key='directv_playback').delete()
             db.session.commit()
         except Exception:
             try:
@@ -1027,6 +1007,12 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
                 rdb.delete(lock_key)
             except Exception:
                 pass
+    # The next tune opens a session with the new profid.
+    try:
+        from ..config_store import persist_source_cache_updates
+        persist_source_cache_updates(source.id, {'directv_playback': {}})
+    except Exception:
+        logger.debug('[directv-dai] could not clear cached streams after the profile switch', exc_info=True)
 
     who = (profile_name or '').strip() or 'the selected profile'
     if profid:
@@ -1046,7 +1032,7 @@ def settings_changed(source, old: dict, current: dict) -> None:
     _DAI_ON[0] = 0.0
     clear_cache_if_toggled(source, old, current)
     if enabled(current) and not current.get('dai_dma_id') and current.get('bearer_token'):
-        _in_background(_fetch_missing_account_context, source.id)
+        device.spawn(_fetch_missing_account_context, source.id)
 
 
 def _fetch_missing_account_context(source_id: int) -> None:
@@ -1066,26 +1052,6 @@ def _fetch_missing_account_context(source_id: int) -> None:
     if updates:
         persist_source_config_updates(source_id, updates)
         logger.info('[directv-dai] fetched the account targeting values (%s)', ', '.join(sorted(updates)))
-
-
-def _in_background(fn, *args) -> None:
-    """Run fn in a daemon thread with the current Flask app context."""
-    try:
-        from flask import current_app
-        app = current_app._get_current_object()
-    except Exception:
-        app = None
-
-    def _run():
-        try:
-            if app is not None:
-                with app.app_context():
-                    fn(*args)
-            else:
-                fn(*args)
-        except Exception as exc:
-            logger.warning('[directv-dai] background %s failed: %s', getattr(fn, '__name__', 'task'), exc)
-    threading.Thread(target=_run, daemon=True).start()
 
 
 def clear_cache_if_toggled(source, old: dict, current: dict) -> None:

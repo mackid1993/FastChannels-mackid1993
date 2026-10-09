@@ -5,12 +5,12 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
  the inserted-ad audio fix, wired in by one hook
 
 ---
- app/scrapers/directv_dai.py         | 1104 +++++++++++++++++++++++++++
- app/scrapers/directv_dai_device.py  |  224 ++++++
- app/scrapers/directv_dai_install.py | 1004 ++++++++++++++++++++++++
+ app/scrapers/directv_dai.py         | 1070 +++++++++++++++++++++++++++
+ app/scrapers/directv_dai_device.py  |  231 ++++++
+ app/scrapers/directv_dai_install.py | 1034 ++++++++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 ++
- app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++++++
- 5 files changed, 3044 insertions(+)
+ app/scrapers/dtv_aac_gain.py        |  663 +++++++++++++++++
+ 5 files changed, 3047 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -19,10 +19,10 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..dcf417d
+index 0000000..7a8dc1c
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,1104 @@
+@@ -0,0 +1,1070 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -137,8 +137,7 @@ index 0000000..dcf417d
 +        return _DAI_ON[1]
 +    try:
 +        from ..models import Source
-+        src = Source.query.filter_by(name='directv').first()
-+        on = bool(src is not None and enabled(src.config))
++        on = any(enabled(src.config) for src in Source.query.filter_by(name='directv').all())
 +    except Exception:
 +        on = _DAI_ON[1]
 +    _DAI_ON[:] = [now + _DAI_ON_TTL, on]
@@ -626,31 +625,14 @@ index 0000000..dcf417d
 +
 +
 +def capture_in_background(addresses: list[str] | None = None) -> int:
-+    """Run capture_registered_devices in a daemon thread, carrying the current Flask app
-+    context into it (the thread needs one for the DB-backed device list and the store
-+    path). Resolves the device list in the calling request thread. Returns how many
-+    devices it will visit."""
-+    try:
-+        from flask import current_app
-+        app = current_app._get_current_object()
-+    except Exception:
-+        app = None
++    """Run capture_registered_devices in a daemon thread with the current Flask app
++    context (the device list and the store need one). Resolves the device list in the
++    calling request thread. Returns how many devices it will visit."""
 +    if addresses is None:
 +        addresses = _bridge_addresses()
 +    addresses = list(addresses or [])
-+    if not addresses:
-+        return 0
-+
-+    def _run():
-+        try:
-+            if app is not None:
-+                with app.app_context():
-+                    capture_registered_devices(addresses)
-+            else:
-+                capture_registered_devices(addresses)
-+        except Exception as exc:
-+            logger.warning('[directv-dai] background capture failed: %s', exc)
-+    threading.Thread(target=_run, daemon=True).start()
++    if addresses:
++        device.spawn(capture_registered_devices, addresses)
 +    return len(addresses)
 +
 +
@@ -1005,7 +987,6 @@ index 0000000..dcf417d
 +        return {'ok': False, 'profid': False, 'error': 'no refresh token: sign in first'}
 +
 +    from ..extensions import db
-+    from ..models import SourceCache
 +    rdb = _redis()
 +    lock_key = f'directv:auth:refreshing:{source.name}'
 +    have_lock = True
@@ -1037,7 +1018,6 @@ index 0000000..dcf417d
 +            if new_refresh:
 +                fresh['refresh_token'] = new_refresh
 +            source.config = fresh
-+            SourceCache.query.filter_by(source_id=source.id, cache_key='directv_playback').delete()
 +            db.session.commit()
 +        except Exception:
 +            try:
@@ -1052,6 +1032,12 @@ index 0000000..dcf417d
 +                rdb.delete(lock_key)
 +            except Exception:
 +                pass
++    # The next tune opens a session with the new profid.
++    try:
++        from ..config_store import persist_source_cache_updates
++        persist_source_cache_updates(source.id, {'directv_playback': {}})
++    except Exception:
++        logger.debug('[directv-dai] could not clear cached streams after the profile switch', exc_info=True)
 +
 +    who = (profile_name or '').strip() or 'the selected profile'
 +    if profid:
@@ -1071,7 +1057,7 @@ index 0000000..dcf417d
 +    _DAI_ON[0] = 0.0
 +    clear_cache_if_toggled(source, old, current)
 +    if enabled(current) and not current.get('dai_dma_id') and current.get('bearer_token'):
-+        _in_background(_fetch_missing_account_context, source.id)
++        device.spawn(_fetch_missing_account_context, source.id)
 +
 +
 +def _fetch_missing_account_context(source_id: int) -> None:
@@ -1093,26 +1079,6 @@ index 0000000..dcf417d
 +        logger.info('[directv-dai] fetched the account targeting values (%s)', ', '.join(sorted(updates)))
 +
 +
-+def _in_background(fn, *args) -> None:
-+    """Run fn in a daemon thread with the current Flask app context."""
-+    try:
-+        from flask import current_app
-+        app = current_app._get_current_object()
-+    except Exception:
-+        app = None
-+
-+    def _run():
-+        try:
-+            if app is not None:
-+                with app.app_context():
-+                    fn(*args)
-+            else:
-+                fn(*args)
-+        except Exception as exc:
-+            logger.warning('[directv-dai] background %s failed: %s', getattr(fn, '__name__', 'task'), exc)
-+    threading.Thread(target=_run, daemon=True).start()
-+
-+
 +def clear_cache_if_toggled(source, old: dict, current: dict) -> None:
 +    """The toggle picks which stream URL resolve() caches (for 55 minutes), so
 +    drop every cached one when it changes; the next tune fetches under the new setting."""
@@ -1129,10 +1095,10 @@ index 0000000..dcf417d
 +        capture_in_background(uncaptured_addresses())
 diff --git a/app/scrapers/directv_dai_device.py b/app/scrapers/directv_dai_device.py
 new file mode 100644
-index 0000000..f79c25c
+index 0000000..cccc7ab
 --- /dev/null
 +++ b/app/scrapers/directv_dai_device.py
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,231 @@
 +"""The bridge device a DirecTV DAI tune plays on: its identity and app User-Agent.
 +
 +DAI targets the playback device the way DirecTV's Android TV app does, so this reads
@@ -1203,18 +1169,26 @@ index 0000000..f79c25c
 +    props = _saved_devices().get(address) or {}
 +    if props:
 +        _DEVICE_CACHE[address] = (now + _DEVICE_TTL, props)
-+        _spawn(_recheck_device, address, props)
++        spawn(_recheck_device, address, props)
 +        return props
-+    # First sight: hold off repeat reads for _RETRY_TTL, read in the background.
++    # First sight: hold off repeat reads for _RETRY_TTL, and read in the background, but
++    # give the read a few seconds so this first session already carries the device's
++    # identity (a stuck adb never holds the request longer than that).
 +    _DEVICE_CACHE[address] = (now + _RETRY_TTL, {})
-+    _spawn(_first_read, address)
++    done = threading.Event()
++    spawn(_first_read, address, done)
++    done.wait(_FIRST_READ_WAIT)
 +    hit = _DEVICE_CACHE.get(address)
 +    return hit[1] if hit else {}
 +
 +
-+def _spawn(fn, *args) -> None:
++_FIRST_READ_WAIT = 4
++
++
++def spawn(fn, *args) -> None:
 +    """Run fn in a daemon thread, inside the current Flask app context (the device
-+    store's path comes from the app's database setting)."""
++    store's path and the database come from the app). The overlay's one background
++    runner."""
 +    try:
 +        from flask import current_app
 +        app = current_app._get_current_object()
@@ -1229,18 +1203,21 @@ index 0000000..f79c25c
 +            else:
 +                fn(*args)
 +        except Exception as exc:
-+            logger.debug('[directv-dai] device read failed: %s', exc)
++            logger.warning('[directv-dai] background %s failed: %s', getattr(fn, '__name__', 'task'), exc)
 +    threading.Thread(target=_run, daemon=True).start()
 +
 +
-+def _first_read(address: str) -> None:
-+    props = _read_device(address)
-+    if props:
-+        _store_device(address, props)
-+        _DEVICE_CACHE[address] = (time.time() + _DEVICE_TTL, props)
-+        logger.info('[directv-dai] saved device values for %s', address)
-+    else:
-+        logger.warning('[directv-dai] adb read failed for %s; its sessions have no device id until a read works', address)
++def _first_read(address: str, done: threading.Event) -> None:
++    try:
++        props = _read_device(address)
++        if props:
++            _store_device(address, props)
++            _DEVICE_CACHE[address] = (time.time() + _DEVICE_TTL, props)
++            logger.info('[directv-dai] saved device values for %s', address)
++        else:
++            logger.warning('[directv-dai] adb read failed for %s; its sessions have no device id until a read works', address)
++    finally:
++        done.set()
 +
 +
 +def _recheck_device(address: str, saved: dict) -> None:
@@ -1263,9 +1240,11 @@ index 0000000..f79c25c
 +
 +# Request IP -> bridge address. Looking it up asks upstream's bridge_devices, which
 +# reads the database and asks ah4c over HTTP, and the relay looks it up on every
-+# playlist and segment fetch, so the answer is kept for a minute.
++# playlist and segment fetch, so a found box is kept for a minute and a miss (another
++# client, or an ah4c hiccup) for a few seconds.
 +_BRIDGE_CACHE: dict[str, tuple[float, str | None]] = {}
 +_BRIDGE_TTL = 60
++_BRIDGE_MISS_TTL = 10
 +
 +
 +def _bridge_address(ip: str) -> str | None:
@@ -1274,7 +1253,7 @@ index 0000000..f79c25c
 +    if hit and now < hit[0]:
 +        return hit[1]
 +    address = _lookup_bridge_address(ip)
-+    _BRIDGE_CACHE[ip] = (now + _BRIDGE_TTL, address)
++    _BRIDGE_CACHE[ip] = (now + (_BRIDGE_TTL if address else _BRIDGE_MISS_TTL), address)
 +    return address
 +
 +
@@ -1343,12 +1322,6 @@ index 0000000..f79c25c
 +_APP_USER_AGENT = 'APP_PROJECT_NAME/5.0.136.2002113867 (Android {release}; {model}; {board})  PureRN/0.79.5'
 +
 +
-+def player_headers() -> dict:
-+    """{'User-Agent': <the DirecTV app UA>} for a bridge device, else {}."""
-+    ua = player_user_agent()
-+    return {'User-Agent': ua} if ua else {}
-+
-+
 +def player_user_agent() -> str | None:
 +    """The DirecTV app's User-Agent for the bridge device making the current
 +    request, or None when it isn't a known bridge device."""
@@ -1359,10 +1332,10 @@ index 0000000..f79c25c
 +
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..ee3155b
+index 0000000..5c466ed
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,1004 @@
+@@ -0,0 +1,1034 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
@@ -1403,7 +1376,7 @@ index 0000000..ee3155b
 +import functools
 +import inspect
 +import logging
-+import threading
++import re
 +import time
 +from urllib.parse import urlsplit
 +
@@ -1436,7 +1409,6 @@ index 0000000..ee3155b
 +    ('app.config_store', 'persist_source_cache_updates'),
 +    ('app.config_store', 'persist_source_config_updates'),
 +    ('app.models', 'Source'),
-+    ('app.models', 'SourceCache'),
 +    ('app.extensions', 'db'),
 +)
 +# The relay's URL space. The Player app and Channels fetch these URLs, so they're the
@@ -1450,10 +1422,13 @@ index 0000000..ee3155b
 +    ('app/scrapers/directv.py', 'directv:auth:refreshing:',
 +     "the profile swap waits on upstream's token-refresh lock (this key)"),
 +)
-+# The fetch arguments the DAI request reads by name (inspect.signature binds them).
-+_FETCH_ARGS = ('bearer_token', 'cookies', 'client_context', 'ccid')
++# The fetch arguments the DAI request needs by name (inspect.signature binds them).
++# cookies and client_context are read too when upstream still passes them; the code
++# sign-in has neither, so their removal mustn't turn DAI off.
++_FETCH_ARGS = ('bearer_token', 'ccid')
 +
 +_CHANNEL_AUTH_V2 = 'https://api.cld.dtvce.com/right/authorization/channel/v2'
++_ABS_URL = re.compile(r'https?://[^\s"]+')
 +
 +# The scraper (config + channel names + a result slot) behind the current
 +# _fetch_channel_playback call. Set by the resolve()/prepare_license_request() wrappers,
@@ -1461,7 +1436,6 @@ index 0000000..ee3155b
 +_TUNE = contextvars.ContextVar('directv_dai_tune', default=None)
 +
 +_process_patched = False
-+_missing: list[str] = []
 +_failed: list[str] = []   # wiring steps that raised or found a changed shape (named in status())
 +
 +
@@ -1532,8 +1506,7 @@ index 0000000..ee3155b
 +    """The one hook. Never raises: a failure here leaves upstream exactly as it was."""
 +    global _process_patched
 +    try:
-+        _missing[:] = missing()
-+        for name in _missing:
++        for name in missing():
 +            logger.error('[directv-dai] upstream moved %s; that part of DAI is not wired', name)
 +        if not _process_patched:
 +            _process_patched = True
@@ -1577,10 +1550,13 @@ index 0000000..ee3155b
 +# gunicorn worker) when it's reachable, else per process.
 +
 +_HEALTH_KEY = 'directv_dai:health'
++_HEALTH_TTL = 7 * 24 * 3600
++# problem kind -> (what the panel says, the good kind that clears it when newer)
 +_PROBLEMS = {
-+    'bypassed': 'DAI is on, but a tune never reached the DAI request (upstream changed its tune path)',
-+    'error': 'a DAI hook raised (see the server log)',
-+    'fallback': 'the last DAI tune fell back to the non-DAI stream',
++    'bypassed': ('DAI is on, but a tune never reached the DAI request (upstream changed its tune path)', 'ok'),
++    'error': ('a DAI hook raised (see the server log)', 'ok'),
++    'fallback': ('the last DAI tune fell back to the non-DAI stream', 'ok'),
++    'ad_uncut': ('an inserted ad went out without the loudness cut', 'ad_cut'),
 +}
 +_local_health: dict[str, dict] = {}
 +_rdb = [None, 0.0]
@@ -1608,8 +1584,11 @@ index 0000000..ee3155b
 +    try:
 +        rdb = _redis()
 +        if rdb is not None:
-+            rdb.hset(_HEALTH_KEY, mapping={f'{kind}.at': now, f'{kind}.detail': detail})
-+            rdb.hincrby(_HEALTH_KEY, f'{kind}.count', 1)
++            pipe = rdb.pipeline(transaction=False)
++            pipe.hset(_HEALTH_KEY, mapping={f'{kind}.at': now, f'{kind}.detail': detail})
++            pipe.hincrby(_HEALTH_KEY, f'{kind}.count', 1)
++            pipe.expire(_HEALTH_KEY, _HEALTH_TTL)
++            pipe.execute()
 +            return
 +    except Exception:
 +        _rdb[0], _rdb[1] = None, time.time() + 60
@@ -1636,11 +1615,10 @@ index 0000000..ee3155b
 +
 +def runtime_warnings() -> list[str]:
 +    h = health()
-+    ok_at = float((h.get('ok') or {}).get('at') or 0)
 +    out = []
-+    for kind, text in _PROBLEMS.items():
++    for kind, (text, good) in _PROBLEMS.items():
 +        info = h.get(kind) or {}
-+        if float(info.get('at') or 0) > ok_at:
++        if float(info.get('at') or 0) > float((h.get(good) or {}).get('at') or 0):
 +            detail = info.get('detail') or ''
 +            out.append(f'{text}{": " + detail if detail else ""}')
 +    return out
@@ -1662,11 +1640,14 @@ index 0000000..ee3155b
 +            try:
 +                dai = directv_dai.enabled(self.config)
 +                names = self.cache.get('dai_channel_names')
++                # Only this channel's entry, and only in memory: upstream's own refetch
++                # then saves the fresh one. Other channels' entries (maybe another box's
++                # session) are left alone.
++                ccid = _ccid(raw_url)
 +                playback = self.cache.get('directv_playback') or {}
-+                fresh = {k: v for k, v in playback.items()
-+                         if not isinstance(v, dict) or directv_dai.cached_url_usable(v, dai)}
-+                if len(fresh) != len(playback):
-+                    self._update_cache('directv_playback', fresh)
++                cached = playback.get(ccid)
++                if isinstance(cached, dict) and not directv_dai.cached_url_usable(cached, dai):
++                    self.cache['directv_playback'] = {k: v for k, v in playback.items() if k != ccid}
 +            except Exception:
 +                _note('error', 'resolve: cache check')
 +                logger.exception('[directv-dai] cache check failed')
@@ -1775,6 +1756,11 @@ index 0000000..ee3155b
 +        directv.apply_auth_result = _wraps(orig_apply, apply_auth_result)
 +
 +
++def _ccid(raw_url) -> str:
++    """The channel id in upstream's directv://<ccid>/<resource> stream URL."""
++    return str(raw_url or '').split('://', 1)[-1].split('/', 1)[0]
++
++
 +def _check_tune(scraper, raw_url: str, url, state: dict) -> None:
 +    """DAI is on: record whether this tune really got a DAI stream."""
 +    if isinstance(url, str) and 'yospace.com' in url:
@@ -1785,8 +1771,7 @@ index 0000000..ee3155b
 +    # Not fetched this time: a cache hit of a DAI entry is fine (a channel with no DAI
 +    # stream caches its non-Yospace URL tagged dai=True); anything else means upstream's
 +    # resolve no longer goes through the fetch we wrap.
-+    ccid = str(raw_url or '').split('://', 1)[-1].split('/', 1)[0]
-+    cached = (scraper.cache.get('directv_playback') or {}).get(ccid)
++    cached = (scraper.cache.get('directv_playback') or {}).get(_ccid(raw_url))
 +    if isinstance(cached, dict) and cached.get('dai'):
 +        return
 +    _note('bypassed', 'resolve() returned without calling _fetch_channel_playback')
@@ -1951,6 +1936,11 @@ index 0000000..ee3155b
 +                swapped = dtv_aac_ads.swap_muffled_ads(text)
 +                if swapped != text:
 +                    resp.set_data(swapped)
++                    # Upstream relays what its CDN allowlist covers; an inserted ad left
++                    # as an absolute URL plays direct, so its loudness cut can't run.
++                    for host in sorted({urlsplit(u).hostname or '' for u in _ABS_URL.findall(swapped)
++                                        if dtv_aac_gain.is_ad_segment(u)}):
++                        _note('ad_uncut', f'ads on {host} are not relayed (not on the DirecTV CDN allowlist)')
 +        except Exception:
 +            _note('error', 'ad swap')
 +            logger.exception('[directv-dai] ad swap failed')
@@ -1972,7 +1962,10 @@ index 0000000..ee3155b
 +    if r.status_code == 200:
 +        try:
 +            cut = dtv_aac_gain.attenuate_ad_segment(body)
-+            _note('ad_cut' if cut != body else 'ad_uncut')
++            if cut != body:
++                _note('ad_cut')
++            else:
++                _note('ad_uncut', 'an ad segment could not be parsed for the cut')
 +            body = cut
 +        except Exception:
 +            logger.exception('[directv-dai] ad loudness cut failed; sending the segment as is')
@@ -2075,8 +2068,10 @@ index 0000000..ee3155b
 +        if source is None:
 +            return jsonify({'error': 'not a directv source'}), 400
 +        if request.method == 'POST':
++            if not request.is_json:
++                return jsonify({'error': 'expected JSON'}), 415
 +            from ..config_store import persist_source_config_updates
-+            data = request.get_json(silent=True) or request.form
++            data = request.get_json(silent=True) or {}
 +            want = str(data.get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
 +            old = dict(source.config or {})
 +            if not persist_source_config_updates(source.id, {'use_dai': 'true' if want else 'false'}):
@@ -2101,6 +2096,8 @@ index 0000000..ee3155b
 +        source = _directv_source(source_id)
 +        if source is None:
 +            return jsonify({'error': 'not a directv source'}), 400
++        if request.method == 'POST' and not request.is_json:
++            return jsonify({'error': 'expected JSON'}), 415
 +        if not directv_dai.enabled(dict(source.config or {})):
 +            return jsonify({'enabled': False, 'ok': True, 'pending': 0})
 +        if request.method == 'GET':
@@ -2124,7 +2121,9 @@ index 0000000..ee3155b
 +            selected = (cfg.get('dtv_android_profile_id') or '').strip() or (info.get('current_id') or '')
 +            return jsonify({'profiles': info.get('profiles') or [], 'selected_id': selected,
 +                            'current_id': info.get('current_id') or ''})
-+        data = request.get_json(silent=True) or request.form
++        if not request.is_json:
++            return jsonify({'error': 'expected JSON'}), 415
++        data = request.get_json(silent=True) or {}
 +        profile_id = (data.get('profile_id') or '').strip()
 +        if not profile_id:
 +            return jsonify({'error': 'no profile_id'}), 400
@@ -2153,9 +2152,11 @@ index 0000000..ee3155b
 +
 +
 +def _issue_lines() -> list[str]:
++    from . import directv_dai
 +    st = status()
++    runtime = st['runtime'] if directv_dai.dai_on() else []   # stale once DAI is off
 +    return [*(f'upstream renamed or removed {n}' for n in st['missing']), *st['markers'],
-+            *(f'could not wire {n}' for n in st['failed']), *st['runtime']]
++            *(f'could not wire {n}' for n in st['failed']), *runtime]
 +
 +
 +_PAGE_HTML = """<!doctype html>
@@ -2328,7 +2329,9 @@ index 0000000..ee3155b
 +    if (st) st.textContent = 'Capturing… (a Google TV/Android TV device briefly shows its Ads screen; a playing device is skipped)';
 +    let message = '';
 +    try {
-+      const [r, d] = await getJson(`/api/sources/${id}/directv-capture-adids`, {method: 'POST'});
++      const [r, d] = await getJson(`/api/sources/${id}/directv-capture-adids`, {
++        method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
++      });
 +      if (r.ok && d.ok && d.enabled !== false) {
 +        const parts = [`Captured ${d.captured} device${d.captured === 1 ? '' : 's'}`];
 +        if (d.playing) parts.push(`${d.playing} skipped — ${d.playing === 1 ? 'a device is' : 'devices are'} playing (re-run when idle)`);

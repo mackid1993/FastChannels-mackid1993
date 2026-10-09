@@ -166,10 +166,12 @@ jobs:
         id: apply
         if: steps.skip.outputs.skip != 'true'
         continue-on-error: true
-        run: overlay/scripts/apply-patches.sh upstream || { echo "conflict=true" >> "$GITHUB_OUTPUT"; exit 1; }
+        # Exit 3 = the DAI hook line couldn't be placed in create_app: not a patch conflict
+        # (the build fails and reports it; scripts/insert_hook.py needs a human update).
+        run: overlay/scripts/apply-patches.sh upstream || { rc=$?; [ "$rc" = 3 ] || echo "conflict=true" >> "$GITHUB_OUTPUT"; exit 1; }
 
       - name: Report a patch conflict
-        if: steps.skip.outputs.skip != 'true' && steps.apply.outcome == 'failure' && env.TEST_RUN != 'true'
+        if: steps.skip.outputs.skip != 'true' && steps.apply.outputs.conflict == 'true' && env.TEST_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -551,6 +553,12 @@ jobs:
           rm -rf .aider*
           git add -- $conflicted
           GIT_EDITOR=true git am --continue
+          # The DAI hook line is inserted, never patched in (as apply-patches.sh does).
+          python3 ../overlay/scripts/insert_hook.py .
+          if ! git diff --quiet -- app/__init__.py; then
+            git add app/__init__.py
+            git commit -q --amend --no-edit
+          fi
 
       - name: Repair any drift the merge left, then verify the full gauntlet
         if: env.HAS_KEY == 'true'

@@ -55,7 +55,7 @@ create_app()   # a second app in the same process (the worker does this) must no
 # would quietly turn off; fail the build with the exact name instead.
 assert install.missing() == [], f'upstream moved DAI wiring targets: {install.missing()}'
 # The lists are the spec of what's checked: a fix may rename an entry, never drop one.
-assert len(install.TARGETS) >= 7 and len(install.USES) >= 14 and len(install.SOURCE_MARKERS) >= 2, \
+assert len(install.TARGETS) >= 7 and len(install.USES) >= 13 and len(install.SOURCE_MARKERS) >= 2, \
     'an upstream name or marker was dropped from directv_dai_install (rename it instead)'
 assert any(path == 'app/scrapers/directv.py' and 'refreshing' in text for path, text, _ in install.SOURCE_MARKERS), \
     'the refresh-lock marker is gone (the profile swap must wait on upstream\'s refresh lock)'
@@ -105,7 +105,7 @@ assert importlib.util.find_spec('app.scrapers.dtv_android') is None, \
 # properties (never the bare Custom-Exoplayer fallback, which stopped ad insertion).
 assert device._APP_USER_AGENT.format(release='11', model='AFTKRT', board='karat') == \
     'APP_PROJECT_NAME/5.0.136.2002113867 (Android 11; AFTKRT; karat)  PureRN/0.79.5'
-assert device.player_headers() == {}, 'outside a request there is no device to build a User-Agent for'
+assert device.player_user_agent() is None, 'outside a request there is no device to build a User-Agent for'
 assert not hasattr(dai, 'keep_drm_session'), 'keep_drm_session was reverted (it broke ad targeting)'
 
 # AAC ad swap: each inserted AC-3 ad (segment + its own EXT-X-MAP init) is rewritten to
@@ -457,6 +457,15 @@ _v2_ok = {'authorized': True, 'dRights': {'playToken': 'PT'},
 _v1_ok = {'authorized': True, 'dRights': {'playToken': 'PT1'},
           'playbackData': {'fallbackStreamUrl': 'https://dfwlive-c.directv.fastly-edge.com/v1.m3u8',
                            'streamURL': 'https://csm-e.tls1.yospace.com/v1'}}
+
+
+def _call_fetch():
+    """Upstream's channel fetch, called with whichever of its arguments it still takes."""
+    params = inspect.signature(directv._fetch_channel_playback.__wrapped__).parameters
+    args = {'bearer_token': 'B', 'cookies': [], 'client_context': None, 'ccid': '123'}
+    return directv._fetch_channel_playback(**{k: v for k, v in args.items() if k in params})
+
+
 sc = directv.DirectvScraper({'use_dai': 'true', 'bearer_token': 'B', 'dai_dma_id': '501'})
 sc._cache = {}
 _real_session = directv.requests.Session
@@ -495,7 +504,7 @@ try:
         _Session.reply = _Resp(data={'authorized': False, 'responseStatus': {'errorCode': '0015'}})
         tok = install._TUNE.set(({'use_dai': 'true'}, None))
         try:
-            directv._fetch_channel_playback('B', [], None, '123')
+            _call_fetch()
             raise AssertionError('an expired DAI authorization did not raise DirectvAuthExpiredError')
         except directv.DirectvAuthExpiredError:
             pass
@@ -505,7 +514,7 @@ try:
         _Session.calls.clear(); _Session.reply = _Resp(status=500)
         tok = install._TUNE.set(({'use_dai': 'true'}, None))
         try:
-            assert directv._fetch_channel_playback('B', [], None, '123') is None
+            assert _call_fetch() is None
             assert [c[0].rsplit('/', 1)[-1] for c in _Session.calls] == ['v2', 'v1'], _Session.calls
         finally:
             install._TUNE.reset(tok)
@@ -525,6 +534,13 @@ try:
         _Session.reply = _Resp(data=_v2_ok)
         sc.resolve('directv://123/res')
         assert install.runtime_warnings() == [], install.runtime_warnings()
+        # (e2) A tune touches only its own channel's cache entry: another channel's entry
+        # (say, another box's session) is neither dropped nor saved by a cache hit here.
+        sc.cache['directv_playback']['999'] = {'fallback_url': 'https://other/x.m3u8', 'dai': False, 'cached_at': _t.time()}
+        sc._pending_cache_updates.clear()
+        sc.resolve('directv://123/res')
+        assert '999' in sc.cache['directv_playback'], "a tune dropped another channel's cached session"
+        assert 'directv_playback' not in sc._pending_cache_updates, 'a cache hit saved a cache rewrite'
 finally:
     directv.requests.Session = _real_session
 
@@ -617,6 +633,16 @@ try:
         _wire_log.clear()
         assert _client.get(_ASSET + _quote(_ad_other, safe='')).status_code == 400
         assert _seen == [] and not _wire_log, 'an ad-shaped URL on an unknown host was fetched'
+        # An inserted ad the relay doesn't cover (its host isn't on upstream's allowlist)
+        # would play without the loudness cut: the DAI panel says so, until a cut ad clears it.
+        _other_pl = 'https://yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/other.m3u8'
+        _wire[_other_pl] = (200, 'application/vnd.apple.mpegurl',
+                            _aac_pl.replace('yospace01-directv.akamaized.net/dtv-prd/7/7/0/02001/u-',
+                                            'unknown-ad-cdn.example.net/x/u-').encode())
+        _client.get(_ASSET + _quote(_other_pl, safe=''))
+        assert any('not relayed' in w for w in install.runtime_warnings()), install.runtime_warnings()
+        _client.get(_relayed)
+        assert install.runtime_warnings() == [], install.runtime_warnings()
     finally:
         dtv_aac_gain.attenuate_ad_segment = _real_att
     assert dtv_aac_gain.is_ad_segment(_seg_url) and not dtv_aac_gain.is_ad_segment(
@@ -685,27 +711,54 @@ try:
         assert directv_device_auth.is_device_session(db.session.get(Source, _sid).config)
     _pg = _client.get(f'/api/sources/{_sid}/directv-dai')
     assert _pg.status_code == 200 and _pg.get_json()['code_signed_in'] is True and _pg.get_json()['use_dai'] is False, _pg.get_data()
+    assert _client.post(f'/api/sources/{_sid}/directv-dai', data={'use_dai': 'true'}).status_code == 415, \
+        'the DAI toggle accepted a form post (another site could flip it)'
+    assert _client.post(f'/api/sources/{_sid}/directv-capture-adids').status_code == 415, \
+        'the ad-id capture accepted a bare post (another site could trigger it)'
     _sv = _client.post(f'/api/sources/{_sid}/directv-dai', json={'use_dai': True})
     assert _sv.status_code == 200 and _sv.get_json()['use_dai'] is True, _sv.get_data()
     with app.app_context():
         assert dai.enabled(db.session.get(Source, _sid).config), 'saving the DAI toggle did not stick'
     assert _captures, 'turning DAI on did not run the ad-id capture'
-    # Upstream's own DirecTV settings save keeps keys it doesn't know (use_dai).
+    # Upstream's own DirecTV settings save, with exactly what its page sends, keeps keys
+    # it doesn't know (use_dai).
     _save = next((r for r in app.url_map.iter_rules() if r.rule.endswith('/<int:source_id>/config')
                   and 'POST' in (r.methods or ())), None)
     assert _save is not None, "upstream's source settings save route is gone"
-    _up = _client.post(_save.rule.replace('<int:source_id>', str(_sid)), json={})
+    _save_url = _save.rule.replace('<int:source_id>', str(_sid))
+    _form = _client.get(_save_url).get_json() or {}
+    _payload = dict(_form.get('values') or {})
+    assert _payload, f"upstream's settings API returned no values to save: {_form}"
+    _up = _client.post(_save_url, json=_payload)
     assert _up.status_code < 400, _up.get_data()
     with app.app_context():
         assert dai.enabled(db.session.get(Source, _sid).config), "upstream's settings save wiped the DAI toggle"
     _pr = _client.get(f'/api/sources/{_sid}/directv-profile')
     assert _pr.status_code == 200 and _pr.get_json()['profiles'][0]['id'] == 'p1', _pr.get_data()
     _page = _client.get('/admin/sources')
-    if _page.status_code == 200:
-        assert b'id="source-config-' in _page.get_data(), "the sources page no longer has settings boxes (source-config-<id>)"
-        assert b'/directv-dai/admin.js' in _page.get_data(), 'the sources page did not get the DAI panel script'
-    else:
-        print(f'note: /admin/sources answered {_page.status_code} on the throwaway DB; page injection checked via after_request only')
+    assert _page.status_code == 200, f'/admin/sources answered {_page.status_code}'
+    assert b'id="source-config-' in _page.get_data(), "the sources page no longer has settings boxes (source-config-<id>)"
+    assert b'/directv-dai/admin.js' in _page.get_data(), 'the sources page did not get the DAI panel script'
+    # The tune that opens the Yospace session, through upstream's real browser.m3u8 route:
+    # the channel/v2 request and the Yospace master fetch both go out, the master with
+    # the bridge device's app User-Agent (the one A/B tested for inserted ads).
+    from app.models import Channel  # noqa: E402
+    with app.app_context():
+        db.session.add(Channel(source_id=_sid, source_channel_id='123', name='CNN', stream_url='directv://123/res'))
+        db.session.commit()
+    _yo_master = 'https://csm-e.tls1.yospace.com/csm/extlive/x/master.m3u8'
+    _wire['https://api.cld.dtvce.com/right/authorization/channel/v2'] = (200, 'application/json', json.dumps(_v2_ok).encode())
+    _wire[_yo_master] = (200, 'application/vnd.apple.mpegurl', _master.encode())
+    _HTTPAdapter.send, device._client_device = _fake_send, (lambda: fire)
+    try:
+        _wire_log.clear()
+        _bm = _client.get('/play/directv/123/browser.m3u8', environ_base={'REMOTE_ADDR': '10.0.0.9'})
+        assert _bm.status_code == 200 and b'#EXTM3U' in _bm.get_data(), (_bm.status_code, _bm.get_data()[:200])
+        assert any(u.startswith('https://api.cld.dtvce.com/right/authorization/channel/v2') for u, _ in _wire_log), _wire_log
+        assert (_ua_of(_yo_master) or '').startswith('APP_PROJECT_NAME/'), \
+            f'the Yospace session-opening fetch lost the app User-Agent: {_ua_of(_yo_master)}'
+    finally:
+        _HTTPAdapter.send, device._client_device = _real_send, _real_client_device
     _st = _client.get('/directv-dai/status').get_json()
     assert _st == {'missing': [], 'markers': [], 'failed': [], 'runtime': []}, _st
     assert _client.post(f'/api/sources/{_sid}/directv-dai', json={'use_dai': False}).get_json()['use_dai'] is False

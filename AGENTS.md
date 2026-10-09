@@ -96,7 +96,7 @@ What the overlay relies on in upstream, all listed at the top of `directv_dai_in
 | `directv.apply_auth_result` | wrap | After upstream writes the session, `store_login_result` adds the DAI account values (DMA/ZIP/GPP fetched with the bearer, DAI on only; hhid/u). |
 | `directv_device_auth._result` | wrap | Carries `valuePairs.partnerProfileId`/`profileId` into the result (upstream keeps only the activation token). |
 | `directv_proxy._DIRECTV_BROWSER_CDN_SUFFIXES` | extended | Adds `yospace.com`, so Yospace playlists take the relay. |
-| `USES`: `_license_content_id_from_stream_url`, `DirectvAuthExpiredError`, `directv_device_auth.AUTH_METHOD`/`app_headers`/`is_device_session`, `_directv_browser_cdn_allowed`, `BaseScraper.cache`/`_update_cache`, `bridge_devices.known_devices`, `config_store.persist_source_cache_updates`/`persist_source_config_updates`, `models.Source`/`SourceCache`, `extensions.db` | called/read | Named so a rename fails with its name. |
+| `USES`: `_license_content_id_from_stream_url`, `DirectvAuthExpiredError`, `directv_device_auth.AUTH_METHOD`/`app_headers`/`is_device_session`, `_directv_browser_cdn_allowed`, `BaseScraper.cache`/`_update_cache`, `bridge_devices.known_devices`, `config_store.persist_source_cache_updates`/`persist_source_config_updates`, `models.Source`, `extensions.db` | called/read | Named so a rename fails with its name. |
 | `RELAY_PREFIX` `/play/directv/` | URL prefix | The HTTP-layer hooks (ad swap, loudness cut, User-Agent). |
 | `SOURCE_MARKERS`: `id="source-config-{{ source.id }}"` in `sources.html`; the refresh-lock key `directv:auth:refreshing:` in `directv.py` | strings | Where the panel mounts (it is also at `/directv-dai`); the profile swap waits on upstream's refresh lock. |
 
@@ -137,7 +137,7 @@ Invariants a port must keep:
 
 The patch only adds our own modules (`directv_dai.py`, `directv_dai_device.py`, `directv_dai_install.py`, `dtv_aac_ads.py`, `dtv_aac_gain.py`), and the one line in `create_app` is inserted by `scripts/insert_hook.py`, not carried as a hunk. So:
 
-- **A conflict** (`git am` fails) can only mean upstream added a file with one of our modules' names. If `insert_hook.py` fails, upstream's app factory changed shape: update `insert_hook.py` (a human change), never `app/__init__.py`.
+- **A conflict** (`git am` fails) can only mean upstream added a file with one of our modules' names. The `resolve` job re-inserts the hook line after the merge, as `apply-patches.sh` does. If `insert_hook.py` fails (`apply-patches.sh` exits 3, not reported as a conflict), upstream's app factory changed shape: update `insert_hook.py` (a human change), never `app/__init__.py`; `ai_fix_drift.sh` stops early on it.
 - **Drift** (the patch applies but `validate.sh`/`smoke_test.py` fails) means upstream renamed, moved or reshaped something in `TARGETS`, `USES`, `SOURCE_MARKERS` or `RELAY_PREFIX`. The failure names it. Find the new name in `upstream_index.txt`, update the entry and every reference in our modules, and keep the behavior. If a wrapped target's shape changed (new arguments, a different return value), adapt the wrapper to it.
 - **Never touch an upstream file.** CI inserts the hook line and `validate.sh` rejects any other change to upstream's files.
 - **Never drop an entry or weaken a check** to get green; the smoke test counts the entries.

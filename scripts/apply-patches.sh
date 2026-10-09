@@ -8,7 +8,9 @@
 # conflict with. The one line in app/__init__.py is not a hunk: scripts/insert_hook.py
 # finds create_app with Python's parser and inserts it, wherever upstream moved it, then
 # it's folded into the last patch commit (so `git diff <upstream> HEAD` is the whole
-# overlay). Exits non-zero (leaving the checkout clean) when a patch genuinely conflicts.
+# overlay). Exits 1 (leaving the checkout clean) when a patch genuinely conflicts, and 3
+# when the hook line can't be placed (upstream's app factory changed shape: a human
+# updates insert_hook.py; it is not a conflict for the AI).
 set -euo pipefail
 
 dir=${1:?usage: apply-patches.sh <upstream-checkout>}
@@ -38,7 +40,7 @@ done
 if ! python3 "$root/scripts/insert_hook.py" .; then
     git reset -q --hard "HEAD~${#patches[@]}"
     echo "::error title=DAI hook::could not insert the one DAI line into create_app"
-    exit 1
+    exit 3
 fi
 if ! git diff --quiet -- app/__init__.py; then
     git add app/__init__.py

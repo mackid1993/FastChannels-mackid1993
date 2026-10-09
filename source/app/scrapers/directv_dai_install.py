@@ -38,7 +38,7 @@ import contextvars
 import functools
 import inspect
 import logging
-import threading
+import re
 import time
 from urllib.parse import urlsplit
 
@@ -71,7 +71,6 @@ USES = (
     ('app.config_store', 'persist_source_cache_updates'),
     ('app.config_store', 'persist_source_config_updates'),
     ('app.models', 'Source'),
-    ('app.models', 'SourceCache'),
     ('app.extensions', 'db'),
 )
 # The relay's URL space. The Player app and Channels fetch these URLs, so they're the
@@ -85,10 +84,13 @@ SOURCE_MARKERS = (
     ('app/scrapers/directv.py', 'directv:auth:refreshing:',
      "the profile swap waits on upstream's token-refresh lock (this key)"),
 )
-# The fetch arguments the DAI request reads by name (inspect.signature binds them).
-_FETCH_ARGS = ('bearer_token', 'cookies', 'client_context', 'ccid')
+# The fetch arguments the DAI request needs by name (inspect.signature binds them).
+# cookies and client_context are read too when upstream still passes them; the code
+# sign-in has neither, so their removal mustn't turn DAI off.
+_FETCH_ARGS = ('bearer_token', 'ccid')
 
 _CHANNEL_AUTH_V2 = 'https://api.cld.dtvce.com/right/authorization/channel/v2'
+_ABS_URL = re.compile(r'https?://[^\s"]+')
 
 # The scraper (config + channel names + a result slot) behind the current
 # _fetch_channel_playback call. Set by the resolve()/prepare_license_request() wrappers,
@@ -96,7 +98,6 @@ _CHANNEL_AUTH_V2 = 'https://api.cld.dtvce.com/right/authorization/channel/v2'
 _TUNE = contextvars.ContextVar('directv_dai_tune', default=None)
 
 _process_patched = False
-_missing: list[str] = []
 _failed: list[str] = []   # wiring steps that raised or found a changed shape (named in status())
 
 
@@ -167,8 +168,7 @@ def install(app) -> None:
     """The one hook. Never raises: a failure here leaves upstream exactly as it was."""
     global _process_patched
     try:
-        _missing[:] = missing()
-        for name in _missing:
+        for name in missing():
             logger.error('[directv-dai] upstream moved %s; that part of DAI is not wired', name)
         if not _process_patched:
             _process_patched = True
@@ -212,10 +212,13 @@ def _already(fn) -> bool:
 # gunicorn worker) when it's reachable, else per process.
 
 _HEALTH_KEY = 'directv_dai:health'
+_HEALTH_TTL = 7 * 24 * 3600
+# problem kind -> (what the panel says, the good kind that clears it when newer)
 _PROBLEMS = {
-    'bypassed': 'DAI is on, but a tune never reached the DAI request (upstream changed its tune path)',
-    'error': 'a DAI hook raised (see the server log)',
-    'fallback': 'the last DAI tune fell back to the non-DAI stream',
+    'bypassed': ('DAI is on, but a tune never reached the DAI request (upstream changed its tune path)', 'ok'),
+    'error': ('a DAI hook raised (see the server log)', 'ok'),
+    'fallback': ('the last DAI tune fell back to the non-DAI stream', 'ok'),
+    'ad_uncut': ('an inserted ad went out without the loudness cut', 'ad_cut'),
 }
 _local_health: dict[str, dict] = {}
 _rdb = [None, 0.0]
@@ -243,8 +246,11 @@ def _note(kind: str, detail: str = '') -> None:
     try:
         rdb = _redis()
         if rdb is not None:
-            rdb.hset(_HEALTH_KEY, mapping={f'{kind}.at': now, f'{kind}.detail': detail})
-            rdb.hincrby(_HEALTH_KEY, f'{kind}.count', 1)
+            pipe = rdb.pipeline(transaction=False)
+            pipe.hset(_HEALTH_KEY, mapping={f'{kind}.at': now, f'{kind}.detail': detail})
+            pipe.hincrby(_HEALTH_KEY, f'{kind}.count', 1)
+            pipe.expire(_HEALTH_KEY, _HEALTH_TTL)
+            pipe.execute()
             return
     except Exception:
         _rdb[0], _rdb[1] = None, time.time() + 60
@@ -271,11 +277,10 @@ def health() -> dict:
 
 def runtime_warnings() -> list[str]:
     h = health()
-    ok_at = float((h.get('ok') or {}).get('at') or 0)
     out = []
-    for kind, text in _PROBLEMS.items():
+    for kind, (text, good) in _PROBLEMS.items():
         info = h.get(kind) or {}
-        if float(info.get('at') or 0) > ok_at:
+        if float(info.get('at') or 0) > float((h.get(good) or {}).get('at') or 0):
             detail = info.get('detail') or ''
             out.append(f'{text}{": " + detail if detail else ""}')
     return out
@@ -297,11 +302,14 @@ def _patch_scraper() -> None:
             try:
                 dai = directv_dai.enabled(self.config)
                 names = self.cache.get('dai_channel_names')
+                # Only this channel's entry, and only in memory: upstream's own refetch
+                # then saves the fresh one. Other channels' entries (maybe another box's
+                # session) are left alone.
+                ccid = _ccid(raw_url)
                 playback = self.cache.get('directv_playback') or {}
-                fresh = {k: v for k, v in playback.items()
-                         if not isinstance(v, dict) or directv_dai.cached_url_usable(v, dai)}
-                if len(fresh) != len(playback):
-                    self._update_cache('directv_playback', fresh)
+                cached = playback.get(ccid)
+                if isinstance(cached, dict) and not directv_dai.cached_url_usable(cached, dai):
+                    self.cache['directv_playback'] = {k: v for k, v in playback.items() if k != ccid}
             except Exception:
                 _note('error', 'resolve: cache check')
                 logger.exception('[directv-dai] cache check failed')
@@ -410,6 +418,11 @@ def _patch_scraper() -> None:
         directv.apply_auth_result = _wraps(orig_apply, apply_auth_result)
 
 
+def _ccid(raw_url) -> str:
+    """The channel id in upstream's directv://<ccid>/<resource> stream URL."""
+    return str(raw_url or '').split('://', 1)[-1].split('/', 1)[0]
+
+
 def _check_tune(scraper, raw_url: str, url, state: dict) -> None:
     """DAI is on: record whether this tune really got a DAI stream."""
     if isinstance(url, str) and 'yospace.com' in url:
@@ -420,8 +433,7 @@ def _check_tune(scraper, raw_url: str, url, state: dict) -> None:
     # Not fetched this time: a cache hit of a DAI entry is fine (a channel with no DAI
     # stream caches its non-Yospace URL tagged dai=True); anything else means upstream's
     # resolve no longer goes through the fetch we wrap.
-    ccid = str(raw_url or '').split('://', 1)[-1].split('/', 1)[0]
-    cached = (scraper.cache.get('directv_playback') or {}).get(ccid)
+    cached = (scraper.cache.get('directv_playback') or {}).get(_ccid(raw_url))
     if isinstance(cached, dict) and cached.get('dai'):
         return
     _note('bypassed', 'resolve() returned without calling _fetch_channel_playback')
@@ -586,6 +598,11 @@ def _register_relay_hooks(app) -> None:
                 swapped = dtv_aac_ads.swap_muffled_ads(text)
                 if swapped != text:
                     resp.set_data(swapped)
+                    # Upstream relays what its CDN allowlist covers; an inserted ad left
+                    # as an absolute URL plays direct, so its loudness cut can't run.
+                    for host in sorted({urlsplit(u).hostname or '' for u in _ABS_URL.findall(swapped)
+                                        if dtv_aac_gain.is_ad_segment(u)}):
+                        _note('ad_uncut', f'ads on {host} are not relayed (not on the DirecTV CDN allowlist)')
         except Exception:
             _note('error', 'ad swap')
             logger.exception('[directv-dai] ad swap failed')
@@ -607,7 +624,10 @@ def _serve_ad_segment(raw_url: str, Response):
     if r.status_code == 200:
         try:
             cut = dtv_aac_gain.attenuate_ad_segment(body)
-            _note('ad_cut' if cut != body else 'ad_uncut')
+            if cut != body:
+                _note('ad_cut')
+            else:
+                _note('ad_uncut', 'an ad segment could not be parsed for the cut')
             body = cut
         except Exception:
             logger.exception('[directv-dai] ad loudness cut failed; sending the segment as is')
@@ -710,8 +730,10 @@ def _register_admin(app) -> None:
         if source is None:
             return jsonify({'error': 'not a directv source'}), 400
         if request.method == 'POST':
+            if not request.is_json:
+                return jsonify({'error': 'expected JSON'}), 415
             from ..config_store import persist_source_config_updates
-            data = request.get_json(silent=True) or request.form
+            data = request.get_json(silent=True) or {}
             want = str(data.get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
             old = dict(source.config or {})
             if not persist_source_config_updates(source.id, {'use_dai': 'true' if want else 'false'}):
@@ -736,6 +758,8 @@ def _register_admin(app) -> None:
         source = _directv_source(source_id)
         if source is None:
             return jsonify({'error': 'not a directv source'}), 400
+        if request.method == 'POST' and not request.is_json:
+            return jsonify({'error': 'expected JSON'}), 415
         if not directv_dai.enabled(dict(source.config or {})):
             return jsonify({'enabled': False, 'ok': True, 'pending': 0})
         if request.method == 'GET':
@@ -759,7 +783,9 @@ def _register_admin(app) -> None:
             selected = (cfg.get('dtv_android_profile_id') or '').strip() or (info.get('current_id') or '')
             return jsonify({'profiles': info.get('profiles') or [], 'selected_id': selected,
                             'current_id': info.get('current_id') or ''})
-        data = request.get_json(silent=True) or request.form
+        if not request.is_json:
+            return jsonify({'error': 'expected JSON'}), 415
+        data = request.get_json(silent=True) or {}
         profile_id = (data.get('profile_id') or '').strip()
         if not profile_id:
             return jsonify({'error': 'no profile_id'}), 400
@@ -788,9 +814,11 @@ def _register_admin(app) -> None:
 
 
 def _issue_lines() -> list[str]:
+    from . import directv_dai
     st = status()
+    runtime = st['runtime'] if directv_dai.dai_on() else []   # stale once DAI is off
     return [*(f'upstream renamed or removed {n}' for n in st['missing']), *st['markers'],
-            *(f'could not wire {n}' for n in st['failed']), *st['runtime']]
+            *(f'could not wire {n}' for n in st['failed']), *runtime]
 
 
 _PAGE_HTML = """<!doctype html>
@@ -963,7 +991,9 @@ _ADMIN_JS = r"""
     if (st) st.textContent = 'Capturing… (a Google TV/Android TV device briefly shows its Ads screen; a playing device is skipped)';
     let message = '';
     try {
-      const [r, d] = await getJson(`/api/sources/${id}/directv-capture-adids`, {method: 'POST'});
+      const [r, d] = await getJson(`/api/sources/${id}/directv-capture-adids`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+      });
       if (r.ok && d.ok && d.enabled !== false) {
         const parts = [`Captured ${d.captured} device${d.captured === 1 ? '' : 's'}`];
         if (d.playing) parts.push(`${d.playing} skipped — ${d.playing === 1 ? 'a device is' : 'devices are'} playing (re-run when idle)`);

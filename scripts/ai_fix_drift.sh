@@ -169,6 +169,11 @@ verify_scope_and_commit() {  # 0 if the AI's edits are in-scope, key-free and co
       && git add -- $(cat "$editable") && GIT_EDITOR=true git commit -q --amend --no-edit )
 }
 
+# 0. The hook line is CI's job (insert_hook.py), not a file the AI may edit: without it
+#    nothing here can pass, so don't spend AI attempts on it.
+python3 "$root/scripts/insert_hook.py" --check "$dir" \
+  || { echo "::error::the DAI hook line is not in create_app; fix scripts/insert_hook.py (not AI-fixable)"; exit 1; }
+
 # 1. Classify the current state of the applied patch.
 out=$(reproduce); code=$?
 printf '%s\n' "$out"

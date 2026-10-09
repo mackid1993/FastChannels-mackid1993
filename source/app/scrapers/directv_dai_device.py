@@ -68,18 +68,26 @@ def _client_device() -> dict:
     props = _saved_devices().get(address) or {}
     if props:
         _DEVICE_CACHE[address] = (now + _DEVICE_TTL, props)
-        _spawn(_recheck_device, address, props)
+        spawn(_recheck_device, address, props)
         return props
-    # First sight: hold off repeat reads for _RETRY_TTL, read in the background.
+    # First sight: hold off repeat reads for _RETRY_TTL, and read in the background, but
+    # give the read a few seconds so this first session already carries the device's
+    # identity (a stuck adb never holds the request longer than that).
     _DEVICE_CACHE[address] = (now + _RETRY_TTL, {})
-    _spawn(_first_read, address)
+    done = threading.Event()
+    spawn(_first_read, address, done)
+    done.wait(_FIRST_READ_WAIT)
     hit = _DEVICE_CACHE.get(address)
     return hit[1] if hit else {}
 
 
-def _spawn(fn, *args) -> None:
+_FIRST_READ_WAIT = 4
+
+
+def spawn(fn, *args) -> None:
     """Run fn in a daemon thread, inside the current Flask app context (the device
-    store's path comes from the app's database setting)."""
+    store's path and the database come from the app). The overlay's one background
+    runner."""
     try:
         from flask import current_app
         app = current_app._get_current_object()
@@ -94,18 +102,21 @@ def _spawn(fn, *args) -> None:
             else:
                 fn(*args)
         except Exception as exc:
-            logger.debug('[directv-dai] device read failed: %s', exc)
+            logger.warning('[directv-dai] background %s failed: %s', getattr(fn, '__name__', 'task'), exc)
     threading.Thread(target=_run, daemon=True).start()
 
 
-def _first_read(address: str) -> None:
-    props = _read_device(address)
-    if props:
-        _store_device(address, props)
-        _DEVICE_CACHE[address] = (time.time() + _DEVICE_TTL, props)
-        logger.info('[directv-dai] saved device values for %s', address)
-    else:
-        logger.warning('[directv-dai] adb read failed for %s; its sessions have no device id until a read works', address)
+def _first_read(address: str, done: threading.Event) -> None:
+    try:
+        props = _read_device(address)
+        if props:
+            _store_device(address, props)
+            _DEVICE_CACHE[address] = (time.time() + _DEVICE_TTL, props)
+            logger.info('[directv-dai] saved device values for %s', address)
+        else:
+            logger.warning('[directv-dai] adb read failed for %s; its sessions have no device id until a read works', address)
+    finally:
+        done.set()
 
 
 def _recheck_device(address: str, saved: dict) -> None:
@@ -128,9 +139,11 @@ _RETRY_TTL = 60
 
 # Request IP -> bridge address. Looking it up asks upstream's bridge_devices, which
 # reads the database and asks ah4c over HTTP, and the relay looks it up on every
-# playlist and segment fetch, so the answer is kept for a minute.
+# playlist and segment fetch, so a found box is kept for a minute and a miss (another
+# client, or an ah4c hiccup) for a few seconds.
 _BRIDGE_CACHE: dict[str, tuple[float, str | None]] = {}
 _BRIDGE_TTL = 60
+_BRIDGE_MISS_TTL = 10
 
 
 def _bridge_address(ip: str) -> str | None:
@@ -139,7 +152,7 @@ def _bridge_address(ip: str) -> str | None:
     if hit and now < hit[0]:
         return hit[1]
     address = _lookup_bridge_address(ip)
-    _BRIDGE_CACHE[ip] = (now + _BRIDGE_TTL, address)
+    _BRIDGE_CACHE[ip] = (now + (_BRIDGE_TTL if address else _BRIDGE_MISS_TTL), address)
     return address
 
 
@@ -206,12 +219,6 @@ def _save_devices(devices: dict) -> None:
 # literal (DirecTV never fills that placeholder in) and there are two spaces
 # before PureRN. 5.0.136.2002113867 is the app's versionName.
 _APP_USER_AGENT = 'APP_PROJECT_NAME/5.0.136.2002113867 (Android {release}; {model}; {board})  PureRN/0.79.5'
-
-
-def player_headers() -> dict:
-    """{'User-Agent': <the DirecTV app UA>} for a bridge device, else {}."""
-    ua = player_user_agent()
-    return {'User-Agent': ua} if ua else {}
 
 
 def player_user_agent() -> str | None:
