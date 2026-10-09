@@ -178,7 +178,10 @@ PY
   for f in $mods; do upstream_reads+=(--read "$f"); done
   local hist=()
   [ "$pass" -gt 1 ] && [ -f "$up/.aider.chat.history.md" ] && hist=(--read "$up/.aider.chat.history.md")
-  ( cd "$up" && aider --model "$model" --edit-format diff --yes-always \
+  # Provider routing (see openrouter_provider.py): never OpenInference, prefer DeepInfra.
+  python3 "$root/scripts/openrouter_provider.py" aider "$model" > "$work/aider_model_settings.json"
+  ( cd "$up" && aider --model "$model" --model-settings-file "$work/aider_model_settings.json" \
+        --edit-format diff --yes-always \
         --no-auto-commits --no-dirty-commits --no-gitignore --no-attribute-author \
         --no-attribute-committer --no-auto-lint --no-auto-test --no-suggest-shell-commands \
         --no-detect-urls --no-show-model-warnings --no-check-update --no-analytics \

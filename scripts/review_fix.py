@@ -63,8 +63,12 @@ def main() -> None:
     # it answers (same reason model-preflight uses 2048) — too small a budget truncates the
     # verdict and it reads as CONCERNS, so the cache would never be reused. No temperature:
     # some reasoning models reject a non-default value.
+    # Provider routing shared with the AI repair (openrouter_provider.py): never OpenInference.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from openrouter_provider import provider
     body = json.dumps({
         "model": model,
+        "provider": provider(),
         "max_tokens": 4096,
         "messages": [
             {"role": "system", "content": SYSTEM},

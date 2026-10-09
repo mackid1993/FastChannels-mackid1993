@@ -528,7 +528,10 @@ jobs:
           # Aider can edit only the files named on the command line; the brief, the
           # patch and AGENTS.md are read-only context. CI does all git operations and
           # validation, so Aider's own git, lint, test, shell and URL features are off.
-          aider --model "$AI_MODEL" --edit-format diff --yes-always --no-git \
+          # Provider routing (scripts/openrouter_provider.py): never OpenInference, prefer DeepInfra.
+          python3 ../overlay/scripts/openrouter_provider.py aider "$AI_MODEL" > ../aider_model_settings.json
+          aider --model "$AI_MODEL" --model-settings-file ../aider_model_settings.json \
+                --edit-format diff --yes-always --no-git \
                 --no-auto-commits --no-auto-lint --no-auto-test --no-suggest-shell-commands \
                 --no-detect-urls --no-show-model-warnings --no-check-update --no-analytics \
                 --no-pretty --map-tokens 0 --read ../conflicts.md --read ../conflict.patch \
