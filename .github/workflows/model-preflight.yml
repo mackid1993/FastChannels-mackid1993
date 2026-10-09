@@ -115,3 +115,44 @@ jobs:
             if echo "$answer" | grep -q 'PINEAPPLE-4217'; then r=OK; else r=LOST; fi
             echo "~${k}k padding: $r  prompt_tokens=$tokens  provider=$provider  answer=$answer"
           done
+
+      - name: Same check, streamed and at temperature 0 (how Aider calls the model)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+        run: |
+          model="${AI_MODEL#openrouter/}"
+          for k in 1 30 70; do
+            python3 - "$model" "$k" > req.json <<'PY'
+          import json, sys
+          model, k = sys.argv[1], int(sys.argv[2])
+          filler = "\n".join(f"def helper_{i}(x):\n    return x + {i}\n" for i in range(k * 1000 // 14))
+          print(json.dumps({"model": model, "stream": True, "temperature": 0, "usage": {"include": True}, "messages": [
+              {"role": "system", "content": "You are a helpful assistant."},
+              {"role": "user", "content": "Remember this code word for later: PINEAPPLE-4217. Reply only OK."},
+              {"role": "assistant", "content": "OK"},
+              {"role": "user", "content": "Here is a file:\n```\n" + filler + "\n```"},
+              {"role": "assistant", "content": "Noted."},
+              {"role": "user", "content": "What was the code word I gave you earlier? Reply with just the code word."}]}))
+          PY
+            curl -sS -N https://openrouter.ai/api/v1/chat/completions -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+              -H "Content-Type: application/json" -d @req.json -o stream.txt
+            python3 - <<'PY'
+          import json
+          text, provider, usage = '', '?', {}
+          for line in open('stream.txt', encoding='utf-8', errors='replace'):
+              line = line.strip()
+              if not line.startswith('data:') or line == 'data: [DONE]':
+                  continue
+              try:
+                  d = json.loads(line[5:])
+              except ValueError:
+                  continue
+              provider = d.get('provider', provider)
+              usage = d.get('usage') or usage
+              for c in d.get('choices') or []:
+                  text += (c.get('delta') or {}).get('content') or ''
+          ok = 'PINEAPPLE-4217' in text
+          print(f"stream: {'OK  ' if ok else 'LOST'} prompt_tokens={usage.get('prompt_tokens', '?')} provider={provider} answer={text.strip()[:100]!r}")
+          PY
+          done
