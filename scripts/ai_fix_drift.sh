@@ -71,10 +71,12 @@ ai_edit() {  # $1 = attempt number
   cat > "$prompt" <<'PROMPT'
 You are running FULLY AUTONOMOUSLY in CI. No human will read your reply or answer anything
 -- there is nobody to ask. Never ask a question or wait for confirmation: decide from the
-rules below and act. This chat is upstream's repository (kineticman/FastChannels): the repo
-map summarizes upstream's CURRENT files, and upstream_index.txt lists every def/class of the
-upstream modules the overlay relies on; use them to find where upstream moved what the overlay
-uses (you may also ask to see an upstream file). reproduce.log is the failing check's output.
+rules below and act. This chat is upstream's repository (kineticman/FastChannels). You have,
+read-only, the FULL CURRENT SOURCE of every upstream module the overlay relies on (e.g.
+app/scrapers/directv.py, app/routes/directv_proxy.py), plus upstream_index.txt (their
+def/class list) and the repo map (a summary of the rest of upstream). reproduce.log is the
+failing check's output. Read upstream's current code to find where it moved what the overlay
+uses.
 
 The files you can edit are the FastChannels DirecTV DAI overlay, which upstream
 kineticman/FastChannels does not have:
@@ -168,6 +170,12 @@ PY
     # shellcheck disable=SC2086
     ( cd "$up" && grep -nHE '^[[:space:]]*(async def|def|class) ' $mods 2>/dev/null )
   } > "$work/upstream_index.txt"
+  # And upstream's ACTUAL code: every module the overlay relies on, in full, read-only. The
+  # model can't re-point a reference into code it can't see (the repo map is only a
+  # summary). In the old patch these files were in the chat because the patch edited them;
+  # rehearsals without them failed.
+  local upstream_reads=() f
+  for f in $mods; do upstream_reads+=(--read "$f"); done
   local hist=()
   [ "$pass" -gt 1 ] && [ -f "$up/.aider.chat.history.md" ] && hist=(--read "$up/.aider.chat.history.md")
   ( cd "$up" && aider --model "$model" --edit-format diff --yes-always \
@@ -175,7 +183,7 @@ PY
         --no-attribute-committer --no-auto-lint --no-auto-test --no-suggest-shell-commands \
         --no-detect-urls --no-show-model-warnings --no-check-update --no-analytics \
         --no-pretty --map-tokens 2048 --read "$log" --read "$work/upstream_index.txt" \
-        --read "$root/AGENTS.md" \
+        "${upstream_reads[@]}" --read "$root/AGENTS.md" \
         --read "$root/scripts/smoke_test.py" --read "$root/scripts/validate.sh" \
         "${hist[@]}" --message-file "$prompt" "${edit[@]}" )
 }
