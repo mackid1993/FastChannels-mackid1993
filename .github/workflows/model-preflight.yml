@@ -59,3 +59,29 @@ jobs:
             -H "Authorization: Bearer $OPENROUTER_API_KEY" -o endpoints.json
           jq -r '.data.endpoints[]? | "\(.provider_name): context \(.context_length), max output \(.max_completion_tokens // "?")"' endpoints.json \
             || head -c 500 endpoints.json
+
+      - name: Check the model sees earlier messages (what Aider relies on)
+        # Aider sends the files in earlier messages and the task in the last one. A
+        # provider that drops earlier turns leaves the model saying no files were added.
+        # Tries a few times (OpenRouter may route each call to a different provider) and
+        # names the provider each time.
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+        run: |
+          model="${AI_MODEL#openrouter/}"
+          fails=0
+          for i in 1 2 3 4 5 6; do
+            jq -n --arg m "$model" '{model: $m, max_tokens: 2048, messages: [
+              {role: "system", content: "You are a helpful assistant."},
+              {role: "user", content: "Remember this code word for later: PINEAPPLE-4217. Reply only OK."},
+              {role: "assistant", content: "OK"},
+              {role: "user", content: "Here is a file:\n```\nx = 1\n```"},
+              {role: "assistant", content: "Noted."},
+              {role: "user", content: "What was the code word I gave you earlier? Reply with just the code word."}]}' > req.json
+            curl -sS https://openrouter.ai/api/v1/chat/completions -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+              -H "Content-Type: application/json" -d @req.json -o resp.json
+            provider=$(jq -r '.provider // "?"' resp.json); answer=$(jq -r '.choices[0].message.content // .error.message // "?"' resp.json | tr -d '\n' | cut -c1-80)
+            if echo "$answer" | grep -q 'PINEAPPLE-4217'; then echo "try $i: OK   provider=$provider"; else echo "try $i: LOST earlier messages  provider=$provider  answer=$answer"; fails=$((fails+1)); fi
+          done
+          [ "$fails" = 0 ] || echo "::warning::$fails of 6 calls lost the earlier messages; the AI repair can't see the files on those providers."
