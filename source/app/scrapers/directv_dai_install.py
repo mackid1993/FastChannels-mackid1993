@@ -68,6 +68,7 @@ USES = {
     'auth_expired_error': ('app.scrapers.directv', 'DirectvAuthExpiredError'),
     'code_signin_method': ('app.scrapers.directv_device_auth', 'AUTH_METHOD'),
     'app_headers': ('app.scrapers.directv_device_auth', 'app_headers'),
+    'app_user_agent': ('app.scrapers.directv_device_auth', 'APP_USER_AGENT'),
     'is_code_signin': ('app.scrapers.directv_device_auth', 'is_device_session'),
     'relay_cdn_allowed': ('app.routes.directv_proxy', '_directv_browser_cdn_allowed'),
     'scraper_cache': ('app.scrapers.base', 'BaseScraper.cache'),

@@ -88,7 +88,7 @@ _CLIENT_PARAMS = {
     # the app's bundled value: the ${...} inside are Yospace server-side macros (the app
     # does not substitute them either), so the blob goes as-is and never varies per
     # session. It drifts only on a DirecTV app update — re-extract YSLiveParams.yo.vm from
-    # the new index.android.bundle then, alongside _APP_USER_AGENT's version.
+    # the new index.android.bundle then (the app User-Agent's version is upstream's now).
     'yo.sl': '3', 'yo.d.cp': 'true',
     'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
 }

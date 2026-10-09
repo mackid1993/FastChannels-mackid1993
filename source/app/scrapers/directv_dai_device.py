@@ -225,19 +225,14 @@ def _save_devices(devices: dict) -> None:
         logger.debug('[directv-dai] could not save device values: %s', exc)
 
 
-# DirecTV's Android TV app sends this User-Agent on its player's requests (Cronet,
-# which the app has on): AnalyticsService::generateUserAgent() in libcpp_core.so,
-# from Build.VERSION.RELEASE, Build.MODEL and Build.BOARD. APP_PROJECT_NAME is
-# literal (DirecTV never fills that placeholder in) and there are two spaces
-# before PureRN. 5.0.136.2002113867 is the app's versionName.
-_APP_USER_AGENT = 'APP_PROJECT_NAME/5.0.136.2002113867 (Android {release}; {model}; {board})  PureRN/0.79.5'
-
-
 def player_user_agent() -> str | None:
-    """The DirecTV app's User-Agent for the bridge device making the current
-    request, or None when it isn't a known bridge device."""
-    props = _client_device()
-    if props.get('release') and props.get('model') and props.get('board'):
-        return _APP_USER_AGENT.format(release=props['release'], model=props['model'], board=props['board'])
-    return None
+    """The DirecTV app User-Agent the relay and the DAI authorization send for the
+    bridge device making the current request: upstream's own fixed app string
+    (directv_device_auth.APP_USER_AGENT), the one its sign-in, refresh and DRM calls
+    send, so DirecTV sees one unchanging client on the session's every request.
+    None when the request isn't from a known bridge device."""
+    if not _client_device():
+        return None
+    from .directv_dai_install import up
+    return up('app_user_agent')
 

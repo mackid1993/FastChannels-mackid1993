@@ -62,7 +62,7 @@ create_app()   # a second app in the same process (the worker does this) must no
 # would quietly turn off; fail the build with the exact name instead.
 assert install.missing() == [], f'upstream moved DAI wiring targets: {install.missing()}'
 # The lists are the spec of what's checked: a fix may rename an entry, never drop one.
-_ROLES = {'channel_fetch', 'apply_auth_result', 'resolve', 'license_request', 'lineup_rows',
+_ROLES = {'app_user_agent', 'channel_fetch', 'apply_auth_result', 'resolve', 'license_request', 'lineup_rows',
           'code_signin_result', 'relay_cdn_suffixes', 'license_content_id', 'auth_expired_error',
           'code_signin_method', 'app_headers', 'is_code_signin', 'relay_cdn_allowed', 'scraper_cache',
           'scraper_update_cache', 'known_devices', 'persist_cache', 'persist_config', 'source_model', 'db'}
@@ -108,10 +108,10 @@ assert up('relay_cdn_allowed')('csm-e-dtv-livecomplex-eb.tls1.yospace.com'), \
 import importlib.util  # noqa: E402
 assert importlib.util.find_spec('app.scrapers.dtv_android') is None, \
     'dtv_android is back: sign-in/refresh/DRM are upstream (directv_device_auth); the overlay is DAI only'
-# The relay sends the DirecTV app's own User-Agent, built from the bridge device's build
-# properties (never the bare Custom-Exoplayer fallback, which stopped ad insertion).
-assert device._APP_USER_AGENT.format(release='11', model='AFTKRT', board='karat') == \
-    'APP_PROJECT_NAME/5.0.136.2002113867 (Android 11; AFTKRT; karat)  PureRN/0.79.5'
+# The relay and the DAI authorization send upstream's own fixed DirecTV app User-Agent
+# (the one its sign-in, refresh and DRM calls send), never the bare Custom-Exoplayer
+# fallback, which stopped ad insertion.
+assert str(up('app_user_agent')).startswith('APP_PROJECT_NAME/') and 'PureRN/' in up('app_user_agent'), up('app_user_agent')
 assert device.player_user_agent() is None, 'outside a request there is no device to build a User-Agent for'
 assert not hasattr(dai, 'keep_drm_session'), 'keep_drm_session was reverted (it broke ad targeting)'
 
@@ -291,7 +291,7 @@ real_client_device = device._client_device
 device._client_device = lambda: fire
 dev = dai.build_query(config, {}, '123')
 assert dev['is_lat'] == '0' and 'adid' not in dev and dev['comscore_device'] == 'Android_Amazon_AFTKRT', dev
-assert device.player_user_agent() == 'APP_PROJECT_NAME/5.0.136.2002113867 (Android 11; AFTKRT; karat)  PureRN/0.79.5'
+assert device.player_user_agent() == up('app_user_agent'), 'a bridge device must send upstream\'s app User-Agent'
 dev_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8?yo.up=u'}, dev)
 assert dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True)
 device._client_device = lambda: {**fire, 'android_id': 'ffffffffffffffff'}
@@ -688,7 +688,7 @@ try:
     # app User-Agent; with DAI off (or from anything else) upstream's own goes out.
     device._client_device = lambda: fire
     _client.get(_ASSET + _quote(_m_url, safe=''))
-    assert (_ua_of(_m_url) or '').startswith('APP_PROJECT_NAME/'), _wire_log[-1:]
+    assert _ua_of(_m_url) == up('app_user_agent'), _wire_log[-1:]
     dai.dai_on = lambda: False
     _client.get(_ASSET + _quote(_m_url, safe=''))
     _upstream_ua = getattr(directv_proxy, '_BROWSER_UA', None)

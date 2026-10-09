@@ -6,11 +6,11 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 ---
  app/scrapers/directv_dai.py         | 1080 +++++++++++++++++++++++++
- app/scrapers/directv_dai_device.py  |  243 ++++++
- app/scrapers/directv_dai_install.py | 1124 +++++++++++++++++++++++++++
+ app/scrapers/directv_dai_device.py  |  238 ++++++
+ app/scrapers/directv_dai_install.py | 1125 +++++++++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 ++
  app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++++++
- 5 files changed, 3159 insertions(+)
+ 5 files changed, 3155 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -19,7 +19,7 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..c96e570
+index 0000000..eef122d
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
 @@ -0,0 +1,1080 @@
@@ -113,7 +113,7 @@ index 0000000..c96e570
 +    # the app's bundled value: the ${...} inside are Yospace server-side macros (the app
 +    # does not substitute them either), so the blob goes as-is and never varies per
 +    # session. It drifts only on a DirecTV app update — re-extract YSLiveParams.yo.vm from
-+    # the new index.android.bundle then, alongside _APP_USER_AGENT's version.
++    # the new index.android.bundle then (the app User-Agent's version is upstream's now).
 +    'yo.sl': '3', 'yo.d.cp': 'true',
 +    'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
 +}
@@ -1105,10 +1105,10 @@ index 0000000..c96e570
 +        capture_in_background(uncaptured_addresses())
 diff --git a/app/scrapers/directv_dai_device.py b/app/scrapers/directv_dai_device.py
 new file mode 100644
-index 0000000..057dbde
+index 0000000..fa938b6
 --- /dev/null
 +++ b/app/scrapers/directv_dai_device.py
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,238 @@
 +"""The bridge device a DirecTV DAI tune plays on: its identity and app User-Agent.
 +
 +DAI targets the playback device the way DirecTV's Android TV app does, so this reads
@@ -1336,28 +1336,23 @@ index 0000000..057dbde
 +        logger.debug('[directv-dai] could not save device values: %s', exc)
 +
 +
-+# DirecTV's Android TV app sends this User-Agent on its player's requests (Cronet,
-+# which the app has on): AnalyticsService::generateUserAgent() in libcpp_core.so,
-+# from Build.VERSION.RELEASE, Build.MODEL and Build.BOARD. APP_PROJECT_NAME is
-+# literal (DirecTV never fills that placeholder in) and there are two spaces
-+# before PureRN. 5.0.136.2002113867 is the app's versionName.
-+_APP_USER_AGENT = 'APP_PROJECT_NAME/5.0.136.2002113867 (Android {release}; {model}; {board})  PureRN/0.79.5'
-+
-+
 +def player_user_agent() -> str | None:
-+    """The DirecTV app's User-Agent for the bridge device making the current
-+    request, or None when it isn't a known bridge device."""
-+    props = _client_device()
-+    if props.get('release') and props.get('model') and props.get('board'):
-+        return _APP_USER_AGENT.format(release=props['release'], model=props['model'], board=props['board'])
-+    return None
++    """The DirecTV app User-Agent the relay and the DAI authorization send for the
++    bridge device making the current request: upstream's own fixed app string
++    (directv_device_auth.APP_USER_AGENT), the one its sign-in, refresh and DRM calls
++    send, so DirecTV sees one unchanging client on the session's every request.
++    None when the request isn't from a known bridge device."""
++    if not _client_device():
++        return None
++    from .directv_dai_install import up
++    return up('app_user_agent')
 +
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..b793532
+index 0000000..54fb725
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,1124 @@
+@@ -0,0 +1,1125 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
@@ -1428,6 +1423,7 @@ index 0000000..b793532
 +    'auth_expired_error': ('app.scrapers.directv', 'DirectvAuthExpiredError'),
 +    'code_signin_method': ('app.scrapers.directv_device_auth', 'AUTH_METHOD'),
 +    'app_headers': ('app.scrapers.directv_device_auth', 'app_headers'),
++    'app_user_agent': ('app.scrapers.directv_device_auth', 'APP_USER_AGENT'),
 +    'is_code_signin': ('app.scrapers.directv_device_auth', 'is_device_session'),
 +    'relay_cdn_allowed': ('app.routes.directv_proxy', '_directv_browser_cdn_allowed'),
 +    'scraper_cache': ('app.scrapers.base', 'BaseScraper.cache'),
