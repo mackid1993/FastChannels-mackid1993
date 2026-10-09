@@ -135,13 +135,32 @@ PROMPT
   # Aider edits only the files named here; the log, AGENTS.md, the overlay's two tests (the
   # spec) and -- on a retry -- its own prior chat history are read-only context. CI does all
   # git/validation, so Aider's own git, lint, test, shell and URL features are off.
-  # Map of upstream's CURRENT tree (files + every def/class) so the AI can find where code
-  # moved: it edits only the patch's files, but must see the rest to re-wire the hooks.
-  { echo "# upstream files:"
-    ( cd "$up" && find app -type f \( -name '*.py' -o -name '*.html' \) | sort )
-    echo; echo "# definitions (path:line: def/class):"
-    ( cd "$up" && find app -name '*.py' -type f -print0 | sort -z \
-        | xargs -0 grep -nHE '^[[:space:]]*(async def|def|class) ' 2>/dev/null )
+  # Map of upstream's CURRENT code, kept small on purpose: every def/class in the upstream
+  # modules the overlay relies on (TARGETS/USES/SOURCE_MARKERS) and in any upstream file the
+  # failure names, plus the list of upstream Python files (so a name moved to another file
+  # can be found). The whole-app index was ~56k tokens and, with the overlay and the tests,
+  # pushed the request past what the model reliably reads: it lost the files it was given.
+  local mods
+  mods=$( cd "$up" && python3 - "$log" <<'PY'
+import ast, os, re, sys
+t = ast.parse(open('app/scrapers/directv_dai_install.py', encoding='utf-8').read())
+c = {n.targets[0].id: ast.literal_eval(n.value) for n in t.body if isinstance(n, ast.Assign)
+     and isinstance(n.targets[0], ast.Name) and n.targets[0].id in ('TARGETS', 'USES', 'SOURCE_MARKERS')}
+files = set()
+for module, _ in c.get('TARGETS', ()) + c.get('USES', ()):
+    base = module.replace('.', '/')
+    files.update(f for f in (base + '.py', base + '/__init__.py') if os.path.isfile(f))
+files.update(p for p, _, _ in c.get('SOURCE_MARKERS', ()) if p.endswith('.py') and os.path.isfile(p))
+log = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+files.update(f for f in re.findall(r'\bapp/[\w/]+\.py\b', log) if os.path.isfile(f))
+print(' '.join(sorted(files)))
+PY
+  )
+  { echo "# upstream Python files:"
+    ( cd "$up" && find app -type f -name '*.py' | sort )
+    echo; echo "# definitions in the upstream modules the overlay relies on (path:line: def/class):"
+    # shellcheck disable=SC2086
+    ( cd "$up" && grep -nHE '^[[:space:]]*(async def|def|class) ' $mods 2>/dev/null )
   } > "$work/upstream_index.txt"
   local hist=()
   [ "$pass" -gt 1 ] && [ -f "$up/.aider.chat.history.md" ] && hist=(--read "$up/.aider.chat.history.md")
