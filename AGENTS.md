@@ -102,7 +102,7 @@ What the overlay relies on in upstream, all listed at the top of `directv_dai_in
 
 Our routes (our blueprint): `/directv-dai` (the panel page), `/directv-dai/admin.js`, `/directv-dai/status`, `/directv-dai/sources`, `/api/sources/<id>/directv-dai` (read/save the toggle), `/api/sources/<id>/directv-profile`, `/api/sources/<id>/directv-capture-adids`. A session the old overlay signed in (`auth_method: 'dtv_android'`) is re-tagged once to upstream's `AUTH_METHOD` (`migrate_old_sessions`).
 
-If upstream renames something, change the reference in `directv_dai_install.py` (and the module that uses it), and the entry in `TARGETS`/`USES`/`SOURCE_MARKERS`. **Never edit an upstream file, never drop an entry to make a check pass** (the smoke test counts them).
+`TARGETS` and `USES` are dicts keyed by a fixed **role** (`'channel_fetch'`, `'source_model'`, ...) whose value is upstream's `(module, 'name' or 'Class.name')`. The overlay's modules **and `smoke_test.py`** reach upstream only through the role (`install.up(role)`, `up_name`, `up_owner`, `up_set`), never by name, so if upstream renames or moves something, **the fix is that role's value, one line**, and the tests follow it (rehearsed: a rename of `_fetch_channel_playback` plus that one-line change passes `validate.sh` and `smoke_test.py`). **Never edit an upstream file, never rename or drop a role to make a check pass** (the smoke test requires every role).
 
 ### Our modules
 
@@ -138,7 +138,7 @@ Invariants a port must keep:
 The patch only adds our own modules (`directv_dai.py`, `directv_dai_device.py`, `directv_dai_install.py`, `dtv_aac_ads.py`, `dtv_aac_gain.py`), and the one line in `create_app` is inserted by `scripts/insert_hook.py`, not carried as a hunk. So:
 
 - **A conflict** (`git am` fails) can only mean upstream added a file with one of our modules' names. The `resolve` job re-inserts the hook line after the merge, as `apply-patches.sh` does. If `insert_hook.py` fails (`apply-patches.sh` exits 3, not reported as a conflict), upstream's app factory changed shape: update `insert_hook.py` (a human change), never `app/__init__.py`; `ai_fix_drift.sh` stops early on it.
-- **Drift** (the patch applies but `validate.sh`/`smoke_test.py` fails) means upstream renamed, moved or reshaped something in `TARGETS`, `USES`, `SOURCE_MARKERS` or `RELAY_PREFIX`. The failure names it. Find the new name in `upstream_index.txt`, update the entry and every reference in our modules, and keep the behavior. If a wrapped target's shape changed (new arguments, a different return value), adapt the wrapper to it.
+- **Drift** (the patch applies but `validate.sh`/`smoke_test.py` fails) means upstream renamed, moved or reshaped something in `TARGETS`, `USES`, `SOURCE_MARKERS` or `RELAY_PREFIX`. The failure names it. Find the new name in `upstream_index.txt`, change that role's value in `TARGETS`/`USES`, and keep the behavior. If a wrapped target's shape changed (new arguments, a different return value), adapt the wrapper to it.
 - **Never touch an upstream file.** CI inserts the hook line and `validate.sh` rejects any other change to upstream's files.
 - **Never drop an entry or weaken a check** to get green; the smoke test counts the entries.
 - **The AI runs unattended.** It never asks a question. When what the overlay needs is truly gone from upstream, it says so in one sentence and makes no edit.

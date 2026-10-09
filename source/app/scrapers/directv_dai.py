@@ -28,6 +28,22 @@ from . import directv_dai_device as device
 
 logger = logging.getLogger(__name__)
 
+
+# Upstream's objects, by role (the registry is TARGETS/USES in directv_dai_install).
+def _up(role):
+    from .directv_dai_install import up
+    return up(role)
+
+
+def _up_name(role):
+    from .directv_dai_install import up_name
+    return up_name(role)
+
+
+def _up_owner(role):
+    from .directv_dai_install import up_owner
+    return up_owner(role)
+
 _LOCATION_URL = "https://api.cld.dtvce.com/right/location/area/v2/service/location"
 _BASICINFO_URL = "https://api.cld.dtvce.com/profile/information/basicinfogo/service"
 
@@ -111,7 +127,7 @@ def dai_on() -> bool:
     if now < _DAI_ON[0]:
         return _DAI_ON[1]
     try:
-        from ..models import Source
+        Source = _up('source_model')
         on = any(enabled(src.config) for src in Source.query.filter_by(name='directv').all())
     except Exception:
         on = _DAI_ON[1]
@@ -574,8 +590,8 @@ def _bust_playback_cache() -> None:
     was built). cached_url_usable already refetches on an id mismatch; this makes it
     explicit so there's no window where a stale URL is served after a capture."""
     try:
-        from ..config_store import persist_source_cache_updates
-        from ..models import Source
+        persist_source_cache_updates = _up('persist_cache')
+        Source = _up('source_model')
         src = Source.query.filter_by(name='directv').first()
         if src:
             persist_source_cache_updates(src.id, {'directv_playback': {}, 'dai_playback_by_device': {}})
@@ -696,7 +712,7 @@ def note_channels(scraper, rows) -> None:
     """Record each lineup row's DAI "net" tag (daiChannelName) in the scraper's cache,
     where a tune reads it. Called with every AllChannels page of rows; writes the cache
     only when something changed."""
-    names = scraper.cache.get('dai_channel_names')
+    names = getattr(scraper, _up_name('scraper_cache')).get('dai_channel_names')
     names = dict(names) if isinstance(names, dict) else {}
     changed = False
     for row in rows or []:
@@ -712,7 +728,7 @@ def note_channels(scraper, rows) -> None:
             names[ccid] = value.strip()
             changed = True
     if changed:
-        scraper._update_cache('dai_channel_names', names)
+        getattr(scraper, _up_name('scraper_update_cache'))('dai_channel_names', names)
 
 
 # ── Login ────────────────────────────────────────────────────────────────────
@@ -730,9 +746,8 @@ def store_login_result(cfg: dict, result: dict) -> None:
     if (enabled(cfg) and 'dai_context' not in result and result.get('bearer_token')
             and (result.get('auth_method') == 'device_code' or not cfg.get('dai_dma_id'))):
         try:
-            from . import directv_device_auth
             account = requests.Session()
-            account.headers.update(directv_device_auth.app_headers())
+            account.headers.update(_up('app_headers')())
             result = {**result, 'dai_context': fetch_account_context(account, result['bearer_token'])}
         except Exception as exc:
             logger.warning('[directv-dai] could not fetch DAI context at login: %s', exc)
@@ -850,20 +865,17 @@ _PROFILE_LOCK_TTL = 120
 
 
 def _profile_headers() -> dict:
-    from . import directv_device_auth
-    return directv_device_auth.app_headers()
+    return _up('app_headers')()
 
 
 def _profile_client_id() -> str:
-    from . import directv_device_auth
-    return getattr(directv_device_auth, '_CLIENT_ID', None) or 'UNIFIED_Android_TV_02'
+    return getattr(_up_owner('app_headers'), '_CLIENT_ID', None) or 'UNIFIED_Android_TV_02'
 
 
 def profiles_supported(config: dict | None) -> bool:
     """Profiles need the Android TV code sign-in (the profiletoken exchange is that
     client's); a web email/password session can't run them."""
-    from . import directv_device_auth
-    return bool(directv_device_auth.is_device_session(config or {}))
+    return bool(_up('is_code_signin')(config or {}))
 
 
 def list_profiles(bearer: str) -> dict:
@@ -960,7 +972,7 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
     if not rt:
         return {'ok': False, 'profid': False, 'error': 'no refresh token: sign in first'}
 
-    from ..extensions import db
+    db = _up('db')
     rdb = _redis()
     lock_key = f'directv:auth:refreshing:{source.name}'
     have_lock = True
@@ -1008,7 +1020,7 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
                 pass
     # The next tune opens a session with the new profid.
     try:
-        from ..config_store import persist_source_cache_updates
+        persist_source_cache_updates = _up('persist_cache')
         persist_source_cache_updates(source.id, {'directv_playback': {}, 'dai_playback_by_device': {}})
     except Exception:
         logger.debug('[directv-dai] could not clear cached streams after the profile switch', exc_info=True)
@@ -1037,15 +1049,14 @@ def settings_changed(source, old: dict, current: dict) -> None:
 def _fetch_missing_account_context(source_id: int) -> None:
     """DAI was turned on for a session whose sign-in ran with DAI off: fetch the
     account's DMA/ZIP/consent now (the same request sign-in makes), with its bearer."""
-    from ..config_store import persist_source_config_updates
-    from ..models import Source
-    from . import directv_device_auth
+    persist_source_config_updates = _up('persist_config')
+    Source = _up('source_model')
     src = Source.query.get(source_id)
     cfg = dict((src.config if src else None) or {})
     if not cfg.get('bearer_token') or cfg.get('dai_dma_id'):
         return
     account = requests.Session()
-    account.headers.update(directv_device_auth.app_headers())
+    account.headers.update(_up('app_headers')())
     ctx = fetch_account_context(account, cfg['bearer_token'])
     updates = {f'dai_{k}': v for k, v in ctx.items() if v}
     if updates:
@@ -1059,7 +1070,7 @@ def clear_cache_if_toggled(source, old: dict, current: dict) -> None:
     if getattr(source, 'name', None) != 'directv':
         return
     if enabled(old) != enabled(current):
-        from ..config_store import persist_source_cache_updates
+        persist_source_cache_updates = _up('persist_cache')
         persist_source_cache_updates(source.id, {'directv_playback': {}, 'dai_playback_by_device': {}})
     if enabled(current):
         # Whenever DAI is saved on, capture the advertising id of any bridge device that

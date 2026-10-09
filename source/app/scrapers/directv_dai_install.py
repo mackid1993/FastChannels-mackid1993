@@ -47,33 +47,37 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Upstream names install() wraps or changes in place: (module, attribute path).
-TARGETS = (
-    ('app.scrapers.directv', '_fetch_channel_playback'),
-    ('app.scrapers.directv', 'apply_auth_result'),
-    ('app.scrapers.directv', 'DirectvScraper.resolve'),
-    ('app.scrapers.directv', 'DirectvScraper.prepare_license_request'),
-    ('app.scrapers.directv', 'DirectvScraper._fetch_allchannels_rows'),
-    ('app.scrapers.directv_device_auth', '_result'),
-    ('app.routes.directv_proxy', '_DIRECTV_BROWSER_CDN_SUFFIXES'),
-)
-# Upstream names the overlay's modules call or read without wrapping them. Checked the
-# same way as TARGETS, so a rename fails CI with its name instead of a vague error.
-USES = (
-    ('app.scrapers.directv', '_license_content_id_from_stream_url'),
-    ('app.scrapers.directv', 'DirectvAuthExpiredError'),
-    ('app.scrapers.directv_device_auth', 'AUTH_METHOD'),
-    ('app.scrapers.directv_device_auth', 'app_headers'),
-    ('app.scrapers.directv_device_auth', 'is_device_session'),
-    ('app.routes.directv_proxy', '_directv_browser_cdn_allowed'),
-    ('app.scrapers.base', 'BaseScraper.cache'),
-    ('app.scrapers.base', 'BaseScraper._update_cache'),
-    ('app.bridge_devices', 'known_devices'),
-    ('app.config_store', 'persist_source_cache_updates'),
-    ('app.config_store', 'persist_source_config_updates'),
-    ('app.models', 'Source'),
-    ('app.extensions', 'db'),
-)
+# EVERY upstream name the overlay touches, keyed by a ROLE that never changes. The
+# overlay's code and its tests reach upstream only through these roles (up(role)), never
+# by writing upstream's names elsewhere, so when upstream renames or moves something the
+# whole fix is the one (module, attribute path) value of its role here.
+#
+# TARGETS: names install() wraps or changes in place.
+TARGETS = {
+    'channel_fetch': ('app.scrapers.directv', '_fetch_channel_playback'),
+    'apply_auth_result': ('app.scrapers.directv', 'apply_auth_result'),
+    'resolve': ('app.scrapers.directv', 'DirectvScraper.resolve'),
+    'license_request': ('app.scrapers.directv', 'DirectvScraper.prepare_license_request'),
+    'lineup_rows': ('app.scrapers.directv', 'DirectvScraper._fetch_allchannels_rows'),
+    'code_signin_result': ('app.scrapers.directv_device_auth', '_result'),
+    'relay_cdn_suffixes': ('app.routes.directv_proxy', '_DIRECTV_BROWSER_CDN_SUFFIXES'),
+}
+# USES: names the overlay's modules call or read without wrapping them.
+USES = {
+    'license_content_id': ('app.scrapers.directv', '_license_content_id_from_stream_url'),
+    'auth_expired_error': ('app.scrapers.directv', 'DirectvAuthExpiredError'),
+    'code_signin_method': ('app.scrapers.directv_device_auth', 'AUTH_METHOD'),
+    'app_headers': ('app.scrapers.directv_device_auth', 'app_headers'),
+    'is_code_signin': ('app.scrapers.directv_device_auth', 'is_device_session'),
+    'relay_cdn_allowed': ('app.routes.directv_proxy', '_directv_browser_cdn_allowed'),
+    'scraper_cache': ('app.scrapers.base', 'BaseScraper.cache'),
+    'scraper_update_cache': ('app.scrapers.base', 'BaseScraper._update_cache'),
+    'known_devices': ('app.bridge_devices', 'known_devices'),
+    'persist_cache': ('app.config_store', 'persist_source_cache_updates'),
+    'persist_config': ('app.config_store', 'persist_source_config_updates'),
+    'source_model': ('app.models', 'Source'),
+    'db': ('app.extensions', 'db'),
+}
 # The relay's URL space. The Player app and Channels fetch these URLs, so they're the
 # most stable contract upstream has; the HTTP-layer hooks key on this prefix only.
 RELAY_PREFIX = '/play/directv/'
@@ -115,10 +119,36 @@ def _resolve(module_name: str, path: str):
     return obj
 
 
+def _where(role: str) -> tuple[str, str]:
+    return TARGETS.get(role) or USES[role]
+
+
+def up(role: str):
+    """Upstream's object for a role (see TARGETS/USES), looked up now."""
+    return _resolve(*_where(role))
+
+
+def up_name(role: str) -> str:
+    """The attribute name of a role's object (the last part of its path)."""
+    return _where(role)[1].rpartition('.')[2]
+
+
+def up_owner(role: str):
+    """The module or class holding a role's object, to read or replace it in place."""
+    import importlib
+    module_name, path = _where(role)
+    head = path.rpartition('.')[0]
+    return _resolve(module_name, head) if head else importlib.import_module(module_name)
+
+
+def up_set(role: str, value) -> None:
+    setattr(up_owner(role), up_name(role), value)
+
+
 def missing() -> list[str]:
     """TARGETS and USES that don't exist in this upstream (empty = everything present)."""
     gone = []
-    for module_name, path in (*TARGETS, *USES):
+    for module_name, path in (*TARGETS.values(), *USES.values()):
         try:
             _resolve(module_name, path)
         except Exception:
@@ -295,32 +325,32 @@ def runtime_warnings() -> list[str]:
 # ── Scraper (app/scrapers/directv.py) ───────────────────────────────────────────
 
 def _patch_scraper() -> None:
-    from . import directv, directv_dai
-    cls = directv.DirectvScraper
+    from . import directv_dai
 
     # resolve(): drop a cached URL from the other DAI setting (or, with DAI on, another
     # device), run upstream's resolve with this scraper as the tune context, then check
     # the tune really got DAI.
-    orig_resolve = cls.resolve
+    orig_resolve = up('resolve')
     if not _already(orig_resolve):
         def resolve(self, raw_url, *a, **kw):
             dai, names = False, None
             try:
                 dai = directv_dai.enabled(self.config)
-                names = self.cache.get('dai_channel_names')
+                cache = getattr(self, up_name('scraper_cache'))
+                names = cache.get('dai_channel_names')
                 # Only this channel's entry, and only in memory: upstream's own refetch
                 # then saves the fresh one. Other channels' entries (maybe another box's
                 # session) are left alone.
                 ccid = _ccid(raw_url)
-                playback = self.cache.get('directv_playback') or {}
+                playback = cache.get('directv_playback') or {}
                 if dai:
-                    mine = _device_session(self.cache, self.config, ccid)
+                    mine = _device_session(cache, self.config, ccid)
                     if mine:   # this box's own session: upstream's cache check reuses it
                         playback = {**playback, ccid: mine}
-                        self.cache['directv_playback'] = playback
+                        cache['directv_playback'] = playback
                 cached = playback.get(ccid)
                 if isinstance(cached, dict) and not directv_dai.cached_url_usable(cached, dai):
-                    self.cache['directv_playback'] = {k: v for k, v in playback.items() if k != ccid}
+                    cache['directv_playback'] = {k: v for k, v in playback.items() if k != ccid}
             except Exception:
                 _note('error', 'resolve: cache check')
                 logger.exception('[directv-dai] cache check failed')
@@ -338,18 +368,18 @@ def _patch_scraper() -> None:
                 except Exception:
                     logger.exception('[directv-dai] tune check failed')
             return url
-        cls.resolve = _wraps(orig_resolve, resolve)
+        up_set('resolve', _wraps(orig_resolve, resolve))
 
-    # prepare_license_request() (a classmethod): its fallback fetch uses the same session type.
-    orig_license = cls.__dict__.get('prepare_license_request')
+    # The license request (a classmethod): its fallback fetch uses the same session type.
+    orig_license = up_owner('license_request').__dict__.get(up_name('license_request'))
     if not isinstance(orig_license, classmethod):
-        _fail('DirectvScraper.prepare_license_request is no longer a classmethod; '
+        _fail(f"{'.'.join(_where('license_request'))} is no longer a classmethod; "
               'its fallback fetch would skip DAI (adapt _patch_scraper)')
     elif not _already(orig_license):
         fn = orig_license.__func__
         lic_sig = inspect.signature(fn)
         if 'config' not in lic_sig.parameters:
-            _fail("DirectvScraper.prepare_license_request has no 'config' argument any more (adapt _patch_scraper)")
+            _fail(f"{'.'.join(_where('license_request'))} has no 'config' argument any more (adapt _patch_scraper)")
         else:
             def prepare_license_request(klass, *a, **kw):
                 config = None
@@ -372,10 +402,10 @@ def _patch_scraper() -> None:
                     return fn(klass, *a, **kw)
                 finally:
                     _TUNE.reset(token)
-            cls.prepare_license_request = classmethod(_wraps(fn, prepare_license_request))
+            up_set('license_request', classmethod(_wraps(fn, prepare_license_request)))
 
     # The lineup rows carry each channel's daiChannelName (the Yospace `net` flag).
-    orig_rows = cls._fetch_allchannels_rows
+    orig_rows = up('lineup_rows')
     if not _already(orig_rows):
         def _fetch_allchannels_rows(self, *a, **kw):
             rows = orig_rows(self, *a, **kw)
@@ -384,18 +414,18 @@ def _patch_scraper() -> None:
             except Exception:
                 logger.exception('[directv-dai] could not record channel names')
             return rows
-        cls._fetch_allchannels_rows = _wraps(orig_rows, _fetch_allchannels_rows)
+        up_set('lineup_rows', _wraps(orig_rows, _fetch_allchannels_rows))
 
     # The channel authorization: with DAI on, the Android TV app's channel/v2 request.
-    orig_fetch = directv._fetch_channel_playback
+    orig_fetch = up('channel_fetch')
     if not _already(orig_fetch):
         sig = inspect.signature(orig_fetch)
         gone = [n for n in _FETCH_ARGS if n not in sig.parameters]
         if gone:
-            _fail(f'_fetch_channel_playback no longer takes {", ".join(gone)}; '
+            _fail(f'{up_name("channel_fetch")} no longer takes {", ".join(gone)}; '
                   'DAI tunes fall back to non-DAI (adapt _fetch_dai_playback)')
 
-        def _fetch_channel_playback(*args, **kwargs):
+        def channel_fetch(*args, **kwargs):
             tune = _TUNE.get()
             flags = bound = None
             if tune and not gone:
@@ -413,8 +443,8 @@ def _patch_scraper() -> None:
             state['called'] = True
             reason = 'no DAI stream for this channel'
             try:
-                result = _fetch_dai_playback(directv, bound, flags)
-            except directv.DirectvAuthExpiredError:
+                result = _fetch_dai_playback(bound, flags)
+            except up('auth_expired_error'):
                 raise
             except Exception as exc:
                 logger.exception('[directv-dai] DAI authorization failed')
@@ -426,10 +456,10 @@ def _patch_scraper() -> None:
             _note('fallback', reason if isinstance(reason, str) else '')
             logger.warning('[directv-dai] no DAI stream for this tune; playing without DAI')
             return orig_fetch(*args, **kwargs)
-        directv._fetch_channel_playback = _wraps(orig_fetch, _fetch_channel_playback)
+        up_set('channel_fetch', _wraps(orig_fetch, channel_fetch))
 
     # Every sign-in and refresh goes through apply_auth_result: add the DAI account values.
-    orig_apply = directv.apply_auth_result
+    orig_apply = up('apply_auth_result')
     if not _already(orig_apply):
         def apply_auth_result(cfg, result, *a, **kw):
             out = orig_apply(cfg, result, *a, **kw)
@@ -438,7 +468,7 @@ def _patch_scraper() -> None:
             except Exception:
                 logger.exception('[directv-dai] could not store the DAI login values')
             return out
-        directv.apply_auth_result = _wraps(orig_apply, apply_auth_result)
+        up_set('apply_auth_result', _wraps(orig_apply, apply_auth_result))
 
 
 def _bearer_tag(config) -> str:
@@ -462,15 +492,16 @@ def _save_device_session(scraper, ccid: str) -> None:
     """After a tune made a new DAI session, keep it under this box too (expired ones pruned)."""
     from . import directv_dai
     address = directv_dai._current_bridge_address()
-    entry = (scraper.cache.get('directv_playback') or {}).get(ccid)
+    cache = getattr(scraper, up_name('scraper_cache'))
+    entry = (cache.get('directv_playback') or {}).get(ccid)
     if not address or not isinstance(entry, dict) or not entry.get('dai'):
         return
     now = time.time()
     store = {a: {c: e for c, e in (m or {}).items()
                  if isinstance(e, dict) and now - float(e.get('cached_at') or 0) <= _DEVICE_SESSION_TTL}
-             for a, m in (scraper.cache.get(DEVICE_SESSIONS) or {}).items()}
+             for a, m in (cache.get(DEVICE_SESSIONS) or {}).items()}
     store.setdefault(address, {})[ccid] = {**entry, 'bearer_tag': _bearer_tag(scraper.config)}
-    scraper._update_cache(DEVICE_SESSIONS, {a: m for a, m in store.items() if m})
+    getattr(scraper, up_name('scraper_update_cache'))(DEVICE_SESSIONS, {a: m for a, m in store.items() if m})
 
 
 def _ccid(raw_url) -> str:
@@ -488,23 +519,24 @@ def _check_tune(scraper, raw_url: str, url, state: dict) -> None:
     # Not fetched this time: a cache hit of a DAI entry is fine (a channel with no DAI
     # stream caches its non-Yospace URL tagged dai=True); anything else means upstream's
     # resolve no longer goes through the fetch we wrap.
-    cached = (scraper.cache.get('directv_playback') or {}).get(_ccid(raw_url))
+    cached = (getattr(scraper, up_name('scraper_cache')).get('directv_playback') or {}).get(_ccid(raw_url))
     if isinstance(cached, dict) and cached.get('dai'):
         return
-    _note('bypassed', 'resolve() returned without calling _fetch_channel_playback')
+    _note('bypassed', f'resolve() returned without calling {up_name("channel_fetch")}')
 
 
-def _fetch_dai_playback(directv, args: dict, flags: dict) -> dict | None:
+def _fetch_dai_playback(args: dict, flags: dict) -> dict | None:
     """The Android TV app's channel authorization (channel/v2): its query, the device's
     app User-Agent, no browser Origin/Referer. Returns upstream's playback dict shape
     plus 'dai': True. Raises upstream's DirectvAuthExpiredError on an expired token,
     so upstream's re-auth runs exactly as on its own request."""
     from . import directv_dai, directv_dai_device
+    scraper_module = up_owner('channel_fetch')
     ccid = args['ccid']
     session = requests.Session()
     session.headers.update({'Accept': '*/*', 'Authorization': f"Bearer {args.get('bearer_token') or ''}"})
     # The bridge device's own app User-Agent; for any other requester, upstream's own.
-    ua = directv_dai_device.player_user_agent() or getattr(directv, '_UA', None)
+    ua = directv_dai_device.player_user_agent() or getattr(scraper_module, '_UA', None)
     if ua:
         session.headers['User-Agent'] = ua
     for c in args.get('cookies') or []:
@@ -527,7 +559,7 @@ def _fetch_dai_playback(directv, args: dict, flags: dict) -> dict | None:
         text = str(status.get('errorText') or status.get('message') or '').strip()
         logger.warning('[directv-dai] channel/v2 not authorized for ccid=%s errorCode=%s', ccid, code or '?')
         if code == '0015' or 'access token has expired' in text.lower():
-            raise directv.DirectvAuthExpiredError(text or 'access token has expired')
+            raise up('auth_expired_error')(text or 'access token has expired')
         return None
     url = directv_dai.pick_stream_url(data.get('playbackData') or {}, flags)
     play_token = (data.get('dRights') or {}).get('playToken')
@@ -536,18 +568,16 @@ def _fetch_dai_playback(directv, args: dict, flags: dict) -> dict | None:
     return {
         'fallback_url': url,
         'play_token': play_token,
-        'license_content_id': directv._license_content_id_from_stream_url(url, ccid),
+        'license_content_id': up('license_content_id')(url, ccid),
         'cached_at': time.time(),
         'dai': True,
     }
 
 
 def _patch_device_auth() -> None:
-    from . import directv_device_auth as auth
-
     # The grant's valuePairs carry the household id (hhid/u); upstream keeps only the
     # activation token from them, so carry the ids through for store_login_result.
-    orig_result = auth._result
+    orig_result = up('code_signin_result')
     if not _already(orig_result):
         def _result(token_data, *a, **kw):
             out = orig_result(token_data, *a, **kw)
@@ -560,24 +590,22 @@ def _patch_device_auth() -> None:
             except Exception:
                 logger.exception('[directv-dai] could not read the sign-in ids')
             return out
-        auth._result = _wraps(orig_result, _result)
+        up_set('code_signin_result', _wraps(orig_result, _result))
 
 
 # ── Relay: hosts, User-Agent, ad audio (all at the HTTP layer) ─────────────────────
 
 def _patch_relay_hosts() -> None:
     """Yospace playlists take upstream's relay (so the HTTP-layer hooks see them)."""
-    from ..routes import directv_proxy as proxy
-    suffixes = proxy._DIRECTV_BROWSER_CDN_SUFFIXES
+    suffixes = up('relay_cdn_suffixes')
     if 'yospace.com' not in suffixes:
-        proxy._DIRECTV_BROWSER_CDN_SUFFIXES = (*suffixes, 'yospace.com')
+        up_set('relay_cdn_suffixes', (*suffixes, 'yospace.com'))
 
 
 def _relay_host(host: str) -> bool:
     """Upstream's own DirecTV CDN allowlist (with yospace.com added)."""
     try:
-        from ..routes import directv_proxy as proxy
-        return bool(proxy._directv_browser_cdn_allowed(host or ''))
+        return bool(up('relay_cdn_allowed')(host or ''))
     except Exception:
         return False
 
@@ -665,11 +693,11 @@ def _register_relay_hooks(app) -> None:
 
 
 def _serve_ad_segment(raw_url: str, Response):
-    from ..routes import directv_proxy as proxy
     from . import dtv_aac_gain
     headers = {}
-    if getattr(proxy, '_BROWSER_UA', None):
-        headers['User-Agent'] = proxy._BROWSER_UA   # the app UA replaces it (see _patch_user_agent)
+    browser_ua = getattr(up_owner('relay_cdn_allowed'), '_BROWSER_UA', None)   # optional
+    if browser_ua:
+        headers['User-Agent'] = browser_ua   # the app UA replaces it (see _patch_user_agent)
     try:
         r = requests.get(raw_url, headers=headers, timeout=(5, 30))
     except Exception as exc:
@@ -697,13 +725,10 @@ def migrate_old_sessions() -> None:
     """The old overlay signed in with the same UNIFIED_Android_TV_02 grant upstream uses
     now, but tagged it auth_method 'dtv_android'. Re-tag it to upstream's tag, so
     upstream refreshes it and nobody signs in again. Needs an app context."""
-    from ..config_store import persist_source_config_updates
-    from ..models import Source
-    from . import directv_device_auth as auth
-    for src in Source.query.filter_by(name='directv').all():
+    for src in up('source_model').query.filter_by(name='directv').all():
         cfg = src.config or {}
         if cfg.get('auth_method') == 'dtv_android' and cfg.get('refresh_token'):
-            persist_source_config_updates(src.id, {'auth_method': auth.AUTH_METHOD})
+            up('persist_config')(src.id, {'auth_method': up('code_signin_method')})
             logger.info("[directv-dai] re-tagged the old overlay sign-in as upstream's code sign-in")
 
 
@@ -713,10 +738,10 @@ def _register_migration(app) -> None:
     done = [False]
 
     def attempt():
-        from ..extensions import db
+        db = up('db')
         try:
             from sqlalchemy import inspect as sa_inspect
-            from ..models import Source
+            Source = up('source_model')
             ready = sa_inspect(db.engine).has_table(Source.__tablename__)
         except Exception:
             logger.debug('[directv-dai] database not ready; session re-tag deferred', exc_info=True)
@@ -740,7 +765,7 @@ def _register_migration(app) -> None:
     try:
         with app.app_context():
             attempt()
-            from ..extensions import db
+            db = up('db')
             db.session.remove()
     except Exception:
         logger.debug('[directv-dai] session re-tag deferred to the first request', exc_info=True)
@@ -761,7 +786,7 @@ def _register_admin(app) -> None:
     bp = Blueprint('directv_dai', __name__)
 
     def _directv_source(source_id):
-        from ..models import Source
+        Source = up('source_model')
         source = Source.query.get_or_404(source_id)
         if source.name != 'directv':
             return None
@@ -782,7 +807,7 @@ def _register_admin(app) -> None:
 
     @bp.route('/directv-dai/sources')
     def dai_sources():
-        from ..models import Source
+        Source = up('source_model')
         return jsonify({'sources': [{'id': s.id, 'name': s.display_name or s.name}
                                     for s in Source.query.filter_by(name='directv').all()]})
 
@@ -797,13 +822,13 @@ def _register_admin(app) -> None:
         if request.method == 'POST':
             if not request.is_json:
                 return jsonify({'error': 'expected JSON'}), 415
-            from ..config_store import persist_source_config_updates
+            persist_source_config_updates = up('persist_config')
             data = request.get_json(silent=True) or {}
             want = str(data.get('use_dai', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
             old = dict(source.config or {})
             if not persist_source_config_updates(source.id, {'use_dai': 'true' if want else 'false'}):
                 return jsonify({'error': 'could not save the setting; try again'}), 409
-            from ..models import Source
+            Source = up('source_model')
             source = Source.query.get(source_id)
             directv_dai.settings_changed(source, old, dict(source.config or {}))
         cfg = dict(source.config or {})

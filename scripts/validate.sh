@@ -132,20 +132,20 @@ def module_file(module):
 
 parsed = {}
 for kind, items in (('wraps', consts['TARGETS']), ('uses', consts['USES'])):
-    for module, path in items:
+    for role, (module, path) in items.items():
         f = module_file(module)
         if not f:
-            err(f'upstream module {module} is gone (DAI {kind} {module}.{path})')
+            err(f'upstream module {module} is gone (DAI {kind} {module}.{path}, role {role!r})')
             continue
         mod = parsed.setdefault(f, ast.parse(open(f, encoding='utf-8').read()))
         head, _, attr = path.partition('.')
         if head not in names(mod.body):
-            err(f'upstream renamed or removed {module}.{head} (DAI {kind} it; update directv_dai_install.py)')
+            err(f'upstream renamed or removed {module}.{head} (DAI {kind} it as role {role!r}; point that entry in directv_dai_install.py at the new name)')
             continue
         if attr:
             cls = next((n for n in mod.body if isinstance(n, ast.ClassDef) and n.name == head), None)
             if cls is None or attr not in names(cls.body):
-                err(f'upstream renamed or removed {module}.{path} (DAI {kind} it; update directv_dai_install.py)')
+                err(f'upstream renamed or removed {module}.{path} (DAI {kind} it as role {role!r}; point that entry in directv_dai_install.py at the new name)')
 for path, text, why in consts['SOURCE_MARKERS']:
     if not os.path.isfile(path) or text not in open(path, encoding='utf-8').read():
         err(f'{path} no longer has {text!r}: {why} (update directv_dai_install.py)')

@@ -160,9 +160,9 @@ def known_bridge_devices() -> list[dict]:
     """Every bridge device upstream knows (HDMI Capture, ah4c tuners, remembered boxes) as
     [{'address': 'host:port', 'host': 'host'}]. The overlay's only read of upstream's
     device list, so if upstream reshapes it, this is the one place to adapt."""
-    from .. import bridge_devices
+    from .directv_dai_install import up
     out = []
-    for d in bridge_devices.known_devices()[0]:
+    for d in up('known_devices')()[0]:
         address = str((d or {}).get('address') or '').strip()
         if address:
             out.append({'address': address, 'host': str(d.get('host') or address.rsplit(':', 1)[0])})

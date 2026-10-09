@@ -86,9 +86,12 @@ Upstream's own files are NOT editable. The overlay's only line in them (the inst
 create_app) is inserted by CI, not by you, and CI rejects any other change to an upstream file.
 
 install() (directv_dai_install.py) attaches the overlay at runtime. Everything it relies on
-in upstream is listed there: TARGETS (functions it wraps by name), USES (names the overlay's
-modules call or read), SOURCE_MARKERS (strings in upstream files) and RELAY_PREFIX (the
-URL prefix of upstream's DirecTV relay). A build check is failing because upstream renamed,
+in upstream is listed there: TARGETS (functions it wraps) and USES (names the overlay's
+modules call or read) map a fixed ROLE (the key) to upstream's (module, 'name' or
+'Class.name'); SOURCE_MARKERS (strings in upstream files) and RELAY_PREFIX (the URL prefix
+of upstream's DirecTV relay). The overlay's code AND the smoke test reach upstream only
+through the roles (up('role'), up_name, up_owner, up_set), never by name, so a rename or
+move upstream is usually a one-line fix: the role's (module, name) value. A build check is failing because upstream renamed,
 moved or reshaped one of those; reproduce.log names it ("upstream renamed or removed X",
 "no longer takes <argument>", "no longer has <string>", or a failing smoke-test assertion).
 
@@ -96,9 +99,9 @@ Rules, highest priority first:
 1. SCOPE. Edit only the overlay files listed at the end of this message. The tests
    (smoke_test.py, validate.sh) are read-only: they are the spec your fix must pass.
 2. FOLLOW UPSTREAM. Point the overlay at upstream's current name, location, argument or
-   string: update the entry in TARGETS/USES/SOURCE_MARKERS AND every reference to it in the
-   overlay's modules. A rename is a rename: never drop an entry to make a check pass (the
-   smoke test counts them), and never weaken a check.
+   string: change the role's (module, name) value in TARGETS/USES (or the SOURCE_MARKERS
+   entry). Never rename or drop a role key (the smoke test requires every role), never add
+   an alias or shim for the old name, and never weaken a check.
 3. KEEP THE BEHAVIOR. If a wrapped function changed shape (new arguments, a different return
    value, a classmethod became something else), adapt the wrapper so it does the same job
    on the new shape. Wrappers bind arguments by name with inspect.signature.
@@ -107,8 +110,8 @@ Rules, highest priority first:
    devices are still in upstream's settings, its ah4c tuner list and its BridgeDevice rows
    (find them in the repo map or upstream_index.txt). Then re-implement that small read in OUR module (for
    the device list: directv_dai_device.known_bridge_devices(), which returns
-   [{'address', 'host'}]), reading those real sources, and update the USES entry to the
-   upstream names it now reads. That is a port, not fabrication.
+   [{'address', 'host'}]), reading those real sources, and point the role's USES value at
+   the upstream name it now reads. That is a port, not fabrication.
 5. NEVER FABRICATE. Don't invent or hard-code values (no made-up address/host), don't write
    a stub that returns nothing, and don't copy removed upstream code wholesale. Make no edit
    (and say why in one sentence) only when no real upstream source is left to read from.
@@ -157,7 +160,7 @@ t = ast.parse(open('app/scrapers/directv_dai_install.py', encoding='utf-8').read
 c = {n.targets[0].id: ast.literal_eval(n.value) for n in t.body if isinstance(n, ast.Assign)
      and isinstance(n.targets[0], ast.Name) and n.targets[0].id in ('TARGETS', 'USES', 'SOURCE_MARKERS')}
 files = set()
-for module, _ in c.get('TARGETS', ()) + c.get('USES', ()):
+for module, _ in (*c.get('TARGETS', {}).values(), *c.get('USES', {}).values()):
     base = module.replace('.', '/')
     files.update(f for f in (base + '.py', base + '/__init__.py') if os.path.isfile(f))
 files.update(p for p, _, _ in c.get('SOURCE_MARKERS', ()) if p.endswith('.py') and os.path.isfile(p))
