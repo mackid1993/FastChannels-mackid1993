@@ -85,3 +85,33 @@ jobs:
             if echo "$answer" | grep -q 'PINEAPPLE-4217'; then echo "try $i: OK   provider=$provider"; else echo "try $i: LOST earlier messages  provider=$provider  answer=$answer"; fails=$((fails+1)); fi
           done
           [ "$fails" = 0 ] || echo "::warning::$fails of 6 calls lost the earlier messages; the AI repair can't see the files on those providers."
+
+      - name: Check the model sees earlier messages in a LONG request
+        # The AI repair's real requests are 60k-120k tokens. Same code-word test, with the
+        # earlier messages padded to a few sizes, to find where a provider starts dropping
+        # the start of the request.
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+        run: |
+          model="${AI_MODEL#openrouter/}"
+          for k in 8 30 70; do
+            python3 - "$model" "$k" > req.json <<'PY'
+          import json, sys
+          model, k = sys.argv[1], int(sys.argv[2])
+          filler = "\n".join(f"def helper_{i}(x):\n    return x + {i}\n" for i in range(k * 1000 // 14))
+          print(json.dumps({"model": model, "max_tokens": 2048, "messages": [
+              {"role": "system", "content": "You are a helpful assistant."},
+              {"role": "user", "content": "Remember this code word for later: PINEAPPLE-4217. Reply only OK."},
+              {"role": "assistant", "content": "OK"},
+              {"role": "user", "content": "Here is a file:\n```\n" + filler + "\n```"},
+              {"role": "assistant", "content": "Noted."},
+              {"role": "user", "content": "What was the code word I gave you earlier? Reply with just the code word."}]}))
+          PY
+            curl -sS https://openrouter.ai/api/v1/chat/completions -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+              -H "Content-Type: application/json" -d @req.json -o resp.json
+            provider=$(jq -r '.provider // "?"' resp.json); answer=$(jq -r '.choices[0].message.content // .error.message // "?"' resp.json | tr -d '\n' | cut -c1-100)
+            tokens=$(jq -r '.usage.prompt_tokens // "?"' resp.json)
+            if echo "$answer" | grep -q 'PINEAPPLE-4217'; then r=OK; else r=LOST; fi
+            echo "~${k}k padding: $r  prompt_tokens=$tokens  provider=$provider  answer=$answer"
+          done
