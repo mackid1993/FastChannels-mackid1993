@@ -6,11 +6,11 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 ---
  app/scrapers/directv_dai.py         | 1084 ++++++++++++++++++++++++++
- app/scrapers/directv_dai_device.py  |  262 +++++++
+ app/scrapers/directv_dai_device.py  |  268 +++++++
  app/scrapers/directv_dai_install.py | 1125 +++++++++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 ++
  app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++++++
- 5 files changed, 3183 insertions(+)
+ 5 files changed, 3189 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -19,7 +19,7 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..bcce451
+index 0000000..236cc53
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
 @@ -0,0 +1,1084 @@
@@ -799,16 +799,16 @@ index 0000000..bcce451
 +
 +def fetch_account_context(session, bearer: str) -> dict:
 +    """Best-effort fetch of the account's real DMA and privacy-consent string, the
-+    values the web client puts on its DAI session request. Uses the already-authed
-+    login session. Any failure returns {} — DAI playback still works, it just
++    values DirecTV's apps put on their DAI session request. Sent as the same client as
++    the rest of the session: upstream's app headers (its fixed app User-Agent), no web
++    player Origin/Referer. Any failure returns {} — DAI playback still works, it just
 +    omits the fields we couldn't source rather than inventing them."""
 +    ctx: dict = {}
-+    hdrs = {
-+        'Authorization': f'Bearer {bearer}',
-+        'Accept': 'application/json, text/plain, */*',
-+        'Origin': 'https://stream.directv.com',
-+        'Referer': 'https://stream.directv.com/',
-+    }
++    try:
++        app = dict(_up('app_headers')() or {})
++    except Exception:
++        app = {}
++    hdrs = {**app, 'Accept': 'application/json, text/plain, */*', 'Authorization': f'Bearer {bearer}'}
 +    try:
 +        r = session.get(_LOCATION_URL, params={'includeTVOD': 'false'}, headers=hdrs, timeout=15)
 +        if r.ok:
@@ -1109,10 +1109,10 @@ index 0000000..bcce451
 +        capture_in_background(uncaptured_addresses())
 diff --git a/app/scrapers/directv_dai_device.py b/app/scrapers/directv_dai_device.py
 new file mode 100644
-index 0000000..8687075
+index 0000000..c34f4b6
 --- /dev/null
 +++ b/app/scrapers/directv_dai_device.py
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,268 @@
 +"""The bridge device a DirecTV DAI tune plays on: its identity and app User-Agent.
 +
 +DAI targets the playback device the way DirecTV's Android TV app does, so this reads
@@ -1346,8 +1346,14 @@ index 0000000..8687075
 +    bridge device making the current request: upstream's own fixed app string
 +    (directv_device_auth.APP_USER_AGENT), the one its sign-in, refresh and DRM calls
 +    send, so DirecTV sees one unchanging client on the session's every request.
-+    None when the request isn't from a known bridge device."""
-+    if not _client_device():
++    None when the request isn't from a known bridge device. The string is fixed, so
++    it doesn't wait for the box's identity to be read: being a bridge device is enough."""
++    try:
++        from flask import has_request_context, request
++        ip = (request.remote_addr or '').strip() if has_request_context() else ''
++    except Exception:
++        ip = ''
++    if not ip or not _bridge_address(ip):
 +        return None
 +    from .directv_dai_install import up
 +    return up('app_user_agent')

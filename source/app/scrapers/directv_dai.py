@@ -774,16 +774,16 @@ def store_login_result(cfg: dict, result: dict) -> None:
 
 def fetch_account_context(session, bearer: str) -> dict:
     """Best-effort fetch of the account's real DMA and privacy-consent string, the
-    values the web client puts on its DAI session request. Uses the already-authed
-    login session. Any failure returns {} — DAI playback still works, it just
+    values DirecTV's apps put on their DAI session request. Sent as the same client as
+    the rest of the session: upstream's app headers (its fixed app User-Agent), no web
+    player Origin/Referer. Any failure returns {} — DAI playback still works, it just
     omits the fields we couldn't source rather than inventing them."""
     ctx: dict = {}
-    hdrs = {
-        'Authorization': f'Bearer {bearer}',
-        'Accept': 'application/json, text/plain, */*',
-        'Origin': 'https://stream.directv.com',
-        'Referer': 'https://stream.directv.com/',
-    }
+    try:
+        app = dict(_up('app_headers')() or {})
+    except Exception:
+        app = {}
+    hdrs = {**app, 'Accept': 'application/json, text/plain, */*', 'Authorization': f'Bearer {bearer}'}
     try:
         r = session.get(_LOCATION_URL, params={'includeTVOD': 'false'}, headers=hdrs, timeout=15)
         if r.ok:

@@ -231,8 +231,14 @@ def player_user_agent() -> str | None:
     bridge device making the current request: upstream's own fixed app string
     (directv_device_auth.APP_USER_AGENT), the one its sign-in, refresh and DRM calls
     send, so DirecTV sees one unchanging client on the session's every request.
-    None when the request isn't from a known bridge device."""
-    if not _client_device():
+    None when the request isn't from a known bridge device. The string is fixed, so
+    it doesn't wait for the box's identity to be read: being a bridge device is enough."""
+    try:
+        from flask import has_request_context, request
+        ip = (request.remote_addr or '').strip() if has_request_context() else ''
+    except Exception:
+        ip = ''
+    if not ip or not _bridge_address(ip):
         return None
     from .directv_dai_install import up
     return up('app_user_agent')

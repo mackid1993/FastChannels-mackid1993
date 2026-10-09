@@ -302,7 +302,16 @@ real_client_device = device._client_device
 device._client_device = lambda: fire
 dev = dai.build_query(config, {}, '123')
 assert dev['is_lat'] == '0' and 'adid' not in dev and dev['comscore_device'] == _SHOWN, dev
-assert device.player_user_agent() == up('app_user_agent'), 'a bridge device must send upstream\'s app User-Agent'
+_real_bridge = device._bridge_address
+device._bridge_address = lambda ip: '10.0.0.9:5555' if ip == '10.0.0.9' else None
+with app.test_request_context(environ_base={'REMOTE_ADDR': '10.0.0.9'}):
+    # The fixed app string goes out for a bridge box even before its identity is read.
+    device._client_device = lambda: {}
+    assert device.player_user_agent() == up('app_user_agent'), 'a bridge device must send upstream\'s app User-Agent'
+    device._client_device = lambda: fire
+with app.test_request_context(environ_base={'REMOTE_ADDR': '10.0.0.99'}):
+    assert device.player_user_agent() is None, 'a non-bridge requester must keep upstream\'s own User-Agent'
+device._bridge_address = _real_bridge
 dev_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8?yo.up=u'}, dev)
 assert dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True)
 device._client_device = lambda: {**fire, 'android_id': 'ffffffffffffffff'}
@@ -417,6 +426,19 @@ class _Scraper:
 sc = _Scraper()
 dai.note_channels(sc, [{'ccid': '1', 'daiChannelName': ' cnn '}, {'ccid': '2', 'daiChannelName': ''}, 'junk'])
 assert sc.cache == {'dai_channel_names': {'1': 'cnn'}}, sc.cache
+
+# The account lookup (market, ZIP, consent) is sent as the same app client as the session:
+# upstream's app User-Agent, no web player Origin/Referer.
+class _HdrSess:
+    def __init__(self):
+        self.seen = []
+    def get(self, url, params=None, headers=None, **kw):
+        self.seen.append(dict(headers or {}))
+        return _types.SimpleNamespace(ok=False)
+_hs = _HdrSess()
+dai.fetch_account_context(_hs, 'B')
+assert _hs.seen and all(h.get('User-Agent') == up('app_user_agent') and 'Origin' not in h and 'Referer' not in h
+                        and h.get('Authorization') == 'Bearer B' for h in _hs.seen), _hs.seen
 
 # The viewer-profile picker: the chosen profile's partnerProfileID1 becomes the Yospace
 # profid (dtv_android_profid). Needed for ad targeting; must not be dropped again.
@@ -631,6 +653,9 @@ _real_client_device, _real_dai_on = device._client_device, dai.dai_on
 _HTTPAdapter.send = _fake_send
 device._client_device = lambda: {}
 dai.dai_on = lambda: True
+# "A bridge device" below = the stubbed _client_device returns its values.
+_real_bridge3 = device._bridge_address
+device._bridge_address = lambda ip: '10.0.0.9:5555' if device._client_device() else None
 try:
     # (f) An inserted-ad AC-3 audio playlist is swapped to the AAC twin (segment AND its
     # EXT-X-MAP init) on the way out of upstream's relay; live content is left alone.
@@ -717,6 +742,7 @@ try:
 finally:
     _HTTPAdapter.send = _real_send
     device._client_device, dai.dai_on = _real_client_device, _real_dai_on
+    device._bridge_address = _real_bridge3
 
 # (k) The panel script is served, our page renders, and the script is added to upstream
 # pages with source settings boxes (only those).
@@ -808,6 +834,7 @@ try:
     _wire['https://api.cld.dtvce.com/right/authorization/channel/v2'] = (200, 'application/json', json.dumps(_v2_ok).encode())
     _wire[_yo_master] = (200, 'application/vnd.apple.mpegurl', _master.encode())
     _HTTPAdapter.send, device._client_device = _fake_send, (lambda: fire)
+    _real_bridge4, device._bridge_address = device._bridge_address, (lambda ip: '10.0.0.9:5555' if ip == '10.0.0.9' else None)
     try:
         _wire_log.clear()
         _bm = _client.get('/play/directv/123/browser.m3u8', environ_base={'REMOTE_ADDR': '10.0.0.9'})
@@ -817,6 +844,7 @@ try:
             f'the Yospace session-opening fetch lost the app User-Agent: {_ua_of(_yo_master)}'
     finally:
         _HTTPAdapter.send, device._client_device = _real_send, _real_client_device
+        device._bridge_address = _real_bridge4
     _st = _client.get('/directv-dai/status').get_json()
     assert _st == {'missing': [], 'markers': [], 'failed': [], 'runtime': []}, _st
     assert _client.post(f'/api/sources/{_sid}/directv-dai', json={'use_dai': False}).get_json()['use_dai'] is False
