@@ -71,8 +71,10 @@ ai_edit() {  # $1 = attempt number
   cat > "$prompt" <<'PROMPT'
 You are running FULLY AUTONOMOUSLY in CI. No human will read your reply or answer anything
 -- there is nobody to ask. Never ask a question or wait for confirmation: decide from the
-rules below and act. upstream_index.txt maps upstream's CURRENT files and every def/class in
-them; use it to find where upstream moved what the overlay uses.
+rules below and act. This chat is upstream's repository (kineticman/FastChannels): the repo
+map summarizes upstream's CURRENT files, and upstream_index.txt lists every def/class of the
+upstream modules the overlay relies on; use them to find where upstream moved what the overlay
+uses (you may also ask to see an upstream file). reproduce.log is the failing check's output.
 
 The files you can edit are the FastChannels DirecTV DAI overlay, which upstream
 kineticman/FastChannels does not have:
@@ -101,7 +103,7 @@ Rules, highest priority first:
 4. REBUILD FROM REAL UPSTREAM DATA. A name in USES may be gone while the data it returned is
    still in upstream. Example: bridge_devices.known_devices() is removed, but the bridge
    devices are still in upstream's settings, its ah4c tuner list and its BridgeDevice rows
-   (find them in upstream_index.txt). Then re-implement that small read in OUR module (for
+   (find them in the repo map or upstream_index.txt). Then re-implement that small read in OUR module (for
    the device list: directv_dai_device.known_bridge_devices(), which returns
    [{'address', 'host'}]), reading those real sources, and update the USES entry to the
    upstream names it now reads. That is a port, not fabrication.
@@ -111,9 +113,6 @@ Rules, highest priority first:
 6. Minimal diff, valid Python, no refactoring or reformatting. Never write a secret (API
    key, bearer, token) into any file.
 PROMPT
-  # Name the exact files the AI may edit, in the prompt itself.
-  { printf '\nThe patch files -- the ONLY files you may edit (editing any other file ends the run):\n'
-    sed 's|^|  - |' "$editable"; } >> "$prompt"
   # On a retry, hand Aider its own previous cycle: its chat history (.aider.chat.history.md,
   # passed with --read below) carries what it already tried, its reasoning, and the edits it
   # made -- so it continues instead of restarting cold and repeating a dead end.
@@ -132,14 +131,23 @@ PROMPT
     esac
   done < "$editable"
   [ ${#edit[@]} -gt 0 ] || { echo "::error::no editable files to offer the AI"; return 1; }
+  # Name the exact files the AI may edit, as Aider shows them (paths from the repo root).
+  { printf '\nThe overlay files added to this chat -- the ONLY files you may edit (editing any other file ends the run):\n'
+    printf '  - %s\n' "${edit[@]}"; } >> "$prompt"
   # Aider edits only the files named here; the log, AGENTS.md, the overlay's two tests (the
   # spec) and -- on a retry -- its own prior chat history are read-only context. CI does all
   # git/validation, so Aider's own git, lint, test, shell and URL features are off.
-  # Map of upstream's CURRENT code, kept small on purpose: every def/class in the upstream
-  # modules the overlay relies on (TARGETS/USES/SOURCE_MARKERS) and in any upstream file the
-  # failure names, plus the list of upstream Python files (so a name moved to another file
-  # can be found). The whole-app index was ~56k tokens and, with the overlay and the tests,
-  # pushed the request past what the model reliably reads: it lost the files it was given.
+  # Aider runs with git ON so upstream's checkout is the project root: the model sees
+  # upstream as a repo (paths like app/scrapers/directv.py), and Aider's repo map gives it
+  # every upstream file's definitions to find where a name moved. (With --no-git Aider's
+  # root is just the folder holding the editable files, app/scrapers/, and the model saw
+  # three loose files and none of upstream: a live rehearsal failed that way.) Commits,
+  # dirty commits and .gitignore edits stay off; CI does all git operations and checks the
+  # AI changed only the overlay's files.
+  # The repo map favors names already mentioned in the chat, so a RENAMED function can be
+  # missing from it; upstream_index.txt adds every def/class of the upstream modules the
+  # overlay relies on (TARGETS/USES/SOURCE_MARKERS) and of any file the failure names
+  # (~5k tokens), so the new name is always in front of the model.
   local mods
   mods=$( cd "$up" && python3 - "$log" <<'PY'
 import ast, os, re, sys
@@ -156,19 +164,18 @@ files.update(f for f in re.findall(r'\bapp/[\w/]+\.py\b', log) if os.path.isfile
 print(' '.join(sorted(files)))
 PY
   )
-  { echo "# upstream Python files:"
-    ( cd "$up" && find app -type f -name '*.py' | sort )
-    echo; echo "# definitions in the upstream modules the overlay relies on (path:line: def/class):"
+  { echo "# definitions in the upstream modules the overlay relies on (path:line: def/class):"
     # shellcheck disable=SC2086
     ( cd "$up" && grep -nHE '^[[:space:]]*(async def|def|class) ' $mods 2>/dev/null )
   } > "$work/upstream_index.txt"
   local hist=()
   [ "$pass" -gt 1 ] && [ -f "$up/.aider.chat.history.md" ] && hist=(--read "$up/.aider.chat.history.md")
-  ( cd "$up" && aider --model "$model" --edit-format diff --yes-always --no-git \
-        --no-auto-commits --no-auto-lint --no-auto-test --no-suggest-shell-commands \
+  ( cd "$up" && aider --model "$model" --edit-format diff --yes-always \
+        --no-auto-commits --no-dirty-commits --no-gitignore --no-attribute-author \
+        --no-attribute-committer --no-auto-lint --no-auto-test --no-suggest-shell-commands \
         --no-detect-urls --no-show-model-warnings --no-check-update --no-analytics \
-        --no-pretty --map-tokens 0 --read "$log" --read "$root/AGENTS.md" \
-        --read "$work/upstream_index.txt" \
+        --no-pretty --map-tokens 2048 --read "$log" --read "$work/upstream_index.txt" \
+        --read "$root/AGENTS.md" \
         --read "$root/scripts/smoke_test.py" --read "$root/scripts/validate.sh" \
         "${hist[@]}" --message-file "$prompt" "${edit[@]}" )
 }
