@@ -45,3 +45,17 @@ jobs:
             exit 1
           fi
           echo "::notice::OK — '$model' answered through OpenRouter under the current privacy policies (provider: ${provider:-unknown})."
+
+      - name: Show the model's context window per provider
+        # The AI repair sends the overlay's files, its tests and the failure log in one
+        # request; if that's longer than the model's context window, OpenRouter silently
+        # drops the middle ("middle-out") and the model never sees the files.
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+        run: |
+          model="${AI_MODEL#openrouter/}"
+          curl -sS "https://openrouter.ai/api/v1/models/$model/endpoints" \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" -o endpoints.json
+          jq -r '.data.endpoints[]? | "\(.provider_name): context \(.context_length), max output \(.max_completion_tokens // "?")"' endpoints.json \
+            || head -c 500 endpoints.json
