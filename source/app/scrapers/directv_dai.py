@@ -276,10 +276,14 @@ def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
       <Android ID> with is_lat=0. DirecTV's own prefix for an Android device id,
       which every Android device exposes over adb. We never invent a value.
     comscore_device = Android_<Build.MANUFACTURER>_<Build.MODEL>, whitespace removed,
-    as the app builds it (universalYospaceParameters)."""
+    as the app builds it (universalYospaceParameters), for the device the session
+    presents: upstream's fixed app User-Agent names one device on sign-in, DRM and
+    playback, so comscore_device names that same device (directv_dai_device.
+    presented_device), falling back to the bridge device's own values."""
     if not props:
         return {}
-    flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{props.get('manufacturer', '')}_{props.get('model', '')}")}
+    shown = device.presented_device() or props
+    flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{shown.get('manufacturer', '')}_{shown.get('model', '')}")}
     gaid = ((ad_id or {}).get('advertising_id') or '').strip()
     # An all-zero id is Android's "deleted / limited" sentinel, never a real id: treat
     # it as opt-out, and never send it as an advertising id.

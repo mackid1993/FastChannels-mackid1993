@@ -217,23 +217,34 @@ assert 'comscore_device' not in query, 'comscore_device only comes from a real b
 # platform advertising id the app sends, captured per device: google_advertising_id:<id>
 # + adid with is_lat=0. A deleted/limited id gives the app's optout form. android_id is
 # the absolute last resort when no advertising id can be read. comscore_device as the app
-# builds it; comscore_device never carries whitespace.
+# builds it, for the device upstream's fixed app User-Agent presents (so every request in
+# the session names one device); it never carries whitespace.
+assert device.presented_device() == {'manufacturer': 'Google', 'model': 'Chromecast'}, \
+    f"upstream's app User-Agent no longer names a device comscore_device can match: {up('app_user_agent')!r}"
+_SHOWN = 'Android_Google_Chromecast'
 fire = {'manufacturer': 'Amazon', 'model': 'AFTKRT', 'board': 'karat', 'release': '11',
         'limit_ad_tracking': '0', 'android_id': 'abcdef0123456789'}
 _cap = {'advertising_id': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', 'optout': False}
-assert dai.device_ad_flags(fire, _cap) == {'comscore_device': 'Android_Amazon_AFTKRT', 'is_lat': '0',
+assert dai.device_ad_flags(fire, _cap) == {'comscore_device': _SHOWN, 'is_lat': '0',
     '_fw_did': 'google_advertising_id:bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f',
     'adid': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f'}
 assert dai.device_ad_flags(fire, {'advertising_id': '', 'optout': True})['_fw_did'] == 'google_advertising_id:optout'
 assert dai.device_ad_flags(fire, {'advertising_id': '00000000-0000-0000-0000-000000000000', 'optout': False}
     )['_fw_did'] == 'google_advertising_id:optout', 'an all-zero (deleted) id is the optout form, never sent as an id'
 # No captured advertising id -> android_id last resort; limited tracking -> optout form.
-assert dai.device_ad_flags(fire) == {'comscore_device': 'Android_Amazon_AFTKRT', 'is_lat': '0',
+assert dai.device_ad_flags(fire) == {'comscore_device': _SHOWN, 'is_lat': '0',
     '_fw_did': 'android_id:abcdef0123456789'}
 assert dai.device_ad_flags({**fire, 'limit_ad_tracking': '1'})['_fw_did'] == 'google_advertising_id:optout'
 shield = {'manufacturer': 'NVIDIA', 'model': 'SHIELD Android TV', 'android_id': 'abcdef0123456789'}
-assert dai.device_ad_flags(shield) == {'comscore_device': 'Android_NVIDIA_SHIELDAndroidTV', 'is_lat': '0',
+assert dai.device_ad_flags(shield) == {'comscore_device': _SHOWN, 'is_lat': '0',
     '_fw_did': 'android_id:abcdef0123456789'}
+# If the presented device can't be read (upstream's UA changed to a board we don't map),
+# comscore_device falls back to the bridge device's own values, whitespace removed.
+_real_presented = device.presented_device
+device.presented_device = lambda: None
+assert dai.device_ad_flags(fire)['comscore_device'] == 'Android_Amazon_AFTKRT'
+assert dai.device_ad_flags(shield)['comscore_device'] == 'Android_NVIDIA_SHIELDAndroidTV'
+device.presented_device = _real_presented
 assert dai.device_ad_flags({}) == {}
 # Advertising-id capture, with adb mocked: Fire reads the id silently from settings;
 # GMS (Ads activity present, box idle) reads it off the Ads screen; a playing box is
@@ -290,7 +301,7 @@ dai._adb_shell = _real_adb2
 real_client_device = device._client_device
 device._client_device = lambda: fire
 dev = dai.build_query(config, {}, '123')
-assert dev['is_lat'] == '0' and 'adid' not in dev and dev['comscore_device'] == 'Android_Amazon_AFTKRT', dev
+assert dev['is_lat'] == '0' and 'adid' not in dev and dev['comscore_device'] == _SHOWN, dev
 assert device.player_user_agent() == up('app_user_agent'), 'a bridge device must send upstream\'s app User-Agent'
 dev_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8?yo.up=u'}, dev)
 assert dai.cached_url_usable({'fallback_url': dev_url, 'dai': True}, True)
@@ -902,7 +913,7 @@ try:
     _q = parse_qs(urlsplit(_yo_req).query)
     for _k, _v in (('d', 'android_tv'), ('yospace.pool', 'livepause'), ('is_lat', '0'), ('dma_location', '501')):
         assert _q.get(_k) == [_v], f'the Yospace session lost {_k}={_v}: {_q.get(_k)}'
-    assert _q.get('_fw_did') and _q.get('comscore_device') == ['Android_Amazon_AFTKRT'], _q
+    assert _q.get('_fw_did') and _q.get('comscore_device') == [_SHOWN], _q
 
     # 3. The audio playlist: the inserted AC-3 ad (and its init) became the AAC twin, and
     # everything, live and ad, still goes through the server.
