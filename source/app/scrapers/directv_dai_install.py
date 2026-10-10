@@ -88,6 +88,20 @@ USES = {
 # The relay's URL space. The Player app and Channels fetch these URLs, so they're the
 # most stable contract upstream has; the HTTP-layer hooks key on this prefix only.
 RELAY_PREFIX = '/play/directv/'
+# Upstream URLs, names and formats the TESTS rely on (smoke_test.py reads them only from
+# here). The overlay's runtime doesn't use them; they're the test's view of upstream, so
+# when upstream changes one, the fix is this value, editable by the AI repair, never the
+# test itself. validate.sh checks each route exists in upstream's routes.
+CONTRACT = {
+    'source_name': 'directv',                                  # Source.name / registry key
+    'stream_url': 'directv://{ccid}/res',                      # Channel.stream_url format
+    'relay_asset': '/play/directv/browser-asset?url=',         # the relay's segment route
+    'relay_manifest': '/play/directv/{ccid}/browser.m3u8',     # the relay's master route
+    'bridge_play': '/play/fc-player/directv/{ccid}.m3u8',      # ah4c's tune route
+    'sources_page': '/admin/sources',                          # where the panel mounts
+    'settings_save': '/<int:source_id>/config',                # upstream's settings save (suffix)
+    'channel_auth_v1': '/channel/v1',                          # upstream's own channel request
+}
 # Strings in upstream's files the wiring relies on without calling them by name:
 # (file, text, what breaks without it). validate.sh, smoke_test.py and status() check these.
 SOURCE_MARKERS = (

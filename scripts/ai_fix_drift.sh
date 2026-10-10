@@ -166,7 +166,8 @@ for module, _ in (*c.get('TARGETS', {}).values(), *c.get('USES', {}).values()):
     files.update(f for f in (base + '.py', base + '/__init__.py') if os.path.isfile(f))
 files.update(p for p, _, _ in c.get('SOURCE_MARKERS', ()) if p.endswith('.py') and os.path.isfile(p))
 log = open(sys.argv[1], encoding='utf-8', errors='replace').read()
-files.update(f for f in re.findall(r'\bapp/[\w/]+\.py\b', log) if os.path.isfile(f))
+# Tracebacks from the image say /app/app/...; take the app/... part either way.
+files.update(f for f in re.findall(r'(?:/app/)?(app/[\w/]+\.py)\b', log) if os.path.isfile(f))
 print(' '.join(sorted(files)))
 PY
   )

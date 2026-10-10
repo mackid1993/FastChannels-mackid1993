@@ -7,10 +7,10 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 ---
  app/scrapers/directv_dai.py         | 1549 +++++++++++++++++++++++++++
  app/scrapers/directv_dai_device.py  |  429 ++++++++
- app/scrapers/directv_dai_install.py | 1231 +++++++++++++++++++++
+ app/scrapers/directv_dai_install.py | 1245 +++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 +
  app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++
- 5 files changed, 3921 insertions(+)
+ 5 files changed, 3935 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -2009,10 +2009,10 @@ index 0000000..da1aa1a
 +    return {'manufacturer': manufacturer, 'model': model} if manufacturer else None
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..5a5a5fb
+index 0000000..f21c2d7
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,1231 @@
+@@ -0,0 +1,1245 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
@@ -2103,6 +2103,20 @@ index 0000000..5a5a5fb
 +# The relay's URL space. The Player app and Channels fetch these URLs, so they're the
 +# most stable contract upstream has; the HTTP-layer hooks key on this prefix only.
 +RELAY_PREFIX = '/play/directv/'
++# Upstream URLs, names and formats the TESTS rely on (smoke_test.py reads them only from
++# here). The overlay's runtime doesn't use them; they're the test's view of upstream, so
++# when upstream changes one, the fix is this value, editable by the AI repair, never the
++# test itself. validate.sh checks each route exists in upstream's routes.
++CONTRACT = {
++    'source_name': 'directv',                                  # Source.name / registry key
++    'stream_url': 'directv://{ccid}/res',                      # Channel.stream_url format
++    'relay_asset': '/play/directv/browser-asset?url=',         # the relay's segment route
++    'relay_manifest': '/play/directv/{ccid}/browser.m3u8',     # the relay's master route
++    'bridge_play': '/play/fc-player/directv/{ccid}.m3u8',      # ah4c's tune route
++    'sources_page': '/admin/sources',                          # where the panel mounts
++    'settings_save': '/<int:source_id>/config',                # upstream's settings save (suffix)
++    'channel_auth_v1': '/channel/v1',                          # upstream's own channel request
++}
 +# Strings in upstream's files the wiring relies on without calling them by name:
 +# (file, text, what breaks without it). validate.sh, smoke_test.py and status() check these.
 +SOURCE_MARKERS = (

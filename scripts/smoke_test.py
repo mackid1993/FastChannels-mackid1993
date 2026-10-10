@@ -55,6 +55,19 @@ BaseScraper = install.up_owner('scraper_cache')
 directv_proxy = install.up_owner('relay_cdn_allowed')
 
 app = create_app()
+_STREAM = install.CONTRACT['stream_url'].format(ccid='123')   # upstream's stream-URL format, by contract
+# Every route in CONTRACT is a real route of the running app (blueprint prefixes included).
+from werkzeug.exceptions import MethodNotAllowed as _MNA, NotFound as _NF  # noqa: E402
+_adapter = app.url_map.bind('localhost')
+for _role in ('relay_asset', 'relay_manifest', 'bridge_play', 'sources_page'):
+    _path = install.CONTRACT[_role].format(ccid='123').split('?', 1)[0]
+    try:
+        _adapter.match(_path)
+    except _MNA:
+        pass
+    except _NF:
+        raise AssertionError(f"CONTRACT['{_role}'] = {install.CONTRACT[_role]!r} is not a route of upstream's app "
+                             'any more (update CONTRACT in directv_dai_install.py)')
 create_app()   # a second app in the same process (the worker does this) must not double-wrap
 
 # ── The one hook, and every upstream name it wires into ──────────────────────
@@ -567,7 +580,7 @@ try:
         # (a) DAI on: resolve() makes the Android TV app's channel/v2 request and plays the
         # Yospace session with the DAI flags; the cached entry is tagged dai=True.
         _Session.calls.clear(); _Session.reply = _Resp(data=_v2_ok)
-        url = sc.resolve('directv://123/res')
+        url = sc.resolve(_STREAM)
         req_url, req_params, req_headers = _Session.calls[-1]
         assert req_url.endswith('/channel/v2'), req_url
         assert req_params.get('startOver') == 'false' and 'timeShiftEnabled' not in req_params, req_params
@@ -584,8 +597,8 @@ try:
         # upstream's own v1 request and gets the non-DAI stream.
         _Session.calls.clear(); _Session.reply = _Resp(data=_v1_ok)
         sc.config['use_dai'] = 'false'
-        url = sc.resolve('directv://123/res')
-        assert _Session.calls and _Session.calls[-1][0].endswith('/channel/v1'), 'DAI off must use upstream untouched'
+        url = sc.resolve(_STREAM)
+        assert _Session.calls and _Session.calls[-1][0].endswith(install.CONTRACT['channel_auth_v1']), 'DAI off must use upstream untouched'
         assert url.endswith('/v1.m3u8'), url
         # The DAI entry has exactly upstream's playback keys (plus 'dai'), so upstream's
         # cache and license code read it like its own.
@@ -618,19 +631,19 @@ try:
             sc.config['use_dai'] = 'true'
             sc._cache = {}
             _Session.reply = _Resp(data=_v1_ok)
-            sc.resolve('directv://123/res')
+            sc.resolve(_STREAM)
             assert any('never reached the DAI request' in w for w in install.runtime_warnings()), install.runtime_warnings()
         finally:
             install.up_set('channel_fetch', _wrapped_fetch)
         sc._cache = {}
         _Session.reply = _Resp(data=_v2_ok)
-        sc.resolve('directv://123/res')
+        sc.resolve(_STREAM)
         assert install.runtime_warnings() == [], install.runtime_warnings()
         # (e2) A tune touches only its own channel's cache entry: another channel's entry
         # (say, another box's session) is neither dropped nor saved by a cache hit here.
         sc.cache['directv_playback']['999'] = {'fallback_url': 'https://other/x.m3u8', 'dai': False, 'cached_at': _t.time()}
         sc._pending_cache_updates.clear()
-        sc.resolve('directv://123/res')
+        sc.resolve(_STREAM)
         assert '999' in sc.cache['directv_playback'], "a tune dropped another channel's cached session"
         assert 'directv_playback' not in sc._pending_cache_updates, 'a cache hit saved a cache rewrite'
         # (e3) Two boxes on one channel each keep their own DAI session (each has its own
@@ -647,11 +660,11 @@ try:
             for _addr, _tok in _boxes:
                 _box['addr'] = _addr
                 _Session.reply = _Resp(data={**_v2_ok, 'dRights': {'playToken': _tok}})
-                sc.resolve('directv://123/res')
+                sc.resolve(_STREAM)
             _Session.calls.clear()
             for _addr, _tok in _boxes:
                 _box['addr'] = _addr
-                _u = sc.resolve('directv://123/res')
+                _u = sc.resolve(_STREAM)
                 assert dai._current_device_ad_flags()['_fw_did'] in _u, f'box {_addr} got another box\'s session'
             assert not _Session.calls, f'a box re-authorized although its own DAI session was saved: {_Session.calls}'
             _lic_cfg = {**sc.config, **sc.cache}
@@ -681,7 +694,7 @@ from requests.adapters import HTTPAdapter as _HTTPAdapter  # noqa: E402
 from requests.structures import CaseInsensitiveDict as _CID  # noqa: E402
 
 _client = app.test_client()
-_ASSET = '/play/directv/browser-asset?url='
+_ASSET = install.CONTRACT['relay_asset']
 _wire = {}      # url (no query) -> (status, content-type, body)
 _wire_log = []  # (url, headers) of every fetch that reached the transport
 
@@ -783,7 +796,7 @@ try:
     assert (_ua_of(_m_url) == _upstream_ua) if _upstream_ua else not (_ua_of(_m_url) or '').startswith('APP_PROJECT_NAME/'), \
         'DAI off must send upstream\'s User-Agent untouched'
     dai.dai_on = lambda: True
-    with app.test_request_context('/admin/sources'):
+    with app.test_request_context(install.CONTRACT['sources_page']):
         install.requests.get('https://yospace01-directv.akamaized.net/x.m3u8', timeout=1)
     assert not (_ua_of('https://yospace01-directv.akamaized.net/x.m3u8') or '').startswith('APP_PROJECT_NAME/'), \
         'the app User-Agent leaked outside the relay'
@@ -801,7 +814,7 @@ finally:
 assert _client.get('/directv-dai/admin.js').status_code == 200
 assert b'source-config-' in _client.get('/directv-dai/admin.js').get_data()
 assert b'/directv-dai/admin.js' in _client.get('/directv-dai').get_data()
-with app.test_request_context('/admin/sources'):
+with app.test_request_context(install.CONTRACT['sources_page']):
     from flask import Response as _Response  # noqa: E402
     _page = _Response('<html><div class="source-config hidden" id="source-config-3"></div></body></html>', mimetype='text/html')
     for fn in app.after_request_funcs.get(None, []):
@@ -835,7 +848,7 @@ finally:
 try:
     with app.app_context():
         db.create_all()
-        _src = Source(name='directv', display_name='DirecTV Stream',
+        _src = Source(name=install.CONTRACT['source_name'], display_name='DirecTV Stream',
                       config={'auth_method': 'dtv_android', 'refresh_token': 'r', 'bearer_token': 'b',
                               'dai_dma_id': '501', 'dtv_android_profid': 'pp-test'})
         db.session.add(_src)
@@ -869,7 +882,7 @@ try:
     assert _captures, 'turning DAI on did not run the ad-id capture'
     # Upstream's own DirecTV settings save, with exactly what its page sends, keeps keys
     # it doesn't know (use_dai).
-    _save = next((r for r in app.url_map.iter_rules() if r.rule.endswith('/<int:source_id>/config')
+    _save = next((r for r in app.url_map.iter_rules() if r.rule.endswith(install.CONTRACT['settings_save'])
                   and 'POST' in (r.methods or ())), None)
     assert _save is not None, "upstream's source settings save route is gone"
     _save_url = _save.rule.replace('<int:source_id>', str(_sid))
@@ -882,7 +895,7 @@ try:
         assert dai.enabled(db.session.get(Source, _sid).config), "upstream's settings save wiped the DAI toggle"
     _pr = _client.get(f'/api/sources/{_sid}/directv-profile')
     assert _pr.status_code == 200 and _pr.get_json()['profiles'][0]['id'] == 'p1', _pr.get_data()
-    _page = _client.get('/admin/sources')
+    _page = _client.get(install.CONTRACT['sources_page'])
     assert _page.status_code == 200, f'/admin/sources answered {_page.status_code}'
     assert b'id="source-config-' in _page.get_data(), "the sources page no longer has settings boxes (source-config-<id>)"
     assert b'/directv-dai/admin.js' in _page.get_data(), 'the sources page did not get the DAI panel script'
@@ -891,7 +904,7 @@ try:
     # the bridge device's app User-Agent (the one A/B tested for inserted ads).
     from app.models import Channel  # noqa: E402
     with app.app_context():
-        db.session.add(Channel(source_id=_sid, source_channel_id='123', name='CNN', stream_url='directv://123/res'))
+        db.session.add(Channel(source_id=_sid, source_channel_id='123', name='CNN', stream_url=_STREAM))
         db.session.commit()
     _yo_master = 'https://csm-e.tls1.yospace.com/csm/extlive/x/master.m3u8'
     _wire['https://api.cld.dtvce.com/right/authorization/channel/v2'] = (200, 'application/json', json.dumps(_v2_ok).encode())
@@ -900,7 +913,7 @@ try:
     _real_bridge4, device._bridge_address = device._bridge_address, (lambda ip: '10.0.0.9:5555' if ip == '10.0.0.9' else None)
     try:
         _wire_log.clear()
-        _bm = _client.get('/play/directv/123/browser.m3u8', environ_base={'REMOTE_ADDR': '10.0.0.9'})
+        _bm = _client.get(install.CONTRACT['relay_manifest'].format(ccid='123'), environ_base={'REMOTE_ADDR': '10.0.0.9'})
         assert _bm.status_code == 200 and b'#EXTM3U' in _bm.get_data(), (_bm.status_code, _bm.get_data()[:200])
         assert any(u.startswith('https://api.cld.dtvce.com/right/authorization/channel/v2') for u, _ in _wire_log), _wire_log
         assert (_ua_of(_yo_master) or '').startswith('APP_PROJECT_NAME/'), \
@@ -964,7 +977,7 @@ try:
         _pscu(_sid, {'directv_playback': {}, 'dai_playback_by_device': {}})
 
     # 1. The bridge hands FC Player the server's own browser.m3u8 (not a DirecTV URL).
-    _manifest = '/play/directv/123/browser.m3u8'
+    _manifest = install.CONTRACT['relay_manifest'].format(ccid='123')
     try:
         from app import fc_player_bridge as _fcb  # noqa: E402
         from app.models import AppSettings as _AS  # noqa: E402
@@ -975,7 +988,7 @@ try:
         _orig_enc = _AS.effective_fc_player_bridge_encoder_url
         _AS.effective_fc_player_bridge_encoder_url = lambda self: 'http://encoder.local/stream1'
         try:
-            _client.get('/play/fc-player/directv/123.m3u8?adb=10.0.0.9:5555', environ_base=_BOX)
+            _client.get(install.CONTRACT['bridge_play'].format(ccid='123') + '?adb=10.0.0.9:5555', environ_base=_BOX)
         finally:
             _fcb.trigger_channel, _fcb.hardware_bridge_active = _orig_fcb
             _AS.effective_fc_player_bridge_encoder_url = _orig_enc
@@ -1436,7 +1449,7 @@ try:
             _s._cache = {'directv_playback': {'123': {'fallback_url': 'https://cached.example/x.m3u8',
                                                       'cached_at': _t.time() - _age}}}
             try:
-                _out = _s.resolve('directv://123/res')
+                _out = _s.resolve(_STREAM)
             except Exception:
                 _out = None
             assert bool(_fetched) == _want_fetch and (_want_fetch or _out == 'https://cached.example/x.m3u8'), \
@@ -1483,5 +1496,84 @@ try:
 finally:
     for _r, _v in _saved.items():
         setattr(install.up_owner(_r), install.up_name(_r), _v)
+# (u) The profile switch waits on upstream's REAL refresh lock: drive upstream's own
+# background re-auth with a fake redis, record the key it takes, and check select_profile
+# refuses while that exact key is held (not just a key the overlay assumes).
+import redis as _redis_mod  # noqa: E402
+class _KeyRedis(_FakeRedis):
+    taken = []
+    def set(self, k, v, nx=False, ex=None):
+        ok = super().set(k, v, nx=nx, ex=ex)
+        if ok:
+            _KeyRedis.taken.append(k)
+        return ok
+_kr = _KeyRedis()
+_real_from_url = _redis_mod.from_url
+try:
+    _redis_mod.from_url = lambda *a, **k: _kr
+    with app.app_context():
+        _src = db.session.get(Source, _sid)
+        _scr = Scraper(dict(_src.config or {}))
+        try:
+            up('start_reauth')(_scr)
+        except Exception:
+            pass   # queueing the RQ job may fail here; the lock is taken first
+    _upkeys = [k for k in _KeyRedis.taken if 'refresh' in k]
+    assert len(_upkeys) == 1, f"upstream's re-auth took no recognizable refresh lock: {_KeyRedis.taken}"
+    _kr.d = {_upkeys[0]: b'1'}   # upstream's refresh holds its lock
+    _real_rr = dai._redis
+    dai._redis = lambda: _kr
+    try:
+        with app.app_context():
+            _res = dai.select_profile(db.session.get(Source, _sid), 'p1', 'David')
+        assert not _res['ok'] and 'refresh' in (_res.get('error') or ''), \
+            f"the profile switch ignored upstream's refresh lock {_upkeys[0]!r}: {_res}"
+    finally:
+        dai._redis = _real_rr
+finally:
+    _redis_mod.from_url = _real_from_url
+
+# (v) Parity with upstream's own channel authorization. Our DAI request (channel/v2) is a
+# separate copy of upstream's v1 request, so if upstream adds a query parameter or header,
+# or a new "token expired" signal, this fails and names it. The allowed differences are
+# the documented ones (CLAUDE.md "Android TV authorization request"); anything else must
+# be looked at, and added either to our request or to this list.
+_V1_ONLY_PARAMS = {'timeShiftEnabled', 'dualManifest'}   # web-only; the app doesn't send them
+_V2_ONLY_PARAMS = {'startOver'}                           # the app's own query
+_V1_ONLY_HEADERS = {'Origin', 'Referer'}                  # web player headers; the app sends none
+_real_sess2 = directv.requests.Session
+directv.requests.Session = _Session
+try:
+    with app.test_request_context(environ_base={'REMOTE_ADDR': '203.0.113.9'}):
+        _Session.calls.clear(); _Session.reply = _Resp(data=_v1_ok)
+        up('channel_fetch').__wrapped__(**{k: v for k, v in {'bearer_token': 'B', 'cookies': [],
+            'client_context': None, 'ccid': '123'}.items()
+            if k in inspect.signature(up('channel_fetch').__wrapped__).parameters})
+        _u1, _p1, _h1 = _Session.calls[-1]
+        _Session.calls.clear(); _Session.reply = _Resp(data=_v2_ok)
+        install._fetch_dai_playback({'bearer_token': 'B', 'cookies': [], 'client_context': None, 'ccid': '123'},
+                                    {'d': 'android_tv'})
+        _u2, _p2, _h2 = _Session.calls[-1]
+    _new_p = set(_p1) - set(_p2) - _V1_ONLY_PARAMS
+    _new_h = {h for h in _h1 if h not in _h2 and h not in _V1_ONLY_HEADERS}
+    assert not _new_p, f"upstream's channel authorization sends query parameters our DAI request doesn't: {sorted(_new_p)}"
+    assert not _new_h, f"upstream's channel authorization sends headers our DAI request doesn't: {sorted(_new_h)}"
+    assert set(_p2) - set(_p1) <= _V2_ONLY_PARAMS, f'our DAI request sends undocumented parameters: {sorted(set(_p2) - set(_p1) - _V2_ONLY_PARAMS)}'
+    # Every body upstream treats as an expired token, ours does too.
+    for _body in ({'authorized': False, 'responseStatus': {'errorCode': '0015'}},
+                  {'authorized': False, 'responseStatus': {'errorText': 'Access token has expired'}}):
+        _Session.reply = _Resp(data=_body)
+        _r1 = _r2 = False
+        try:
+            up('channel_fetch').__wrapped__(bearer_token='B', cookies=[], client_context=None, ccid='123')
+        except up('auth_expired_error'):
+            _r1 = True
+        try:
+            install._fetch_dai_playback({'bearer_token': 'B', 'ccid': '123'}, {'d': 'android_tv'})
+        except up('auth_expired_error'):
+            _r2 = True
+        assert _r1 == _r2, f"upstream and our DAI request disagree on whether {_body} is an expired token"
+finally:
+    directv.requests.Session = _real_sess2
 
 print('Overlay smoke test passed.')

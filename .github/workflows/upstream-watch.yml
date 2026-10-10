@@ -39,7 +39,7 @@ env:
 
 jobs:
   watch:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Read development HEAD
         id: head
@@ -51,7 +51,7 @@ jobs:
 
       - name: Already invoked the agent for this commit?
         id: seen
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .dev-watch-marker
           key: dev-watch-v2-${{ steps.head.outputs.sha }}
