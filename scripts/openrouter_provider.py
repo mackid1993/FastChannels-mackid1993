@@ -5,7 +5,8 @@ held-fix reviewer). The model is the AI_MODEL repo variable, as Aider names it:
 - "anthropic/<id>" (the default, Claude Haiku 5.5): Anthropic's API with ANTHROPIC_API_KEY.
   Paid from the Claude Max plan's monthly API credit. Gets an explicit output budget, since
   Anthropic requires max_tokens and a model newer than Aider's model list would otherwise get
-  a small default (and its adaptive thinking spends from the same budget).
+  a small default (and its adaptive thinking spends from the same budget), and no
+  temperature (Haiku 5.5 rejects it).
 - "openrouter/<id>": OpenRouter with OPENROUTER_API_KEY, plus provider routing. Tested
   2026-10-09 with the AI repair's exact request (~130k tokens): OpenInference answered as if no
   files were in the chat, so it is never used, and DeepInfra is preferred. Override with the
@@ -40,7 +41,10 @@ def key_var(model: str) -> str:
 
 def aider_settings(model: str) -> list:
     if is_anthropic(model):
-        return [{'name': model, 'extra_params': {'max_tokens': ANTHROPIC_MAX_TOKENS}}]
+        # use_temperature False: Claude Haiku 5.5 (and later models) reject `temperature`
+        # ("deprecated for this model"), and Aider sends it unless told not to.
+        return [{'name': model, 'edit_format': 'diff', 'use_temperature': False,
+                 'extra_params': {'max_tokens': ANTHROPIC_MAX_TOKENS}}]
     # Aider passes extra_body straight into the OpenRouter request.
     return [{'name': model, 'extra_params': {'extra_body': {'provider': provider()}}}]
 
