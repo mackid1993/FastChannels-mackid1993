@@ -285,14 +285,14 @@ def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
       <Android ID> with is_lat=0. DirecTV's own prefix for an Android device id,
       which every Android device exposes over adb. We never invent a value.
     comscore_device = Android_<Build.MANUFACTURER>_<Build.MODEL>, whitespace removed,
-    as the app builds it (universalYospaceParameters), for the device the session
-    presents: upstream's fixed app User-Agent names one device on sign-in, DRM and
-    playback, so comscore_device names that same device (directv_dai_device.
-    presented_device), falling back to the bridge device's own values."""
+    as the app builds it (universalYospaceParameters), of the bridge device itself (its
+    build properties, read over adb). The ad session describes the box actually playing;
+    upstream's fixed sign-in identity stays on sign-in, refresh and DRM, which never see
+    these values (David, 2026-10-10: the box's own identity is what brought hyper-local
+    ads; the Chromecast name on every box did not)."""
     if not props:
         return {}
-    shown = device.presented_device() or props
-    flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{shown.get('manufacturer', '')}_{shown.get('model', '')}")}
+    flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{props.get('manufacturer', '')}_{props.get('model', '')}")}
     gaid = ((ad_id or {}).get('advertising_id') or '').strip()
     # An all-zero id is Android's "deleted / limited" sentinel, never a real id: treat
     # it as opt-out, and never send it as an advertising id.

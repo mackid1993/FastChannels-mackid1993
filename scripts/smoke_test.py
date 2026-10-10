@@ -231,11 +231,10 @@ assert 'comscore_device' not in query, 'comscore_device only comes from a real b
 # platform advertising id the app sends, captured per device: google_advertising_id:<id>
 # + adid with is_lat=0. A deleted/limited id gives the app's optout form. android_id is
 # the absolute last resort when no advertising id can be read. comscore_device as the app
-# builds it, for the device upstream's fixed app User-Agent presents (so every request in
-# the session names one device); it never carries whitespace.
-assert device.presented_device() == {'manufacturer': 'Google', 'model': 'Chromecast'}, \
-    f"upstream's app User-Agent no longer names a device comscore_device can match: {up('app_user_agent')!r}"
-_SHOWN = 'Android_Google_Chromecast'
+# builds it, from the bridge device's OWN build properties (David, 2026-10-10: the ad
+# session describes the box playing; upstream's sign-in identity stays on sign-in/DRM);
+# it never carries whitespace.
+_SHOWN = 'Android_Amazon_AFTKRT'
 fire = {'manufacturer': 'Amazon', 'model': 'AFTKRT', 'board': 'karat', 'release': '11',
         'limit_ad_tracking': '0', 'android_id': 'abcdef0123456789'}
 _cap = {'advertising_id': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', 'optout': False}
@@ -250,15 +249,10 @@ assert dai.device_ad_flags(fire) == {'comscore_device': _SHOWN, 'is_lat': '0',
     '_fw_did': 'android_id:abcdef0123456789'}
 assert dai.device_ad_flags({**fire, 'limit_ad_tracking': '1'})['_fw_did'] == 'google_advertising_id:optout'
 shield = {'manufacturer': 'NVIDIA', 'model': 'SHIELD Android TV', 'android_id': 'abcdef0123456789'}
-assert dai.device_ad_flags(shield) == {'comscore_device': _SHOWN, 'is_lat': '0',
+assert dai.device_ad_flags(shield) == {'comscore_device': 'Android_NVIDIA_SHIELDAndroidTV', 'is_lat': '0',
     '_fw_did': 'android_id:abcdef0123456789'}
-# If the presented device can't be read (upstream's UA changed to a board we don't map),
-# comscore_device falls back to the bridge device's own values, whitespace removed.
-_real_presented = device.presented_device
-device.presented_device = lambda: None
-assert dai.device_ad_flags(fire)['comscore_device'] == 'Android_Amazon_AFTKRT'
-assert dai.device_ad_flags(shield)['comscore_device'] == 'Android_NVIDIA_SHIELDAndroidTV'
-device.presented_device = _real_presented
+_gtv = {'manufacturer': 'onn', 'model': 'onn. 4K Plus Streaming', 'android_id': 'abcdef0123456789'}
+assert dai.device_ad_flags(_gtv)['comscore_device'] == 'Android_onn_onn.4KPlusStreaming'
 assert dai.device_ad_flags({}) == {}
 # Advertising-id capture, with adb mocked: Fire reads the id silently from settings;
 # GMS (Ads activity present, box idle) reads it off the Ads screen; a playing box is
@@ -1230,14 +1224,6 @@ assert install._device_session_ttl() == float(up('playback_cache_ttl')), \
 # 5. The profile exchange uses upstream's own code sign-in client id (by role, no fallback).
 assert dai._profile_client_id() == str(up('code_signin_client_id')) and dai._profile_client_id(), dai._profile_client_id()
 
-# 6. If upstream's app User-Agent names a device comscore_device can't match, it is reported.
-_real_presented = device.presented_device
-try:
-    device.presented_device = lambda: None
-    assert any(f.startswith('comscore_device') for f in install.status(app)['failed']), install.status(app)
-finally:
-    device.presented_device = _real_presented
-assert not any(f.startswith('comscore_device') for f in install.status(app)['failed'])
 
 # 4 + 7. The profile switch merges into the live config under upstream's lock (a token
 # written meanwhile survives), releases only its own refresh lock, re-queues a refresh

@@ -6,11 +6,11 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 ---
  app/scrapers/directv_dai.py         | 1554 +++++++++++++++++++++++++++
- app/scrapers/directv_dai_device.py  |  429 ++++++++
- app/scrapers/directv_dai_install.py | 1254 +++++++++++++++++++++
+ app/scrapers/directv_dai_device.py  |  407 +++++++
+ app/scrapers/directv_dai_install.py | 1234 +++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 +
  app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++
- 5 files changed, 3949 insertions(+)
+ 5 files changed, 3907 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -19,7 +19,7 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..64856a8
+index 0000000..abf562a
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
 @@ -0,0 +1,1554 @@
@@ -310,14 +310,14 @@ index 0000000..64856a8
 +      <Android ID> with is_lat=0. DirecTV's own prefix for an Android device id,
 +      which every Android device exposes over adb. We never invent a value.
 +    comscore_device = Android_<Build.MANUFACTURER>_<Build.MODEL>, whitespace removed,
-+    as the app builds it (universalYospaceParameters), for the device the session
-+    presents: upstream's fixed app User-Agent names one device on sign-in, DRM and
-+    playback, so comscore_device names that same device (directv_dai_device.
-+    presented_device), falling back to the bridge device's own values."""
++    as the app builds it (universalYospaceParameters), of the bridge device itself (its
++    build properties, read over adb). The ad session describes the box actually playing;
++    upstream's fixed sign-in identity stays on sign-in, refresh and DRM, which never see
++    these values (David, 2026-10-10: the box's own identity is what brought hyper-local
++    ads; the Chromecast name on every box did not)."""
 +    if not props:
 +        return {}
-+    shown = device.presented_device() or props
-+    flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{shown.get('manufacturer', '')}_{shown.get('model', '')}")}
++    flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{props.get('manufacturer', '')}_{props.get('model', '')}")}
 +    gaid = ((ad_id or {}).get('advertising_id') or '').strip()
 +    # An all-zero id is Android's "deleted / limited" sentinel, never a real id: treat
 +    # it as opt-out, and never send it as an advertising id.
@@ -1579,10 +1579,10 @@ index 0000000..64856a8
 +        capture_in_background(UNCAPTURED)
 diff --git a/app/scrapers/directv_dai_device.py b/app/scrapers/directv_dai_device.py
 new file mode 100644
-index 0000000..da1aa1a
+index 0000000..3e2ad91
 --- /dev/null
 +++ b/app/scrapers/directv_dai_device.py
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,407 @@
 +"""The bridge device a DirecTV DAI tune plays on: its identity and app User-Agent.
 +
 +DAI targets the playback device the way DirecTV's Android TV app does, so this reads
@@ -1990,34 +1990,12 @@ index 0000000..da1aa1a
 +    return up('app_user_agent')
 +
 +
-+
-+# Build.MANUFACTURER for the devices upstream's fixed app User-Agent can name, by
-+# Build.BOARD (the UA carries model and board, not the manufacturer).
-+_UA_MANUFACTURERS = {'sabrina': 'Google', 'boreal': 'Google'}
-+_UA_DEVICE = re.compile(r'\(Android [^;)]*;\s*([^;)]+?)\s*;\s*([^;)]+?)\s*\)')
-+
-+
-+def presented_device() -> dict | None:
-+    """The device upstream's fixed app User-Agent presents ({'manufacturer', 'model'}),
-+    so comscore_device can name the same device as every request in the session.
-+    None when it can't be read (no such UA, or a board not in _UA_MANUFACTURERS);
-+    then comscore_device keeps the bridge device's own values."""
-+    try:
-+        from .directv_dai_install import up
-+        m = _UA_DEVICE.search(str(up('app_user_agent') or ''))
-+    except Exception:
-+        return None
-+    if not m:
-+        return None
-+    model, board = m.group(1), m.group(2)
-+    manufacturer = _UA_MANUFACTURERS.get(board.lower())
-+    return {'manufacturer': manufacturer, 'model': model} if manufacturer else None
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..9eddb53
+index 0000000..9a9999b
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,1254 @@
+@@ -0,0 +1,1234 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
@@ -2253,27 +2231,7 @@ index 0000000..9eddb53
 +    if root:
 +        markers = missing_markers(root)
 +    return {'missing': missing(), 'markers': markers + relay,
-+            'failed': sorted(set(_failed + identity_problems())), 'runtime': runtime_warnings()}
-+
-+
-+def identity_problems() -> list[str]:
-+    """The one client identity the session presents must hold together: comscore_device
-+    names the device upstream's fixed app User-Agent presents. If upstream changes that
-+    string to a device directv_dai_device can't name, comscore_device would quietly fall
-+    back to each box's own values; say so instead (CI and the panel)."""
-+    try:
-+        from . import directv_dai_device
-+        ua = up('app_user_agent')
-+    except Exception:
-+        return []   # the role itself is gone: missing() names it
-+    try:
-+        if directv_dai_device.presented_device() is None:
-+            return [f"comscore_device: upstream's app User-Agent ({str(ua)[:120]!r}) names a "
-+                    'device directv_dai_device._UA_MANUFACTURERS does not map; comscore_device falls back to '
-+                    "each box's own values (add its board)"]
-+    except Exception:
-+        return ['comscore_device: could not read the device upstream\'s app User-Agent presents']
-+    return []
++            'failed': sorted(set(_failed)), 'runtime': runtime_warnings()}
 +
 +
 +def install(app) -> None:

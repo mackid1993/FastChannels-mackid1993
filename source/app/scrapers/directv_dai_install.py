@@ -233,27 +233,7 @@ def status(app=None) -> dict:
     if root:
         markers = missing_markers(root)
     return {'missing': missing(), 'markers': markers + relay,
-            'failed': sorted(set(_failed + identity_problems())), 'runtime': runtime_warnings()}
-
-
-def identity_problems() -> list[str]:
-    """The one client identity the session presents must hold together: comscore_device
-    names the device upstream's fixed app User-Agent presents. If upstream changes that
-    string to a device directv_dai_device can't name, comscore_device would quietly fall
-    back to each box's own values; say so instead (CI and the panel)."""
-    try:
-        from . import directv_dai_device
-        ua = up('app_user_agent')
-    except Exception:
-        return []   # the role itself is gone: missing() names it
-    try:
-        if directv_dai_device.presented_device() is None:
-            return [f"comscore_device: upstream's app User-Agent ({str(ua)[:120]!r}) names a "
-                    'device directv_dai_device._UA_MANUFACTURERS does not map; comscore_device falls back to '
-                    "each box's own values (add its board)"]
-    except Exception:
-        return ['comscore_device: could not read the device upstream\'s app User-Agent presents']
-    return []
+            'failed': sorted(set(_failed)), 'runtime': runtime_warnings()}
 
 
 def install(app) -> None:

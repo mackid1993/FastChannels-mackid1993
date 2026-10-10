@@ -405,25 +405,3 @@ def player_user_agent() -> str | None:
     return up('app_user_agent')
 
 
-
-# Build.MANUFACTURER for the devices upstream's fixed app User-Agent can name, by
-# Build.BOARD (the UA carries model and board, not the manufacturer).
-_UA_MANUFACTURERS = {'sabrina': 'Google', 'boreal': 'Google'}
-_UA_DEVICE = re.compile(r'\(Android [^;)]*;\s*([^;)]+?)\s*;\s*([^;)]+?)\s*\)')
-
-
-def presented_device() -> dict | None:
-    """The device upstream's fixed app User-Agent presents ({'manufacturer', 'model'}),
-    so comscore_device can name the same device as every request in the session.
-    None when it can't be read (no such UA, or a board not in _UA_MANUFACTURERS);
-    then comscore_device keeps the bridge device's own values."""
-    try:
-        from .directv_dai_install import up
-        m = _UA_DEVICE.search(str(up('app_user_agent') or ''))
-    except Exception:
-        return None
-    if not m:
-        return None
-    model, board = m.group(1), m.group(2)
-    manufacturer = _UA_MANUFACTURERS.get(board.lower())
-    return {'manufacturer': manufacturer, 'model': model} if manufacturer else None
