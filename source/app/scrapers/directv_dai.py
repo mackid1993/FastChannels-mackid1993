@@ -77,18 +77,17 @@ _CLIENT_PARAMS = {
     # a break ever comes back empty/503, this is the first thing to restore).
     # yo.lp also dropped 2026-10-03: no DirecTV client — app or Osprey — sends it.
     'yo.fr': 'true', 'yo.av': '5',
-    # The Android TV app's own live Yospace params. Its com.att.tv config tree sets
-    # YSLiveParams = {yo.d.cp, yo.vm}; it does NOT send yo.cps for a live tune. yo.cps
-    # is a Content Playback Spec from the app's default/iOS config tree only
-    # ('b.lp.d.s.<min>-3630.0x.s.n' with a computed <min> we can't know), and sending
-    # it pinned Yospace to a band-limited inserted-ad profile (muffled ~7 kHz) that the
-    # real Android TV app — and the Osprey — never get. Leaving it out, per the repo
-    # rule: if we don't know the value, don't invent one. yo.vm is the ad-macro map,
-    # base64 JSON with APPBUNDLE com.att.tv, sent verbatim. yo.vm is a pinned snapshot of
-    # the app's bundled value: the ${...} inside are Yospace server-side macros (the app
-    # does not substitute them either), so the blob goes as-is and never varies per
-    # session. It drifts only on a DirecTV app update — re-extract YSLiveParams.yo.vm from
-    # the new index.android.bundle then (the app User-Agent's version is upstream's now).
+    # The Android TV app's own live Yospace params, as captured from com.att.tv 5.0.136 on
+    # an Android TV box (mitmproxy on a debuggable build, 2026-10-10): yo.sl, yo.fr, yo.av,
+    # yo.d.cp, yo.vm and yo.cps. yo.cps is the app's Content Playback Spec template
+    # 'b.lp.d.s.<min>-3630.0x.s.n'; generateURIWithDynamicCPSFlag fills <min> with
+    # minutesToSeconds(3) = 180 (its default), which the capture confirms. (An older note
+    # blamed yo.cps for muffled ad audio; that was DirecTV's per-ad AC-3 encode, fixed on the
+    # relay side by serving those ads' AAC rendition.) yo.vm is the ad-macro map, base64 JSON
+    # with APPBUNDLE com.att.tv, sent verbatim: the ${...} inside are Yospace server-side
+    # macros (the app does not substitute them either). Both drift only on a DirecTV app
+    # update: re-extract YSLiveParams / the CPS template from the new index.android.bundle.
+    'yo.cps': 'b.lp.d.s.180-3630.0x.s.n',
     'yo.sl': '3', 'yo.d.cp': 'true',
     'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
 }
@@ -717,7 +716,11 @@ def _current_device_ad_flags() -> dict:
 
 
 # The billing ZIP (bZipCode) is part of the account's targeting and every DAI session must
-# carry it. Sign-in and turning DAI on fetch it before any tune. If a tune still finds none
+# carry it. This is the app's own cgnatEnabled branch of universalYospaceParameters (it adds
+# the account's clientContext zipCode when the feature flag is on; the bundled default is
+# off and a captured Android TV tune went without it). A bridge has no location source and
+# sits behind whatever IP its host has, so we take the app's fallback deliberately: a real
+# account value, never invented. Sign-in and turning DAI on fetch it before any tune. If a tune still finds none
 # stored (an older session, or that lookup failed), it looks it up right then:
 # - the location lookup runs in the background, one per sign-in (single-flight); every
 #   tune that needs it, the first included, waits for it at most _ZIP_DEADLINE in total

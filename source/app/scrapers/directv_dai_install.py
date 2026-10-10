@@ -107,7 +107,7 @@ CONTRACT = {
     # If in doubt, leave it out; never copy a web value into the Android TV request.
     'web_only_params': ['timeShiftEnabled', 'dualManifest'],   # web player only; the app doesn't send them
     'web_only_headers': ['Origin', 'Referer'],                 # web player headers; the app sends none
-    'app_only_params': ['startOver'],                          # the Android TV app's own query
+    'app_only_params': ['startOver', '_tz'],                   # the Android TV app's own query
 }
 # Strings in upstream's files the wiring relies on without calling them by name:
 # (file, text, what breaks without it). validate.sh, smoke_test.py and status() check these.
@@ -651,8 +651,10 @@ def _fetch_dai_playback(args: dict, flags: dict) -> dict | None:
             session.cookies.set(c['name'], c['value'], domain=c.get('domain') or None, path=c.get('path') or '/')
         except Exception:
             continue
+    # The Android TV app's exact channel/v2 query (captured 2026-10-10), _tz included: the
+    # request time in epoch milliseconds (a cache-buster, not an identity value).
     params = {'ccid': ccid, 'proximity': 'O', 'reserveCTicket': 'true', 'daiEnabled': 'true',
-              'startOver': 'false', 'abrEnabled': 'true'}
+              'startOver': 'false', 'abrEnabled': 'true', '_tz': str(int(time.time() * 1000))}
     if args.get('client_context'):
         params['clientContext'] = args['client_context']
     r = session.get(_CHANNEL_AUTH_V2, params=params, timeout=15)
