@@ -112,6 +112,8 @@ Our routes (our blueprint): `/directv-dai` (the panel page), `/directv-dai/admin
 
 When one of these fails, find the upstream object that does that job (read the code that uses it, not just the names in `upstream_index.txt`) and point the role there.
 
+**`CONTRACT` (also in `directv_dai_install.py`) is the tests' view of upstream:** the routes, source name and stream-URL format `smoke_test.py` drives (each route is checked against the running app), plus the allowed differences between our DAI request and upstream's own channel request. If upstream moves a route or changes a format, the fix is that `CONTRACT` value, like a role. The parity test (`smoke_test.py` (v)) fails when upstream's channel request sends a parameter or header ours doesn't, or treats a different response as an expired token. **Fairness rule for a parity failure:** a new upstream parameter or header goes on `web_only_params` / `web_only_headers` (not sent by us) unless the Android TV app is known to send it. If in doubt, leave it out. Never copy a web value into the Android TV request to make the test pass. A new expired-token signal is mirrored in `_fetch_dai_playback`.
+
 ### Our modules
 
 - **`directv_dai.py`**: the DAI feature.

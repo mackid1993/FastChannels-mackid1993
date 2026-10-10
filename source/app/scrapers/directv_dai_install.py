@@ -91,7 +91,7 @@ RELAY_PREFIX = '/play/directv/'
 # Upstream URLs, names and formats the TESTS rely on (smoke_test.py reads them only from
 # here). The overlay's runtime doesn't use them; they're the test's view of upstream, so
 # when upstream changes one, the fix is this value, editable by the AI repair, never the
-# test itself. validate.sh checks each route exists in upstream's routes.
+# test itself. smoke_test.py checks each route against the running app.
 CONTRACT = {
     'source_name': 'directv',                                  # Source.name / registry key
     'stream_url': 'directv://{ccid}/res',                      # Channel.stream_url format
@@ -101,6 +101,13 @@ CONTRACT = {
     'sources_page': '/admin/sources',                          # where the panel mounts
     'settings_save': '/<int:source_id>/config',                # upstream's settings save (suffix)
     'channel_auth_v1': '/channel/v1',                          # upstream's own channel request
+    # How our DAI request (the Android TV app's channel/v2) may differ from upstream's own
+    # channel request. FAIRNESS RULE: a new parameter or header upstream starts sending goes
+    # in the web_only lists (NOT sent by us) unless the Android TV app is known to send it.
+    # If in doubt, leave it out; never copy a web value into the Android TV request.
+    'web_only_params': ['timeShiftEnabled', 'dualManifest'],   # web player only; the app doesn't send them
+    'web_only_headers': ['Origin', 'Referer'],                 # web player headers; the app sends none
+    'app_only_params': ['startOver'],                          # the Android TV app's own query
 }
 # Strings in upstream's files the wiring relies on without calling them by name:
 # (file, text, what breaks without it). validate.sh, smoke_test.py and status() check these.

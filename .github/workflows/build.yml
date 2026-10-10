@@ -151,7 +151,7 @@ jobs:
             echo "::notice::Upstream $UPSTREAM_BRANCH ${{ steps.inputs.outputs.short }} doesn't have the DirecTV code sign-in yet (app/scrapers/directv_device_auth.py); waiting for his release. :latest stays on the last good build."
             # Not silent: one open issue says the release builds are waiting (closed below once
             # main has the code sign-in). Test runs never file issues.
-            if [ "$TEST_RUN" != true ] && ! overlay/scripts/issue.sh exists "$WAIT_TITLE"; then
+            if [ "$TEST_RUN" != true ] && [ "$UPSTREAM_BRANCH" = main ] && ! overlay/scripts/issue.sh exists "$WAIT_TITLE"; then
               printf '%s\n\n%s\n\ncc @%s\n' \
                 "Scheduled builds of upstream \`$UPSTREAM_BRANCH\` are skipping: it doesn't have the DirecTV code sign-in (\`app/scrapers/directv_device_auth.py\`) yet. \`:latest\` stays on the last good build (publish a development build by hand meanwhile)." \
                 "This closes by itself once \`$UPSTREAM_BRANCH\` has it. If upstream released it under another name, the overlay's roles in \`directv_dai_install.py\` need pointing at it." \
@@ -164,7 +164,8 @@ jobs:
             echo "::error::could not check upstream for the code sign-in (HTTP ${code:-none}); retrying next run"
             exit 1
           fi
-          if [ "$TEST_RUN" != true ]; then
+          # Only a build of main can say main has it (a manual development build can't).
+          if [ "$TEST_RUN" != true ] && [ "$UPSTREAM_BRANCH" = main ]; then
             overlay/scripts/issue.sh close "$WAIT_TITLE" "Upstream \`$UPSTREAM_BRANCH\` now has the DirecTV code sign-in; builds resume." || true
           fi
           if [ "${{ inputs.force }}" != "true" ] && [ "${{ steps.inputs.outputs.drift }}" != "true" ] && docker buildx imagetools inspect "$IMAGE:build-${{ steps.inputs.outputs.key }}" >/dev/null 2>&1; then

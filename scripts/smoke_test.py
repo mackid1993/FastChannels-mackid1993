@@ -1535,20 +1535,22 @@ finally:
 
 # (v) Parity with upstream's own channel authorization. Our DAI request (channel/v2) is a
 # separate copy of upstream's v1 request, so if upstream adds a query parameter or header,
-# or a new "token expired" signal, this fails and names it. The allowed differences are
-# the documented ones (CLAUDE.md "Android TV authorization request"); anything else must
-# be looked at, and added either to our request or to this list.
-_V1_ONLY_PARAMS = {'timeShiftEnabled', 'dualManifest'}   # web-only; the app doesn't send them
-_V2_ONLY_PARAMS = {'startOver'}                           # the app's own query
-_V1_ONLY_HEADERS = {'Origin', 'Referer'}                  # web player headers; the app sends none
+# or a new "token expired" signal, this fails and names it. The allowed differences live in
+# CONTRACT (web_only_params / web_only_headers / app_only_params, AI-editable): a new
+# upstream value goes on a web_only list unless the Android TV app is known to send it.
+_V1_ONLY_PARAMS = set(install.CONTRACT['web_only_params'])
+_V2_ONLY_PARAMS = set(install.CONTRACT['app_only_params'])
+_V1_ONLY_HEADERS = set(install.CONTRACT['web_only_headers'])
+_fetch_params = inspect.signature(up('channel_fetch').__wrapped__).parameters
+def _v1_args():   # upstream's fetch, called with whichever of its arguments it still takes
+    return {k: v for k, v in {'bearer_token': 'B', 'cookies': [], 'client_context': None,
+                              'ccid': '123'}.items() if k in _fetch_params}
 _real_sess2 = directv.requests.Session
 directv.requests.Session = _Session
 try:
     with app.test_request_context(environ_base={'REMOTE_ADDR': '203.0.113.9'}):
         _Session.calls.clear(); _Session.reply = _Resp(data=_v1_ok)
-        up('channel_fetch').__wrapped__(**{k: v for k, v in {'bearer_token': 'B', 'cookies': [],
-            'client_context': None, 'ccid': '123'}.items()
-            if k in inspect.signature(up('channel_fetch').__wrapped__).parameters})
+        up('channel_fetch').__wrapped__(**_v1_args())
         _u1, _p1, _h1 = _Session.calls[-1]
         _Session.calls.clear(); _Session.reply = _Resp(data=_v2_ok)
         install._fetch_dai_playback({'bearer_token': 'B', 'cookies': [], 'client_context': None, 'ccid': '123'},
@@ -1565,7 +1567,7 @@ try:
         _Session.reply = _Resp(data=_body)
         _r1 = _r2 = False
         try:
-            up('channel_fetch').__wrapped__(bearer_token='B', cookies=[], client_context=None, ccid='123')
+            up('channel_fetch').__wrapped__(**_v1_args())
         except up('auth_expired_error'):
             _r1 = True
         try:

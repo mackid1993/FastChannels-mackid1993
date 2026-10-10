@@ -7,10 +7,10 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 ---
  app/scrapers/directv_dai.py         | 1549 +++++++++++++++++++++++++++
  app/scrapers/directv_dai_device.py  |  429 ++++++++
- app/scrapers/directv_dai_install.py | 1245 +++++++++++++++++++++
+ app/scrapers/directv_dai_install.py | 1252 ++++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 +
  app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++
- 5 files changed, 3935 insertions(+)
+ 5 files changed, 3942 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -2009,10 +2009,10 @@ index 0000000..da1aa1a
 +    return {'manufacturer': manufacturer, 'model': model} if manufacturer else None
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..f21c2d7
+index 0000000..4f0502e
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,1245 @@
+@@ -0,0 +1,1252 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
@@ -2106,7 +2106,7 @@ index 0000000..f21c2d7
 +# Upstream URLs, names and formats the TESTS rely on (smoke_test.py reads them only from
 +# here). The overlay's runtime doesn't use them; they're the test's view of upstream, so
 +# when upstream changes one, the fix is this value, editable by the AI repair, never the
-+# test itself. validate.sh checks each route exists in upstream's routes.
++# test itself. smoke_test.py checks each route against the running app.
 +CONTRACT = {
 +    'source_name': 'directv',                                  # Source.name / registry key
 +    'stream_url': 'directv://{ccid}/res',                      # Channel.stream_url format
@@ -2116,6 +2116,13 @@ index 0000000..f21c2d7
 +    'sources_page': '/admin/sources',                          # where the panel mounts
 +    'settings_save': '/<int:source_id>/config',                # upstream's settings save (suffix)
 +    'channel_auth_v1': '/channel/v1',                          # upstream's own channel request
++    # How our DAI request (the Android TV app's channel/v2) may differ from upstream's own
++    # channel request. FAIRNESS RULE: a new parameter or header upstream starts sending goes
++    # in the web_only lists (NOT sent by us) unless the Android TV app is known to send it.
++    # If in doubt, leave it out; never copy a web value into the Android TV request.
++    'web_only_params': ['timeShiftEnabled', 'dualManifest'],   # web player only; the app doesn't send them
++    'web_only_headers': ['Origin', 'Referer'],                 # web player headers; the app sends none
++    'app_only_params': ['startOver'],                          # the Android TV app's own query
 +}
 +# Strings in upstream's files the wiring relies on without calling them by name:
 +# (file, text, what breaks without it). validate.sh, smoke_test.py and status() check these.
