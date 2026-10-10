@@ -204,16 +204,18 @@ def cached_url_usable(cached: dict | None, dai: bool) -> bool:
     return True
 
 
-def request_flags(config: dict, channel_names: dict | None, ccid: str, zip_lookup: bool = True) -> dict | None:
+def request_flags(config: dict, channel_names: dict | None, ccid: str, zip_lookup: bool = True,
+                  report: bool = True) -> dict | None:
     """The DAI flags for one tune, or None when DAI is off. ``zip_lookup=False`` for a
     request whose stream is never played (the license path's play-token fallback): it
     uses a stored ZIP but never waits on a lookup."""
     if not enabled(config):
         return None
-    return build_query(config, channel_names or {}, ccid, zip_lookup=zip_lookup)
+    return build_query(config, channel_names or {}, ccid, zip_lookup=zip_lookup, report=report)
 
 
-def build_query(config: dict, dai_channel_names: dict, ccid: str, zip_lookup: bool = True) -> dict:
+def build_query(config: dict, dai_channel_names: dict, ccid: str, zip_lookup: bool = True,
+                report: bool = True) -> dict:
     """The DAI request flags: the general client flags (never a desktop device
     identity; see _CLIENT_PARAMS), the account's own household/profile/DMA, its
     real ad-personalization choice (is_lat derived from the account's GPP consent
@@ -231,10 +233,11 @@ def build_query(config: dict, dai_channel_names: dict, ccid: str, zip_lookup: bo
     profid = config.get('dtv_android_profid')
     if profid:
         q['profid'] = profid
-    _profid_check(config, bool(profid))
+    if report:
+        _profid_check(config, bool(profid))
     if config.get('dai_dma_id'):
         q['dma_location'] = config['dai_dma_id']
-        q['dma_billing'] = config.get('dai_billing_dma_id') or config['dai_dma_id']
+        q['dma_billing'] = config['dai_dma_id']
     if config.get('dai_gpp'):
         q['gpp'] = config['dai_gpp']
     if config.get('dai_gpp_sid'):
@@ -285,19 +288,11 @@ def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
     presents: upstream's fixed app User-Agent names one device on sign-in, DRM and
     playback, so comscore_device names that same device (directv_dai_device.
     presented_device), falling back to the bridge device's own values."""
-    props = props or {}
-    if not props and not ad_id:
+    if not props:
         return {}
-    flags = {}
     shown = device.presented_device() or props
-    if shown.get('manufacturer') and shown.get('model'):
-        flags['comscore_device'] = re.sub(r'\s+', '', f"Android_{shown['manufacturer']}_{shown['model']}")
+    flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{shown.get('manufacturer', '')}_{shown.get('model', '')}")}
     gaid = ((ad_id or {}).get('advertising_id') or '').strip()
-    # The device's own ad-tracking choice wins over a captured id: a box that turned
-    # tracking off after its id was captured sends the opt-out form, never the old id.
-    if props.get('limit_ad_tracking') == '1':
-        flags.update({'is_lat': '1', '_fw_did': 'google_advertising_id:optout', 'adid': 'optout'})
-        return flags
     # An all-zero id is Android's "deleted / limited" sentinel, never a real id: treat
     # it as opt-out, and never send it as an advertising id.
     optout = bool((ad_id or {}).get('optout')) or gaid == _ZERO_GAID
@@ -548,22 +543,10 @@ def _read_gms_advertising_id(address: str):
     if _is_playing(address):
         logger.info('[directv-dai] skipped advertising-id capture for %s: box is playing', address)
         return _PLAYING
-    # The script runs DETACHED on the box (nohup, backgrounded): if this worker or its adb
-    # connection dies mid-read, the box still finishes and goes back HOME. Its result
-    # file is polled, then removed.
     b64 = base64.b64encode(_GMS_CAPTURE_SH.encode()).decode()
-    _adb_shell(address, f'rm -f /data/local/tmp/dai_cap.out; echo {b64} | base64 -d > /data/local/tmp/dai_cap.sh; '
-                        "nohup sh -c 'sh /data/local/tmp/dai_cap.sh > /data/local/tmp/dai_cap.out.tmp 2>&1; "
-                        "mv /data/local/tmp/dai_cap.out.tmp /data/local/tmp/dai_cap.out' >/dev/null 2>&1 &",
-               timeout=15)
-    out = ''
-    deadline = time.time() + 40
-    while time.time() < deadline:
-        time.sleep(1)
-        out = _adb_shell(address, 'cat /data/local/tmp/dai_cap.out 2>/dev/null', timeout=8)
-        if 'GAID=' in out:
-            break
-    _adb_shell(address, 'rm -f /data/local/tmp/dai_cap.sh /data/local/tmp/dai_cap.out', timeout=8)
+    out = _adb_shell(address, f'echo {b64} | base64 -d > /data/local/tmp/dai_cap.sh; '
+                              'sh /data/local/tmp/dai_cap.sh; rm -f /data/local/tmp/dai_cap.sh',
+                     timeout=45)
     state = gaid = ''
     for ln in out.splitlines():
         if ln.startswith('STATE='):
@@ -627,25 +610,6 @@ def _capture_and_store(address: str) -> str:
                 rdb.delete(lock_key)
             except Exception:
                 pass
-
-
-def refresh_fire_advertising_id(address: str) -> None:
-    """Background, from the device's hourly re-check: re-read a Fire TV's advertising id
-    (silent, a settings read) and store it if it changed (reset, or tracking limited). Only
-    for boxes whose id came from Fire OS; a Google TV id is never re-read (its read shows
-    the Ads screen)."""
-    saved = _saved_adids().get(address) or {}
-    if saved.get('source') != 'fire':
-        return
-    res = _read_fire_advertising_id(address)
-    if not res:
-        return
-    entry = {'advertising_id': res['advertising_id'], 'optout': res['optout'],
-             'source': 'fire', 'captured_at': int(time.time())}
-    if _store_adid(address, entry):
-        logger.info('[directv-dai] advertising id for %s changed (%s); cached streams cleared',
-                    address, 'optout' if res['optout'] else 'new id')
-        _bust_playback_cache()
 
 
 def _bridge_addresses(fresh: bool = True) -> list[str]:
@@ -743,8 +707,7 @@ def _current_device_ad_flags() -> dict:
     advertising id captured for it earlier. Reads the store only — a tune NEVER triggers a
     capture (capture is explicit: DAI toggle-on or the admin button)."""
     address = _current_bridge_address()
-    # A bridge box whose identity read hasn't landed still sends its captured id.
-    return device_ad_flags(device._client_device(), _saved_adids().get(address) if address else None)
+    return device_ad_flags(device._client_device(), _saved_adids().get(address or ''))
 
 
 # The billing ZIP (bZipCode) is part of the account's targeting and every DAI session must
@@ -804,20 +767,26 @@ def _profid_check(config: dict, have: bool) -> None:
         logger.debug('[directv-dai] profid check failed', exc_info=True)
 
 
-def targeting_signature(flags: dict | None) -> str:
-    import hashlib
-    picked = {k: str((flags or {}).get(k) or '') for k in _SIG_KEYS}
-    return hashlib.sha256(json.dumps(picked, sort_keys=True).encode()).hexdigest()[:16]
+def targeting_values(flags: dict | None) -> dict:
+    """The ad-deciding values a DAI session was opened with (stored with it)."""
+    return {k: str(v) for k, v in (flags or {}).items() if k in _SIG_KEYS and v not in (None, '')}
 
 
 def session_current(entry: dict | None, config: dict, names: dict | None, ccid: str) -> bool:
-    """Whether a cached DAI session still carries what this tune would send (no network)."""
+    """Whether a cached DAI session still carries what a tune would send. Read-only and no
+    network. A value this process can't know yet (e.g. a ZIP another worker looked up and
+    hasn't been saved) never makes a session stale; only a value that is known now and
+    differs from, or is missing in, the session does (it was opened before the ZIP/DMA/
+    profile arrived, under another account, or for another opt-out state)."""
     if not isinstance(entry, dict) or not entry.get('dai'):
         return True
     if 'yospace.com' not in (entry.get('fallback_url') or ''):
         return True   # this channel has no DAI stream; nothing targeted to compare
-    want = targeting_signature(request_flags(config, names, ccid, zip_lookup=False))
-    return entry.get('dai_sig') == want
+    had = entry.get('dai_targeting')
+    if not isinstance(had, dict):
+        return False  # opened before sessions recorded their targeting: replace once
+    now = targeting_values(request_flags(config, names, ccid, zip_lookup=False, report=False))
+    return all(had.get(k) == v for k, v in now.items())
 
 
 def _account_zip(config: dict) -> str | None:
@@ -1026,7 +995,7 @@ def store_login_result(cfg: dict, result: dict) -> None:
 
 # The looked-up account values (refetched automatically on the next sign-in or tune) and
 # the chosen viewer profile (picked by a person, so never dropped on a guess).
-_LOOKUP_VALUES = ('dai_dma_id', 'dai_billing_dma_id', 'dai_zip', 'dai_gpp', 'dai_gpp_sid')
+_LOOKUP_VALUES = ('dai_dma_id', 'dai_zip', 'dai_gpp', 'dai_gpp_sid')
 _PROFILE_VALUES = ('dtv_android_profid', 'dtv_android_profile_id')
 
 
@@ -1164,15 +1133,10 @@ def fetch_location_context(session, bearer: str, timeout: float = 15) -> dict:
         r = session.get(_LOCATION_URL, params={'includeTVOD': 'false'}, headers=hdrs, timeout=timeout)
         if r.ok:
             data = r.json()
-            billing = data.get('billingDmas') if isinstance(data, dict) else None
-            service = ({k: v for k, v in data.items() if k != 'billingDmas'}
-                       if isinstance(data, dict) else data)
-            dma = _find_first_key(service, 'dmaId') or _find_first_key(data, 'dmaId')
+            dma = _find_first_key(data, 'dmaId')
             if dma:
                 ctx['dma_id'] = str(dma)
-            billing_dma = _find_first_key(billing, 'dmaId')
-            if billing_dma:
-                ctx['billing_dma_id'] = str(billing_dma)
+            billing = data.get('billingDmas') if isinstance(data, dict) else None
             zip_code = _find_first_key(billing, 'zipcode') or _find_first_key(data, 'zipcode')
             if zip_code:
                 ctx['zip'] = str(zip_code)

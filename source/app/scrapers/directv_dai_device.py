@@ -136,16 +136,11 @@ def _first_read(address: str, done: threading.Event) -> None:
 
 
 def _recheck_device(address: str, saved: dict) -> None:
-    """Background re-check: update the saved values only if the device changed; also
-    re-read a Fire TV's advertising id (silent) in case it was reset or limited."""
+    """Background re-check of the device IDENTITY only (never its advertising id, which is
+    captured once and kept): update the saved values only if the device changed."""
     fresh = _read_device(address)
     if fresh:
         _store_device(address, fresh)   # also stamps checked_at
-        try:
-            from . import directv_dai
-            directv_dai.refresh_fire_advertising_id(address)
-        except Exception:
-            logger.debug('[directv-dai] Fire advertising-id re-check failed for %s', address, exc_info=True)
     if fresh and fresh != saved:
         changed = sorted(k for k in fresh if fresh.get(k) != saved.get(k))
         _DEVICE_CACHE[address] = (time.time() + _DEVICE_TTL, fresh)

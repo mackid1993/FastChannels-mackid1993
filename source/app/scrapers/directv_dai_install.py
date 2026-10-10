@@ -488,7 +488,7 @@ def _patch_scraper() -> None:
             try:
                 result = _fetch_dai_playback(bound, flags)
                 if result:
-                    result['dai_sig'] = directv_dai.targeting_signature(flags)
+                    result['dai_targeting'] = directv_dai.targeting_values(flags)
             except up('auth_expired_error'):
                 raise
             except Exception as exc:
@@ -601,9 +601,8 @@ def _fetch_dai_playback(args: dict, flags: dict) -> dict | None:
     ccid = args['ccid']
     session = requests.Session()
     session.headers.update({'Accept': '*/*', 'Authorization': f"Bearer {args.get('bearer_token') or ''}"})
-    # The DirecTV app's User-Agent for every channel/v2 request: it is the app's endpoint,
-    # sent with d=android_tv, so it never goes out with upstream's desktop browser string.
-    ua = directv_dai_device.player_user_agent() or up('app_user_agent') or getattr(scraper_module, '_UA', None)
+    # The bridge device's own app User-Agent; for any other requester, upstream's own.
+    ua = directv_dai_device.player_user_agent() or getattr(scraper_module, '_UA', None)
     if ua:
         session.headers['User-Agent'] = ua
     for c in args.get('cookies') or []:
@@ -615,7 +614,7 @@ def _fetch_dai_playback(args: dict, flags: dict) -> dict | None:
               'startOver': 'false', 'abrEnabled': 'true'}
     if args.get('client_context'):
         params['clientContext'] = args['client_context']
-    r = session.get(_CHANNEL_AUTH_V2, params=params, timeout=(5, 10))
+    r = session.get(_CHANNEL_AUTH_V2, params=params, timeout=15)
     if r.status_code != 200:
         logger.warning('[directv-dai] channel/v2 HTTP %s for ccid=%s', r.status_code, ccid)
         return None

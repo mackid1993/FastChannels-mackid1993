@@ -590,7 +590,7 @@ try:
         assert url.endswith('/v1.m3u8'), url
         # The DAI entry has exactly upstream's playback keys (plus 'dai'), so upstream's
         # cache and license code read it like its own.
-        assert set(_dai_entry) - {'dai', 'dai_sig'} == set(sc.cache['directv_playback']['123']), \
+        assert set(_dai_entry) - {'dai', 'dai_targeting'} == set(sc.cache['directv_playback']['123']), \
             f"the DAI playback entry's keys differ from upstream's: {sorted(_dai_entry)} vs {sorted(sc.cache['directv_playback']['123'])}"
         # (c) An expired token on the DAI request raises upstream's own error, so upstream's
         # re-auth runs exactly as on its own request.
@@ -1347,5 +1347,29 @@ try:
     assert not any('without profid' in w for w in install.runtime_warnings()), 'a tune with profid did not clear the warning'
 finally:
     dai.list_profiles, dai.select_profile, device.spawn = _real
+
+# (p) A cached DAI session is reused only while it carries current targeting. A value
+# this process can't know yet (another worker's unsaved ZIP) never makes it stale; a
+# value known now that is missing or different does. The check never starts anything.
+_yo = 'https://x.yospace.com/csm/a.m3u8?yospace.pool=livepause'
+_cfg = {'use_dai': 'true', 'dai_partner_profile_id': 'hh', 'dai_dma_id': '501', 'dtv_android_profid': 'pp'}
+_full = {'hhid': 'hh', 'u': 'hh', 'profid': 'pp', 'dma_location': '501', 'dma_billing': '501', 'bZipCode': '10965'}
+_e = lambda t: {'fallback_url': _yo, 'dai': True, 'dai_targeting': t}
+_sp2, _real_sp2 = [], device.spawn
+device.spawn = lambda fn, *a: _sp2.append(fn.__name__)
+try:
+    assert dai.session_current(_e(_full), _cfg, {}, '1'), 'a session from another worker (ZIP not known here) was dropped'
+    assert dai.session_current(_e(_full), {**_cfg, 'dai_zip': '10965'}, {}, '1')
+    assert not dai.session_current(_e({k: v for k, v in _full.items() if k != 'bZipCode'}), {**_cfg, 'dai_zip': '10965'}, {}, '1'), \
+        'a session opened before the ZIP arrived was reused'
+    assert not dai.session_current(_e({k: v for k, v in _full.items() if k != 'profid'}), _cfg, {}, '1'), \
+        'a session opened before the profile was set was reused'
+    assert not dai.session_current(_e({**_full, 'hhid': 'other', 'u': 'other'}), _cfg, {}, '1'), 'another account\'s session was reused'
+    assert not dai.session_current({'fallback_url': _yo, 'dai': True}, _cfg, {}, '1'), 'an untagged (old) session was kept'
+    assert dai.session_current({'fallback_url': 'https://dfwlive/x.m3u8', 'dai': True}, _cfg, {}, '1'), 'a no-DAI channel entry was dropped'
+    assert dai.session_current(_e(_full), {k: v for k, v in _cfg.items() if k != 'dtv_android_profid'}, {}, '1') is not None
+    assert _sp2 == [], f'the read-only session check started background work: {_sp2}'
+finally:
+    device.spawn = _real_sp2
 
 print('Overlay smoke test passed.')
