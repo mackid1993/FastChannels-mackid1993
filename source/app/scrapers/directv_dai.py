@@ -272,14 +272,24 @@ def build_query(config: dict, dai_channel_names: dict, ccid: str, zip_lookup: bo
     return q
 
 
-def _fw_did_prefix(ad_id: dict | None, props: dict) -> str:
-    """FreeWheel's id-type prefix for this device's advertising id: Amazon's for an id
-    read from Fire OS (capture source 'fire', or an Amazon box with no recorded source),
-    Google's otherwise."""
-    source = (ad_id or {}).get('source')
-    if source == 'fire' or (not source and str(props.get('manufacturer', '')).lower() == 'amazon'):
-        return 'amazon_advertising_id:'
-    return 'google_advertising_id:'
+# The Fire TV build of the same app (com.att.tv for Fire OS, decompiled 2026-10-10) sends its
+# own platform identity: yospaceParameters' Fire TV branch sets d=firetv, nielsen_platform
+# plt,OTT, nielsen_dev_group DEVGRP_FIRETV (devgrp,STB) and the id via
+# makeFWAdvertisingIdFn(ADID_PREFIX_FIRETV) (amazon_advertising_id:); its YSLiveParams yo.vm
+# is the same ad-macro map with APPBUNDLE B01J62Q632 (its Amazon Appstore id). The player
+# runs on exactly two platforms, so each box sends its own (David, 2026-10-10): a Fire TV
+# box this, an Android TV box _CLIENT_PARAMS' android_tv values. Decided from the box's
+# saved adb properties (no adb call at tune time).
+_FIRE_TV_PARAMS = {
+    'd': 'firetv', 'nielsen_platform': 'plt,OTT', 'nielsen_dev_group': 'devgrp,STB',
+    'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJCMDFKNjJRNjMyIiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQo=',
+}
+
+
+def is_fire_tv(props: dict, ad_id: dict | None = None) -> bool:
+    """A Fire OS box: Amazon-made, or its advertising id was read from Fire OS settings."""
+    return (str((props or {}).get('manufacturer', '')).lower() == 'amazon'
+            or (ad_id or {}).get('source') == 'fire')
 
 
 def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
@@ -314,8 +324,11 @@ def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
     # Amazon advertising id, which DirecTV's Fire TV build sends as amazon_advertising_id:
     # (makeFWAdvertisingIdFn(ADID_PREFIX_FIRETV)); a Google Play Services id keeps
     # google_advertising_id:. Labelling an Amazon id as Google's hid it from the identity
-    # match (David, 2026-10-10). d stays android_tv.
-    prefix = _fw_did_prefix(ad_id, props)
+    # match (David, 2026-10-10).
+    fire = is_fire_tv(props, ad_id)
+    if fire:
+        flags.update(_FIRE_TV_PARAMS)
+    prefix = 'amazon_advertising_id:' if fire else 'google_advertising_id:'
     if gaid and not optout:
         flags.update({'is_lat': '0', '_fw_did': f'{prefix}{gaid}', 'adid': gaid})
     elif optout or props.get('limit_ad_tracking') == '1':
@@ -476,6 +489,28 @@ def _store_adid(address: str, entry: dict) -> bool:
         adids[address] = entry
         _save_adids(adids)
     return changed
+
+
+def mark_box_replaced(address: str) -> None:
+    """A different box now answers at ``address`` (new Android ID). Its saved advertising
+    id is the old box's: replace it with a marker, so no session sends it (the new box goes
+    out with its own android_id until captured), the capture button shows it as pending, and
+    the panel says the box changed. The next capture of that box clears the marker."""
+    with _adid_lock, _adids_file_lock():
+        adids = _saved_adids()
+        prev = adids.get(address) or {}
+        if prev.get('replaced_at') and not prev.get('source'):
+            return
+        adids[address] = {'replaced_at': int(time.time())}
+        _save_adids(adids)
+    logger.warning('[directv-dai] %s is a different box now; press "Capture advertising IDs" '
+                   'for it (its old advertising id is no longer sent)', address)
+
+
+def replaced_boxes() -> list[str]:
+    """Addresses flagged by mark_box_replaced and not captured since."""
+    return sorted(a for a, e in _saved_adids().items()
+                  if isinstance(e, dict) and e.get('replaced_at') and not e.get('source'))
 
 
 def _adb_shell(address: str, shell_cmd: str, timeout: int = 20) -> str:
@@ -714,7 +749,8 @@ def uncaptured_addresses(fresh: bool = False) -> list[str]:
     now = time.time()
     with _adid_lock:
         recent = {a for a, t in _adid_tried.items() if now - t < _ADID_TRIED_TTL}
-    return [a for a in _bridge_addresses(fresh=fresh) if a and a not in saved and a not in recent]
+    captured = {a for a, e in saved.items() if isinstance(e, dict) and e.get('source')}
+    return [a for a in _bridge_addresses(fresh=fresh) if a and a not in captured and a not in recent]
 
 
 def _current_bridge_address() -> str | None:

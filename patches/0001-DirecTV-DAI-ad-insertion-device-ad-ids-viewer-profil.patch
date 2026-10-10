@@ -5,12 +5,12 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
  the inserted-ad audio fix, wired in by one hook
 
 ---
- app/scrapers/directv_dai.py         | 1571 +++++++++++++++++++++++++++
- app/scrapers/directv_dai_device.py  |  407 +++++++
- app/scrapers/directv_dai_install.py | 1234 +++++++++++++++++++++
+ app/scrapers/directv_dai.py         | 1607 +++++++++++++++++++++++++++
+ app/scrapers/directv_dai_device.py  |  416 +++++++
+ app/scrapers/directv_dai_install.py | 1241 +++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 +
  app/scrapers/dtv_aac_gain.py        |  663 +++++++++++
- 5 files changed, 3924 insertions(+)
+ 5 files changed, 3976 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -19,10 +19,10 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..1e04f6e
+index 0000000..f86390d
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,1571 @@
+@@ -0,0 +1,1607 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -297,14 +297,24 @@ index 0000000..1e04f6e
 +    return q
 +
 +
-+def _fw_did_prefix(ad_id: dict | None, props: dict) -> str:
-+    """FreeWheel's id-type prefix for this device's advertising id: Amazon's for an id
-+    read from Fire OS (capture source 'fire', or an Amazon box with no recorded source),
-+    Google's otherwise."""
-+    source = (ad_id or {}).get('source')
-+    if source == 'fire' or (not source and str(props.get('manufacturer', '')).lower() == 'amazon'):
-+        return 'amazon_advertising_id:'
-+    return 'google_advertising_id:'
++# The Fire TV build of the same app (com.att.tv for Fire OS, decompiled 2026-10-10) sends its
++# own platform identity: yospaceParameters' Fire TV branch sets d=firetv, nielsen_platform
++# plt,OTT, nielsen_dev_group DEVGRP_FIRETV (devgrp,STB) and the id via
++# makeFWAdvertisingIdFn(ADID_PREFIX_FIRETV) (amazon_advertising_id:); its YSLiveParams yo.vm
++# is the same ad-macro map with APPBUNDLE B01J62Q632 (its Amazon Appstore id). The player
++# runs on exactly two platforms, so each box sends its own (David, 2026-10-10): a Fire TV
++# box this, an Android TV box _CLIENT_PARAMS' android_tv values. Decided from the box's
++# saved adb properties (no adb call at tune time).
++_FIRE_TV_PARAMS = {
++    'd': 'firetv', 'nielsen_platform': 'plt,OTT', 'nielsen_dev_group': 'devgrp,STB',
++    'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJCMDFKNjJRNjMyIiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQo=',
++}
++
++
++def is_fire_tv(props: dict, ad_id: dict | None = None) -> bool:
++    """A Fire OS box: Amazon-made, or its advertising id was read from Fire OS settings."""
++    return (str((props or {}).get('manufacturer', '')).lower() == 'amazon'
++            or (ad_id or {}).get('source') == 'fire')
 +
 +
 +def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
@@ -339,8 +349,11 @@ index 0000000..1e04f6e
 +    # Amazon advertising id, which DirecTV's Fire TV build sends as amazon_advertising_id:
 +    # (makeFWAdvertisingIdFn(ADID_PREFIX_FIRETV)); a Google Play Services id keeps
 +    # google_advertising_id:. Labelling an Amazon id as Google's hid it from the identity
-+    # match (David, 2026-10-10). d stays android_tv.
-+    prefix = _fw_did_prefix(ad_id, props)
++    # match (David, 2026-10-10).
++    fire = is_fire_tv(props, ad_id)
++    if fire:
++        flags.update(_FIRE_TV_PARAMS)
++    prefix = 'amazon_advertising_id:' if fire else 'google_advertising_id:'
 +    if gaid and not optout:
 +        flags.update({'is_lat': '0', '_fw_did': f'{prefix}{gaid}', 'adid': gaid})
 +    elif optout or props.get('limit_ad_tracking') == '1':
@@ -501,6 +514,28 @@ index 0000000..1e04f6e
 +        adids[address] = entry
 +        _save_adids(adids)
 +    return changed
++
++
++def mark_box_replaced(address: str) -> None:
++    """A different box now answers at ``address`` (new Android ID). Its saved advertising
++    id is the old box's: replace it with a marker, so no session sends it (the new box goes
++    out with its own android_id until captured), the capture button shows it as pending, and
++    the panel says the box changed. The next capture of that box clears the marker."""
++    with _adid_lock, _adids_file_lock():
++        adids = _saved_adids()
++        prev = adids.get(address) or {}
++        if prev.get('replaced_at') and not prev.get('source'):
++            return
++        adids[address] = {'replaced_at': int(time.time())}
++        _save_adids(adids)
++    logger.warning('[directv-dai] %s is a different box now; press "Capture advertising IDs" '
++                   'for it (its old advertising id is no longer sent)', address)
++
++
++def replaced_boxes() -> list[str]:
++    """Addresses flagged by mark_box_replaced and not captured since."""
++    return sorted(a for a, e in _saved_adids().items()
++                  if isinstance(e, dict) and e.get('replaced_at') and not e.get('source'))
 +
 +
 +def _adb_shell(address: str, shell_cmd: str, timeout: int = 20) -> str:
@@ -739,7 +774,8 @@ index 0000000..1e04f6e
 +    now = time.time()
 +    with _adid_lock:
 +        recent = {a for a, t in _adid_tried.items() if now - t < _ADID_TRIED_TTL}
-+    return [a for a in _bridge_addresses(fresh=fresh) if a and a not in saved and a not in recent]
++    captured = {a for a, e in saved.items() if isinstance(e, dict) and e.get('source')}
++    return [a for a in _bridge_addresses(fresh=fresh) if a and a not in captured and a not in recent]
 +
 +
 +def _current_bridge_address() -> str | None:
@@ -1596,10 +1632,10 @@ index 0000000..1e04f6e
 +        capture_in_background(UNCAPTURED)
 diff --git a/app/scrapers/directv_dai_device.py b/app/scrapers/directv_dai_device.py
 new file mode 100644
-index 0000000..3e2ad91
+index 0000000..0ddec1f
 --- /dev/null
 +++ b/app/scrapers/directv_dai_device.py
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,416 @@
 +"""The bridge device a DirecTV DAI tune plays on: its identity and app User-Agent.
 +
 +DAI targets the playback device the way DirecTV's Android TV app does, so this reads
@@ -1747,6 +1783,15 @@ index 0000000..3e2ad91
 +        changed = sorted(k for k in fresh if fresh.get(k) != saved.get(k))
 +        _DEVICE_CACHE[address] = (time.time() + _DEVICE_TTL, fresh)
 +        logger.info('[directv-dai] device %s changed (%s); saved values updated', address, ', '.join(changed))
++        # A different Android ID at the same address is a different (or factory-reset) box:
++        # the advertising id captured there belongs to the old one. Stop sending it and ask
++        # for a capture (never captured automatically: a capture can interrupt playback).
++        if saved.get('android_id') and fresh.get('android_id') != saved.get('android_id'):
++            try:
++                from .directv_dai import mark_box_replaced
++                mark_box_replaced(address)
++            except Exception:
++                logger.exception('[directv-dai] could not flag the replaced box %s', address)
 +
 +
 +def _store_device(address: str, props: dict) -> None:
@@ -2009,10 +2054,10 @@ index 0000000..3e2ad91
 +
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..9a9999b
+index 0000000..1523e86
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,1234 @@
+@@ -0,0 +1,1241 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
@@ -3031,8 +3076,15 @@ index 0000000..9a9999b
 +    from . import directv_dai
 +    st = status()
 +    runtime = st['runtime'] if directv_dai.dai_on() else []   # stale once DAI is off
++    replaced = []
++    if directv_dai.dai_on():
++        try:
++            replaced = [f'box {a} was replaced (new Android ID): press "Capture advertising IDs" '
++                        'again; until then it sends no advertising id' for a in directv_dai.replaced_boxes()]
++        except Exception:
++            replaced = []
 +    return [*(f'upstream renamed or removed {n}' for n in st['missing']), *st['markers'],
-+            *(f'could not wire {n}' for n in st['failed']), *runtime]
++            *(f'could not wire {n}' for n in st['failed']), *runtime, *replaced]
 +
 +
 +_PAGE_HTML = """<!doctype html>

@@ -145,6 +145,15 @@ def _recheck_device(address: str, saved: dict) -> None:
         changed = sorted(k for k in fresh if fresh.get(k) != saved.get(k))
         _DEVICE_CACHE[address] = (time.time() + _DEVICE_TTL, fresh)
         logger.info('[directv-dai] device %s changed (%s); saved values updated', address, ', '.join(changed))
+        # A different Android ID at the same address is a different (or factory-reset) box:
+        # the advertising id captured there belongs to the old one. Stop sending it and ask
+        # for a capture (never captured automatically: a capture can interrupt playback).
+        if saved.get('android_id') and fresh.get('android_id') != saved.get('android_id'):
+            try:
+                from .directv_dai import mark_box_replaced
+                mark_box_replaced(address)
+            except Exception:
+                logger.exception('[directv-dai] could not flag the replaced box %s', address)
 
 
 def _store_device(address: str, props: dict) -> None:

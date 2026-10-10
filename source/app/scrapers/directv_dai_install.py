@@ -1016,8 +1016,15 @@ def _issue_lines() -> list[str]:
     from . import directv_dai
     st = status()
     runtime = st['runtime'] if directv_dai.dai_on() else []   # stale once DAI is off
+    replaced = []
+    if directv_dai.dai_on():
+        try:
+            replaced = [f'box {a} was replaced (new Android ID): press "Capture advertising IDs" '
+                        'again; until then it sends no advertising id' for a in directv_dai.replaced_boxes()]
+        except Exception:
+            replaced = []
     return [*(f'upstream renamed or removed {n}' for n in st['missing']), *st['markers'],
-            *(f'could not wire {n}' for n in st['failed']), *runtime]
+            *(f'could not wire {n}' for n in st['failed']), *runtime, *replaced]
 
 
 _PAGE_HTML = """<!doctype html>

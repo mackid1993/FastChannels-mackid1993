@@ -241,9 +241,17 @@ fire = {'manufacturer': 'Amazon', 'model': 'AFTKRT', 'board': 'karat', 'release'
 # advertising id (the app's Fire TV branch: amazon_advertising_id:), a Play Services
 # capture (source 'gms') keeps google_advertising_id:.
 _cap = {'advertising_id': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', 'optout': False, 'source': 'fire'}
-assert dai.device_ad_flags(fire, _cap) == {'comscore_device': _SHOWN, 'is_lat': '0',
+_FIRE_ID = {'d': 'firetv', 'nielsen_platform': 'plt,OTT', 'nielsen_dev_group': 'devgrp,STB'}
+_ff = dai.device_ad_flags(fire, _cap)
+assert {k: _ff[k] for k in ('comscore_device', 'is_lat', '_fw_did', 'adid', *_FIRE_ID)} == {
+    'comscore_device': _SHOWN, 'is_lat': '0',
     '_fw_did': 'amazon_advertising_id:bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f',
-    'adid': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f'}
+    'adid': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', **_FIRE_ID}, _ff
+assert 'B01J62Q632' in base64.b64decode(_ff['yo.vm']).decode(), "a Fire TV box sends the Fire TV app's yo.vm"
+_gf = dai.device_ad_flags({'manufacturer': 'onn', 'model': 'onn. 4K Plus Streaming', 'android_id': 'abcdef0123456789'},
+                          {**_cap, 'source': 'gms'})
+assert 'd' not in _gf and 'yo.vm' not in _gf and 'nielsen_dev_group' not in _gf, \
+    'an Android TV box keeps the base android_tv identity'
 assert dai.device_ad_flags(_gtv_pre := {'manufacturer': 'onn', 'model': 'onn. 4K Plus Streaming'},
     {**_cap, 'source': 'gms'})['_fw_did'] == 'google_advertising_id:bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', \
     'a Play Services id keeps the Google prefix'
@@ -253,8 +261,8 @@ assert dai.device_ad_flags(fire, {'advertising_id': '', 'optout': True, 'source'
 assert dai.device_ad_flags(fire, {'advertising_id': '00000000-0000-0000-0000-000000000000', 'optout': False, 'source': 'fire'}
     )['_fw_did'] == 'amazon_advertising_id:optout', 'an all-zero (deleted) id is the optout form, never sent as an id'
 # No captured advertising id -> android_id last resort; limited tracking -> optout form.
-assert dai.device_ad_flags(fire) == {'comscore_device': _SHOWN, 'is_lat': '0',
-    '_fw_did': 'android_id:abcdef0123456789'}
+assert {k: v for k, v in dai.device_ad_flags(fire).items() if k not in ('yo.vm', *_FIRE_ID)} == {
+    'comscore_device': _SHOWN, 'is_lat': '0', '_fw_did': 'android_id:abcdef0123456789'}
 assert dai.device_ad_flags({**fire, 'limit_ad_tracking': '1'})['_fw_did'] == 'amazon_advertising_id:optout'
 shield = {'manufacturer': 'NVIDIA', 'model': 'SHIELD Android TV', 'android_id': 'abcdef0123456789'}
 assert dai.device_ad_flags(shield) == {'comscore_device': 'Android_NVIDIA_SHIELDAndroidTV', 'is_lat': '0',
@@ -1020,7 +1028,9 @@ try:
     assert _refs and all(r.startswith('/') for r in _refs), f'the master points the player straight at DirecTV: {_refs}'
     _yo_req = next(u for u, _ in _wire_log if u.startswith(_m_yo + 'master.m3u8'))
     _q = parse_qs(urlsplit(_yo_req).query)
-    for _k, _v in (('d', 'android_tv'), ('yospace.pool', 'livepause'), ('is_lat', '0'), ('dma_location', '501')):
+    # The end-to-end box is the Fire TV fixture: it sends the Fire TV app's identity.
+    for _k, _v in (('d', 'firetv'), ('nielsen_dev_group', 'devgrp,STB'), ('yospace.pool', 'livepause'),
+                   ('is_lat', '0'), ('dma_location', '501')):
         assert _q.get(_k) == [_v], f'the Yospace session lost {_k}={_v}: {_q.get(_k)}'
     assert _q.get('_fw_did') and _q.get('comscore_device') == [_SHOWN], _q
 
@@ -1574,5 +1584,34 @@ try:
         assert _r1 == _r2, f"upstream and our DAI request disagree on whether {_body} is an expired token"
 finally:
     directv.requests.Session = _real_sess2
+
+# (w) A different box at the same address (new Android ID on the hourly identity re-read):
+# its old advertising id stops being sent, it's pending capture, and the panel says so.
+_real_read, _real_saved_devs = device._read_device, device._saved_devices
+_real_store_dev, _real_devfile = device._store_device, device._devices_file
+import tempfile as _tf
+_swap_dir = _tf.mkdtemp()
+device._devices_file = lambda: os.path.join(_swap_dir, 'directv_dai_devices.json')
+try:
+    _swap_addr = '10.9.9.9:5555'
+    dai._store_adid(_swap_addr, {'advertising_id': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f',
+                                 'optout': False, 'source': 'fire', 'captured_at': 1})
+    device._store_device = lambda a, p: None
+    device._read_device = lambda a: {**fire, 'android_id': 'ffff000011112222'}
+    device._recheck_device(_swap_addr, {**fire})          # old box had fire's android_id
+    assert _swap_addr in dai.replaced_boxes(), 'a replaced box must be flagged'
+    _e = dai._saved_adids().get(_swap_addr)
+    assert not _e.get('advertising_id') and not _e.get('source'), "the old box's id must not be kept"
+    _sf = dai.device_ad_flags({**fire, 'android_id': 'ffff000011112222'}, _e)
+    assert _sf['_fw_did'] == 'android_id:ffff000011112222', f"a replaced box never sends the old id: {_sf}"
+    device._recheck_device(_swap_addr, {**fire, 'android_id': 'ffff000011112222'})   # same box: no re-flag churn
+    # Same box re-read with only a non-identity change: not flagged.
+    dai._store_adid(_swap_addr, {'advertising_id': 'x', 'optout': False, 'source': 'fire', 'captured_at': 2})
+    device._read_device = lambda a: {**fire, 'limit_ad_tracking': '1'}
+    device._recheck_device(_swap_addr, {**fire})
+    assert _swap_addr not in dai.replaced_boxes(), 'an ad-tracking toggle is not a box swap'
+finally:
+    device._read_device, device._store_device = _real_read, _real_store_dev
+    device._devices_file = _real_devfile
 
 print('Overlay smoke test passed.')
