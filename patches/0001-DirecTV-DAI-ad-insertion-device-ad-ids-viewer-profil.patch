@@ -5,12 +5,12 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
  the inserted-ad audio fix, wired in by one hook
 
 ---
- app/scrapers/directv_dai.py         | 1552 +++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py         | 1554 +++++++++++++++++++++++++++
  app/scrapers/directv_dai_device.py  |  429 ++++++++
- app/scrapers/directv_dai_install.py | 1254 ++++++++++++++++++++++
+ app/scrapers/directv_dai_install.py | 1254 +++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 +
  app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++
- 5 files changed, 3947 insertions(+)
+ 5 files changed, 3949 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -19,10 +19,10 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..46faecd
+index 0000000..64856a8
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,1552 @@
+@@ -0,0 +1,1554 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -112,7 +112,9 @@ index 0000000..46faecd
 +    # with APPBUNDLE com.att.tv, sent verbatim: the ${...} inside are Yospace server-side
 +    # macros (the app does not substitute them either). Both drift only on a DirecTV app
 +    # update: re-extract YSLiveParams / the CPS template from the new index.android.bundle.
-+    'yo.cps': 'b.lp.d.s.180-3630.0x.s.n',
++    # yo.cps is NOT sent (A/B, David 2026-10-10): with it, CNN breaks lost every car-dealer and
++    # political ad (the local pool) within the first hour; restore only if a no-cps hour shows
++    # the local ads didn't come back either.
 +    'yo.sl': '3', 'yo.d.cp': 'true',
 +    'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
 +}

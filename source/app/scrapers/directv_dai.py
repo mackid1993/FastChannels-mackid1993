@@ -87,7 +87,9 @@ _CLIENT_PARAMS = {
     # with APPBUNDLE com.att.tv, sent verbatim: the ${...} inside are Yospace server-side
     # macros (the app does not substitute them either). Both drift only on a DirecTV app
     # update: re-extract YSLiveParams / the CPS template from the new index.android.bundle.
-    'yo.cps': 'b.lp.d.s.180-3630.0x.s.n',
+    # yo.cps is NOT sent (A/B, David 2026-10-10): with it, CNN breaks lost every car-dealer and
+    # political ad (the local pool) within the first hour; restore only if a no-cps hour shows
+    # the local ads didn't come back either.
     'yo.sl': '3', 'yo.d.cp': 'true',
     'yo.vm': 'WwogIHsKICAgICJERVNJUkVEX0RVUkFUSU9OX1NFQ1MiOiAiJHtERVNJUkVEX0RVUkFUSU9OX1NFQ1N9IiwKICAgICJNRVRBREFUQV9DQUlEIjogIiR7TUVUQURBVEEuQURWRVJUSVNJTkdfSUR9IiwKICAgICJNRVRBREFUQV9CUkVBS0lEIjogIjAiLAogICAgIkFQUEJVTkRMRSI6ICJjb20uYXR0LnR2IiwKICAgICJJTlZFTlRPUllTVEFURSI6ICJhdXRvcGxheWVkIgogIH0KXQ==',
 }

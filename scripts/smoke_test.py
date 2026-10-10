@@ -218,9 +218,9 @@ assert 'yo.lp' not in query, 'yo.lp must not be sent (no DirecTV client — app 
 assert 'yo.po' not in query, "the web player's yo.po must not be sent"
 assert query.get('yo.sl') == '3' and query.get('yo.d.cp') == 'true', \
     "the Android TV app's live Yospace params are missing"
-assert query.get('yo.cps') == 'b.lp.d.s.180-3630.0x.s.n', \
-    ("yo.cps must be the Android TV app's own Content Playback Spec, <min> filled the way "
-     "generateURIWithDynamicCPSFlag does (minutesToSeconds(3) = 180), as captured 2026-10-10")
+assert 'yo.cps' not in query, \
+    ("yo.cps is not sent (A/B 2026-10-10): the app sends b.lp.d.s.180-3630.0x.s.n, but with it "
+     "the local ad pool (car dealers, political) disappeared")
 assert 'com.att.tv' in base64.b64decode(query.get('yo.vm', '')).decode(), \
     "yo.vm must carry the Android TV app's ad-macro map (APPBUNDLE com.att.tv)"
 assert query.get('attnid') == 'dfw003' and query.get('p') == 'dfw', 'DirecTV app constants missing'
