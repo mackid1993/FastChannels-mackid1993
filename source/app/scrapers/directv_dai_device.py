@@ -66,10 +66,13 @@ def _client_device() -> dict:
     hit = _DEVICE_CACHE.get(address)
     if hit and now < hit[0]:
         return hit[1]
-    props = _saved_devices().get(address) or {}
+    saved = _saved_devices().get(address) or {}
+    props = {k: v for k, v in saved.items() if k != 'checked_at'}
     if props:
         _DEVICE_CACHE[address] = (now + _DEVICE_TTL, props)
-        spawn(_recheck_device, address, props)
+        # Re-checked about hourly (the stamp is on disk, so worker recycles don't re-run adb).
+        if now - float(saved.get('checked_at') or 0) >= _DEVICE_TTL:
+            spawn(_recheck_device, address, props)
         return props
     # First sight: hold off repeat reads for _RETRY_TTL, and read in the background, but
     # give the read a few seconds so this first session already carries the device's
@@ -133,19 +136,37 @@ def _first_read(address: str, done: threading.Event) -> None:
 
 
 def _recheck_device(address: str, saved: dict) -> None:
-    """Background re-check: update the saved values only if the device changed."""
+    """Background re-check: update the saved values only if the device changed; also
+    re-read a Fire TV's advertising id (silent) in case it was reset or limited."""
     fresh = _read_device(address)
+    if fresh:
+        _store_device(address, fresh)   # also stamps checked_at
+        try:
+            from . import directv_dai
+            directv_dai.refresh_fire_advertising_id(address)
+        except Exception:
+            logger.debug('[directv-dai] Fire advertising-id re-check failed for %s', address, exc_info=True)
     if fresh and fresh != saved:
         changed = sorted(k for k in fresh if fresh.get(k) != saved.get(k))
-        _store_device(address, fresh)
         _DEVICE_CACHE[address] = (time.time() + _DEVICE_TTL, fresh)
         logger.info('[directv-dai] device %s changed (%s); saved values updated', address, ', '.join(changed))
 
 
 def _store_device(address: str, props: dict) -> None:
-    devices = _saved_devices()
-    devices[address] = props
-    _save_devices(devices)
+    from .directv_dai import _flock_polled
+    lock = None
+    try:
+        lock = open(_devices_file() + '.lock', 'w')
+        _flock_polled(lock)
+    except Exception:
+        lock = None
+    try:
+        devices = _saved_devices()
+        devices[address] = {**props, 'checked_at': int(time.time())}
+        _save_devices(devices)
+    finally:
+        if lock is not None:
+            lock.close()
 
 
 _RETRY_TTL = 60
@@ -207,6 +228,8 @@ def forget_bridge_devices() -> None:
 
 
 def _cached_bridge_devices() -> list[dict]:
+    if _BRIDGE_LIST[1] is None:
+        _load_bridge_snapshot()   # another worker's (or a previous process's) last read
     read_at, devices = _BRIDGE_LIST
     if devices is not None:
         if time.time() - read_at > _BRIDGE_TTL:
@@ -265,7 +288,37 @@ def _read_bridge_devices() -> bool:
         logger.info('[directv-dai] bridge device list readable again')
     _bridge_failed_at[0] = 0.0
     _BRIDGE_LIST[:] = [now, devices]
+    _save_bridge_snapshot(now, devices)
     return True
+
+
+def _bridges_file() -> str:
+    return os.path.join(os.path.dirname(_devices_file()), 'directv_dai_bridges.json')
+
+
+def _load_bridge_snapshot() -> None:
+    """Seed this process's list from the last good read on disk (every gunicorn worker
+    and each recycled worker starts with it, so none waits on ah4c to recognize a box)."""
+    try:
+        with open(_bridges_file(), encoding='utf-8') as f:
+            data = json.load(f)
+        devices = [d for d in data.get('devices') or []
+                   if isinstance(d, dict) and d.get('address') and d.get('host')]
+        if _BRIDGE_LIST[1] is None:
+            _BRIDGE_LIST[:] = [float(data.get('read_at') or 0), devices]
+    except Exception:
+        pass
+
+
+def _save_bridge_snapshot(read_at: float, devices: list) -> None:
+    path = _bridges_file()
+    try:
+        tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'read_at': read_at, 'devices': devices}, f)
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.debug('[directv-dai] could not save the bridge device list: %s', exc)
 
 
 def known_bridge_devices() -> list[dict]:
@@ -327,7 +380,7 @@ def _saved_devices() -> dict:
 def _save_devices(devices: dict) -> None:
     path = _devices_file()
     try:
-        tmp = f'{path}.{os.getpid()}.tmp'
+        tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(devices, f)
         os.replace(tmp, path)

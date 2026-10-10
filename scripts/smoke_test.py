@@ -173,11 +173,13 @@ config = {
     'dai_gpp': us_national_gpp(1), 'dai_gpp_sid': '7', 'dai_zip': '10001',
 }
 query = dai.build_query(config, {'123': 'testnet'}, '123')
-expected = {'hhid': 'hh-1', 'u': 'hh-1', 'profid': 'prof-1', 'dma_location': '999',
+expected = {'hhid': 'hh-1', 'u': 'hh-1', 'dma_location': '999',
             'dma_billing': '999', 'is_lat': '1', 'gpp_sid': '7', 'bZipCode': '10001',
             '_fw_did': 'google_advertising_id:optout', 'adid': 'optout', 'net': 'testnet'}
 for key, value in expected.items():
     assert query.get(key) == value, f'{key}: expected {value!r}, got {query.get(key)!r}'
+# profid is only the picked profile's partnerProfileID1; a login's profileId is another id.
+assert 'profid' not in query, 'a sign-in profileId was sent as profid (only the picker sets it)'
 
 # A viewer profile id the old overlay's profile picker stored (dtv_android_profid, still in
 # the config) is what the app sends as profid, and it wins over the
@@ -348,16 +350,25 @@ device.threading.Thread = _SyncThread
 device._bridge_address = lambda ip: '10.0.0.9:5555'
 device._devices_file = lambda: os.path.join(_tmp, 'devices.json')
 reset = {**fire, 'android_id': 'ffffffffffffffff'}
+def _saved(addr='10.0.0.9:5555'):   # the stored identity, without its re-check stamp
+    return {k: v for k, v in (device._saved_devices().get(addr) or {}).items() if k != 'checked_at'}
+def _age(addr='10.0.0.9:5555'):     # make the next lookup due for its (hourly) re-check
+    d = device._saved_devices(); d[addr]['checked_at'] = 0; device._save_devices(d)
 with Flask('t').test_request_context(environ_base={'REMOTE_ADDR': '10.0.0.9'}):
     device._DEVICE_CACHE.clear(); device._read_device = lambda a: dict(fire)
     assert device._client_device() == fire, 'new device not read'
-    assert device._saved_devices() == {'10.0.0.9:5555': fire}, 'new device not saved'
-    device._DEVICE_CACHE.clear(); device._read_device = lambda a: {}
-    assert device._client_device() == fire and device._saved_devices()['10.0.0.9:5555'] == fire, \
+    assert _saved() == fire and set(device._saved_devices()) == {'10.0.0.9:5555'}, 'new device not saved'
+    # A fresh stamp: a lookup (e.g. after a worker recycle) does NOT re-run adb.
+    _rereads = []
+    device._DEVICE_CACHE.clear(); device._read_device = lambda a: (_rereads.append(a) or dict(fire))
+    device._client_device()
+    assert _rereads == [], 'a device checked within the hour was re-read'
+    _age(); device._DEVICE_CACHE.clear(); device._read_device = lambda a: {}
+    assert device._client_device() == fire and _saved() == fire, \
         'a failed re-check changed the saved identity'
-    device._DEVICE_CACHE.clear(); device._read_device = lambda a: dict(reset)
+    _age(); device._DEVICE_CACHE.clear(); device._read_device = lambda a: dict(reset)
     assert device._client_device() == fire, 'the session must use the saved values, not wait for the re-check'
-    assert device._saved_devices()['10.0.0.9:5555'] == reset, 'a reset device (new Android ID) was not updated'
+    assert _saved() == reset, 'a reset device (new Android ID) was not updated'
     device._DEVICE_CACHE.clear()
     assert device._client_device() == reset, 'the updated identity is not used afterwards'
     os.remove(device._devices_file()); device._DEVICE_CACHE.clear(); device._read_device = lambda a: {}
@@ -548,7 +559,7 @@ def _call_fetch():
     return up('channel_fetch')(**{k: v for k, v in args.items() if k in params})
 
 
-sc = Scraper({'use_dai': 'true', 'bearer_token': 'B', 'dai_dma_id': '501'})
+sc = Scraper({'use_dai': 'true', 'bearer_token': 'B', 'dai_dma_id': '501', 'dtv_android_profid': 'pp-test'})
 sc._cache = {}
 _real_session = directv.requests.Session
 directv.requests.Session = _Session
@@ -579,7 +590,7 @@ try:
         assert url.endswith('/v1.m3u8'), url
         # The DAI entry has exactly upstream's playback keys (plus 'dai'), so upstream's
         # cache and license code read it like its own.
-        assert set(_dai_entry) - {'dai'} == set(sc.cache['directv_playback']['123']), \
+        assert set(_dai_entry) - {'dai', 'dai_sig'} == set(sc.cache['directv_playback']['123']), \
             f"the DAI playback entry's keys differ from upstream's: {sorted(_dai_entry)} vs {sorted(sc.cache['directv_playback']['123'])}"
         # (c) An expired token on the DAI request raises upstream's own error, so upstream's
         # re-auth runs exactly as on its own request.
@@ -827,7 +838,7 @@ try:
         db.create_all()
         _src = Source(name='directv', display_name='DirecTV Stream',
                       config={'auth_method': 'dtv_android', 'refresh_token': 'r', 'bearer_token': 'b',
-                              'dai_dma_id': '501'})
+                              'dai_dma_id': '501', 'dtv_android_profid': 'pp-test'})
         db.session.add(_src)
         db.session.commit()
         _sid = _src.id
@@ -943,7 +954,7 @@ dtv_aac_gain.attenuate_ad_segment = lambda data, *a, **k: (_cut.append(data) or 
 try:
     with app.app_context():
         _s = db.session.get(Source, _sid)
-        _s.config = {**(_s.config or {}), 'use_dai': 'true'}
+        _s.config = {**(_s.config or {}), 'use_dai': 'true', 'dtv_android_profid': 'pp-test'}
         _ch = Channel.query.filter_by(source_id=_sid, source_channel_id='123').first()
         if hasattr(_ch, 'requires_drm_bridge'):
             _ch.requires_drm_bridge = True
@@ -1301,5 +1312,40 @@ finally:
     install.up_set('persist_config', _real_pc)
     dai.time.sleep = _real_sleep
     dai._redis, dai.profile_token_exchange, dai._requeue_stale_refresh = _real
+
+# (o) Every DAI session carries profid: with none picked, the account's DEFAULT (primary)
+# profile is picked automatically; a pick made in the panel is never replaced; a tune with
+# no profid starts the pick (rate-limited) and is reported.
+_real = (dai.list_profiles, dai.select_profile, device.spawn)
+_picked, _sp = [], []
+try:
+    dai.list_profiles = lambda b: {'profiles': [{'id': 'kid', 'name': 'Kid', 'primary': False},
+                                                {'id': 'main', 'name': 'David', 'primary': True}],
+                                   'current_id': 'kid'}
+    dai.select_profile = lambda src, pid, name='': (_picked.append(pid) or {'ok': True})
+    with app.app_context():
+        _s = db.session.get(Source, _sid)
+        _keep = dict(_s.config)
+        _s.config = {**_keep, 'use_dai': 'true', 'auth_method': up('code_signin_method'),
+                     'refresh_token': 'r', 'bearer_token': 'pick-b'}
+        _s.config.pop('dtv_android_profid', None)
+        db.session.commit()
+        dai._auto_pick_profile('pick-b')
+        assert _picked == ['main'], f'the default (primary) profile was not picked: {_picked}'
+        _s = db.session.get(Source, _sid); _s.config = {**_s.config, 'dtv_android_profid': 'chosen'}; db.session.commit()
+        _picked.clear(); dai._auto_pick_profile('pick-b')
+        assert _picked == [], 'the automatic pick replaced a profile picked in the panel'
+        _s = db.session.get(Source, _sid); _s.config = _keep; db.session.commit()
+    # A tune with no profid starts the pick (once per window) and reports it.
+    device.spawn = lambda fn, *a: _sp.append(fn.__name__)
+    dai._auto_pick_at[0] = 0.0
+    _cfg = {'use_dai': 'true', 'auth_method': up('code_signin_method'), 'refresh_token': 'r', 'bearer_token': 'b'}
+    dai.build_query(_cfg, {}, '1'); dai.build_query(_cfg, {}, '1')
+    assert _sp.count('_auto_pick_profile') == 1, _sp
+    assert any('without profid' in w for w in install.runtime_warnings()), install.runtime_warnings()
+    dai.build_query({**_cfg, 'dtv_android_profid': 'pp'}, {}, '1')
+    assert not any('without profid' in w for w in install.runtime_warnings()), 'a tune with profid did not clear the warning'
+finally:
+    dai.list_profiles, dai.select_profile, device.spawn = _real
 
 print('Overlay smoke test passed.')

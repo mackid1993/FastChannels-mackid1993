@@ -128,7 +128,8 @@ def dai_on() -> bool:
         return _DAI_ON[1]
     try:
         Source = _up('source_model')
-        on = any(enabled(src.config) for src in Source.query.filter_by(name='directv').all())
+        with _up('db').session.no_autoflush:
+            on = any(enabled(src.config) for src in Source.query.filter_by(name='directv').all())
     except Exception:
         on = _DAI_ON[1]
     _DAI_ON[:] = [now + _DAI_ON_TTL, on]
@@ -223,20 +224,22 @@ def build_query(config: dict, dai_channel_names: dict, ccid: str, zip_lookup: bo
     if pid:
         q['hhid'] = pid
         q['u'] = pid
-    # profid is the chosen viewer profile's id, from the profile picker's profiletoken
-    # exchange (select_profile -> dtv_android_profid; the key name predates the move into
-    # this module); dai_profile_id is the web-login value. Omitted when unknown (fairness rule).
-    profid = config.get('dtv_android_profid') or config.get('dai_profile_id')
+    # profid is the chosen viewer profile's partnerProfileID1, from the profile picker's
+    # profiletoken exchange (select_profile -> dtv_android_profid; the key name predates the
+    # move into this module). Nothing else is that value (a grant's or token's profileId is
+    # the profile-manager id), so without a picked profile profid is omitted (fairness rule).
+    profid = config.get('dtv_android_profid')
     if profid:
         q['profid'] = profid
+    _profid_check(config, bool(profid))
     if config.get('dai_dma_id'):
         q['dma_location'] = config['dai_dma_id']
-        q['dma_billing'] = config['dai_dma_id']
+        q['dma_billing'] = config.get('dai_billing_dma_id') or config['dai_dma_id']
     if config.get('dai_gpp'):
         q['gpp'] = config['dai_gpp']
     if config.get('dai_gpp_sid'):
         q['gpp_sid'] = config['dai_gpp_sid']
-    zip_code = config.get('dai_zip') or (_account_zip(config) if zip_lookup else None)
+    zip_code = config.get('dai_zip') or (_account_zip(config) if zip_lookup else _known_zip(config))
     if zip_code:
         q['bZipCode'] = zip_code
 
@@ -282,11 +285,19 @@ def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
     presents: upstream's fixed app User-Agent names one device on sign-in, DRM and
     playback, so comscore_device names that same device (directv_dai_device.
     presented_device), falling back to the bridge device's own values."""
-    if not props:
+    props = props or {}
+    if not props and not ad_id:
         return {}
+    flags = {}
     shown = device.presented_device() or props
-    flags = {'comscore_device': re.sub(r'\s+', '', f"Android_{shown.get('manufacturer', '')}_{shown.get('model', '')}")}
+    if shown.get('manufacturer') and shown.get('model'):
+        flags['comscore_device'] = re.sub(r'\s+', '', f"Android_{shown['manufacturer']}_{shown['model']}")
     gaid = ((ad_id or {}).get('advertising_id') or '').strip()
+    # The device's own ad-tracking choice wins over a captured id: a box that turned
+    # tracking off after its id was captured sends the opt-out form, never the old id.
+    if props.get('limit_ad_tracking') == '1':
+        flags.update({'is_lat': '1', '_fw_did': 'google_advertising_id:optout', 'adid': 'optout'})
+        return flags
     # An all-zero id is Android's "deleted / limited" sentinel, never a real id: treat
     # it as opt-out, and never send it as an advertising id.
     optout = bool((ad_id or {}).get('optout')) or gaid == _ZERO_GAID
@@ -402,6 +413,23 @@ def _save_adids(adids: dict) -> None:
             pass
 
 
+def _flock_polled(f, timeout: float = 5.0) -> bool:
+    """Exclusive flock, polled with a (gevent-friendly) sleep instead of a blocking call."""
+    try:
+        import fcntl
+    except Exception:
+        return False
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
 @contextlib.contextmanager
 def _adids_file_lock():
     """Exclusive cross-process lock for the store's read-modify-write. The app runs several
@@ -411,11 +439,7 @@ def _adids_file_lock():
     f = None
     try:
         f = open(_adids_file() + '.lock', 'w')
-        try:
-            import fcntl
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            pass
+        _flock_polled(f)
         yield
     finally:
         if f is not None:
@@ -524,10 +548,22 @@ def _read_gms_advertising_id(address: str):
     if _is_playing(address):
         logger.info('[directv-dai] skipped advertising-id capture for %s: box is playing', address)
         return _PLAYING
+    # The script runs DETACHED on the box (nohup, backgrounded): if this worker or its adb
+    # connection dies mid-read, the box still finishes and goes back HOME. Its result
+    # file is polled, then removed.
     b64 = base64.b64encode(_GMS_CAPTURE_SH.encode()).decode()
-    out = _adb_shell(address, f'echo {b64} | base64 -d > /data/local/tmp/dai_cap.sh; '
-                              'sh /data/local/tmp/dai_cap.sh; rm -f /data/local/tmp/dai_cap.sh',
-                     timeout=45)
+    _adb_shell(address, f'rm -f /data/local/tmp/dai_cap.out; echo {b64} | base64 -d > /data/local/tmp/dai_cap.sh; '
+                        "nohup sh -c 'sh /data/local/tmp/dai_cap.sh > /data/local/tmp/dai_cap.out.tmp 2>&1; "
+                        "mv /data/local/tmp/dai_cap.out.tmp /data/local/tmp/dai_cap.out' >/dev/null 2>&1 &",
+               timeout=15)
+    out = ''
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        time.sleep(1)
+        out = _adb_shell(address, 'cat /data/local/tmp/dai_cap.out 2>/dev/null', timeout=8)
+        if 'GAID=' in out:
+            break
+    _adb_shell(address, 'rm -f /data/local/tmp/dai_cap.sh /data/local/tmp/dai_cap.out', timeout=8)
     state = gaid = ''
     for ln in out.splitlines():
         if ln.startswith('STATE='):
@@ -559,6 +595,12 @@ def _capture_and_store(address: str) -> str:
         if address in _adid_inflight:
             return 'none'
         _adid_inflight.add(address)
+    rdb, lock_key = _redis(), f'directv_dai:capture:{address}'
+    try:
+        if rdb is not None and not rdb.set(lock_key, '1', nx=True, ex=180):
+            return 'none'   # another worker is capturing this box right now
+    except Exception:
+        pass
     try:
         if not _reachable(address):
             return 'unreachable'   # box off / adb down; kept pending so a re-run picks it up
@@ -580,6 +622,30 @@ def _capture_and_store(address: str) -> str:
     finally:
         with _adid_lock:
             _adid_inflight.discard(address)
+        if rdb is not None:
+            try:
+                rdb.delete(lock_key)
+            except Exception:
+                pass
+
+
+def refresh_fire_advertising_id(address: str) -> None:
+    """Background, from the device's hourly re-check: re-read a Fire TV's advertising id
+    (silent, a settings read) and store it if it changed (reset, or tracking limited). Only
+    for boxes whose id came from Fire OS; a Google TV id is never re-read (its read shows
+    the Ads screen)."""
+    saved = _saved_adids().get(address) or {}
+    if saved.get('source') != 'fire':
+        return
+    res = _read_fire_advertising_id(address)
+    if not res:
+        return
+    entry = {'advertising_id': res['advertising_id'], 'optout': res['optout'],
+             'source': 'fire', 'captured_at': int(time.time())}
+    if _store_adid(address, entry):
+        logger.info('[directv-dai] advertising id for %s changed (%s); cached streams cleared',
+                    address, 'optout' if res['optout'] else 'new id')
+        _bust_playback_cache()
 
 
 def _bridge_addresses(fresh: bool = True) -> list[str]:
@@ -677,7 +743,8 @@ def _current_device_ad_flags() -> dict:
     advertising id captured for it earlier. Reads the store only — a tune NEVER triggers a
     capture (capture is explicit: DAI toggle-on or the admin button)."""
     address = _current_bridge_address()
-    return device_ad_flags(device._client_device(), _saved_adids().get(address or ''))
+    # A bridge box whose identity read hasn't landed still sends its captured id.
+    return device_ad_flags(device._client_device(), _saved_adids().get(address) if address else None)
 
 
 # The billing ZIP (bZipCode) is part of the account's targeting and every DAI session must
@@ -703,6 +770,54 @@ _zip_lock = threading.Lock()
 def _bearer_tag(bearer: str) -> str:
     import hashlib
     return hashlib.sha256(bearer.encode()).hexdigest()[:12]
+
+
+def _known_zip(config: dict) -> str | None:
+    """A ZIP this process already looked up for the config's sign-in (no network)."""
+    bearer = str(config.get('bearer_token') or '')
+    if not bearer:
+        return None
+    with _zip_lock:
+        return _ZIP_FOUND.get(_bearer_tag(bearer))
+
+
+# The values a DAI session was opened with that decide its ads. A cached session is only
+# reused while these still match what a tune would send now, so a session opened before
+# the account's ZIP/DMA/consent arrived, under another account, profile or opt-out, is
+# replaced on the next tune instead of serving untargeted ads for the cache's lifetime.
+_SIG_KEYS = ('hhid', 'u', 'profid', 'dma_location', 'dma_billing', 'gpp', 'gpp_sid',
+             'bZipCode', '_fw_did', 'adid', 'is_lat')
+
+
+def _profid_check(config: dict, have: bool) -> None:
+    """Every DAI session must carry profid. Without one, start the default-profile pick
+    (rate-limited) and report it in red on the panel until a tune carries one."""
+    try:
+        from .directv_dai_install import _note
+        if have:
+            _note('profid_ok')
+            return
+        _note('no_profid', 'no viewer profile set yet; running as the account\'s default profile '
+                           'automatically (or pick one in the DirecTV settings)')
+        _start_auto_pick(config, config.get('bearer_token'), force=False)
+    except Exception:
+        logger.debug('[directv-dai] profid check failed', exc_info=True)
+
+
+def targeting_signature(flags: dict | None) -> str:
+    import hashlib
+    picked = {k: str((flags or {}).get(k) or '') for k in _SIG_KEYS}
+    return hashlib.sha256(json.dumps(picked, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def session_current(entry: dict | None, config: dict, names: dict | None, ccid: str) -> bool:
+    """Whether a cached DAI session still carries what this tune would send (no network)."""
+    if not isinstance(entry, dict) or not entry.get('dai'):
+        return True
+    if 'yospace.com' not in (entry.get('fallback_url') or ''):
+        return True   # this channel has no DAI stream; nothing targeted to compare
+    want = targeting_signature(request_flags(config, names, ccid, zip_lookup=False))
+    return entry.get('dai_sig') == want
 
 
 def _account_zip(config: dict) -> str | None:
@@ -906,11 +1021,12 @@ def store_login_result(cfg: dict, result: dict) -> None:
             device.spawn(_fetch_account_values_after_signin, bearer)
         except Exception:
             logger.warning('[directv-dai] could not start the account lookup after sign-in', exc_info=True)
+    _start_auto_pick(cfg, bearer)
 
 
 # The looked-up account values (refetched automatically on the next sign-in or tune) and
 # the chosen viewer profile (picked by a person, so never dropped on a guess).
-_LOOKUP_VALUES = ('dai_dma_id', 'dai_zip', 'dai_gpp', 'dai_gpp_sid')
+_LOOKUP_VALUES = ('dai_dma_id', 'dai_billing_dma_id', 'dai_zip', 'dai_gpp', 'dai_gpp_sid')
 _PROFILE_VALUES = ('dtv_android_profid', 'dtv_android_profile_id')
 
 
@@ -966,6 +1082,60 @@ def _check_profile_after_signin(bearer: str, profile_id: str) -> None:
                        '(pick one in the DirecTV settings)')
 
 
+def _auto_pick_profile(bearer: str) -> None:
+    """Background: with no viewer profile picked, run as the account's DEFAULT profile
+    (its primary; every account has one), so every DAI session carries a real profid
+    (partnerProfileID1). Uses select_profile, so it waits on upstream's refresh
+    lock, verifies a rotated refresh token and clears cached streams. A pick made in the
+    panel always wins: this never replaces one."""
+    db, Source = _up('db'), _up('source_model')
+    for attempt in range(6):
+        db.session.expire_all()
+        src = Source.query.filter_by(name='directv').first()
+        cfg = dict((src.config if src else None) or {})
+        if not src or cfg.get('dtv_android_profid') or not enabled(cfg) or not profiles_supported(cfg):
+            return
+        if cfg.get('bearer_token') != bearer:
+            time.sleep(5)   # sign-in commits after our hook; wait for it
+            continue
+        info = list_profiles(bearer)
+        profiles = info.get('profiles') or []
+        pick = (next((p for p in profiles if p.get('primary')), None)
+                or next((p for p in profiles if p['id'] == info.get('current_id')), None)
+                or (profiles[0] if len(profiles) == 1 else None))
+        if not pick:
+            logger.warning('[directv-dai] no viewer profile to run as automatically; pick one in the '
+                           'DirecTV settings so ads carry profid')
+            return
+        res = select_profile(src, pick['id'], pick.get('name') or '')
+        if res.get('ok'):
+            logger.info('[directv-dai] running as the account\'s default profile automatically (profid set)')
+            return
+        if 'refresh is in flight' not in (res.get('error') or ''):
+            logger.warning('[directv-dai] automatic profile pick failed: %s', res.get('error'))
+            return
+        time.sleep(10)
+
+
+_AUTO_PICK_RETRY = 300
+_auto_pick_at = [0.0]
+
+
+def _start_auto_pick(cfg: dict, bearer, force: bool = True) -> None:
+    """Start the default-profile pick (sign-in, DAI turned on, or a tune that found no
+    profid: at most every _AUTO_PICK_RETRY per process for the tune path)."""
+    if not (bearer and enabled(cfg) and not cfg.get('dtv_android_profid') and profiles_supported(cfg)):
+        return
+    now = time.time()
+    if not force and now - _auto_pick_at[0] < _AUTO_PICK_RETRY:
+        return
+    _auto_pick_at[0] = now
+    try:
+        device.spawn(_auto_pick_profile, str(bearer))
+    except Exception:
+        logger.warning('[directv-dai] could not start the automatic profile pick', exc_info=True)
+
+
 def _fetch_account_values_after_signin(bearer: str) -> None:
     """Background, after a sign-in: the account's DMA/ZIP/consent, merged into the source
     once that sign-in is stored (persist_config, so nothing written meanwhile is lost)."""
@@ -994,10 +1164,15 @@ def fetch_location_context(session, bearer: str, timeout: float = 15) -> dict:
         r = session.get(_LOCATION_URL, params={'includeTVOD': 'false'}, headers=hdrs, timeout=timeout)
         if r.ok:
             data = r.json()
-            dma = _find_first_key(data, 'dmaId')
+            billing = data.get('billingDmas') if isinstance(data, dict) else None
+            service = ({k: v for k, v in data.items() if k != 'billingDmas'}
+                       if isinstance(data, dict) else data)
+            dma = _find_first_key(service, 'dmaId') or _find_first_key(data, 'dmaId')
             if dma:
                 ctx['dma_id'] = str(dma)
-            billing = data.get('billingDmas') if isinstance(data, dict) else None
+            billing_dma = _find_first_key(billing, 'dmaId')
+            if billing_dma:
+                ctx['billing_dma_id'] = str(billing_dma)
             zip_code = _find_first_key(billing, 'zipcode') or _find_first_key(data, 'zipcode')
             if zip_code:
                 ctx['zip'] = str(zip_code)
@@ -1089,7 +1264,9 @@ def _find_first_key(obj, key):
 # store partnerProfileID1), so only `profid` changes per profile. We do exactly that.
 _PROFILES_URL = 'https://api.cld.dtvce.com/profile/user/manager/v1/profiles'
 _PROFILE_TOKEN_URL = 'https://api.cld.dtvce.com/ac/authn/profiletoken/v1/tokens'
-_PROFILE_LOCK_TTL = 120
+# Covers the worst case: the exchange (30 s) plus three saves, each of which can wait on
+# upstream's source lock and SQLite busy retries. Released at once when done.
+_PROFILE_LOCK_TTL = 600
 
 
 def _profile_headers() -> dict:
@@ -1176,12 +1353,9 @@ def profile_token_exchange(profile_id: str, refresh_token: str) -> dict:
 
 
 def _redis():
-    try:
-        import redis as _redis_mod
-        from flask import current_app
-        return _redis_mod.from_url(current_app.config['REDIS_URL'])
-    except Exception:
-        return None
+    """The install module's shared redis client (1 s timeouts), or None."""
+    from .directv_dai_install import _redis as shared
+    return shared()
 
 
 def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
@@ -1225,9 +1399,9 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
         # Merged into the live row under upstream's per-source lock (persist_config),
         # never a commit of the copy read at the start: a refresh or a DRM self-heal
         # that wrote the config meanwhile is kept.
-        updates = {'dtv_android_profile_id': profile_id}
-        if profid:
-            updates['dtv_android_profid'] = profid
+        # The picked profile is saved only together with its profid: without one, the
+        # panel must not show a profile that ads aren't requested as.
+        updates = {'dtv_android_profile_id': profile_id, 'dtv_android_profid': profid} if profid else {}
         # Persist a rotated refresh token only if the exchange returned one; otherwise
         # leave the account session untouched (the profile-scoped bearer it mints isn't
         # adopted by the app, so we don't adopt it either).
@@ -1236,11 +1410,12 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
                        or vp.get('refreshToken') or '').strip()
         if new_refresh:
             updates['refresh_token'] = new_refresh
-        saved = False
+        saved = not updates
         attempts = 3 if new_refresh else 1
-        for attempt in range(attempts):
+        for attempt in range(attempts if updates else 0):
             try:
-                saved = _up('persist_config')(source.id, updates)
+                saved = (_up('persist_config')(source.id, updates)
+                         and _saved_as(source.id, updates.get('refresh_token')))
             except Exception:
                 saved = False
                 logger.warning('[directv-dai] could not persist profile selection', exc_info=True)
@@ -1286,6 +1461,17 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
 _RELEASE_LUA = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
 
 
+def _saved_as(source_id, refresh_token: str | None) -> bool:
+    """Re-read the row: a save reported as done must really hold the rotated token
+    (upstream's commit retry can report success after a rollback dropped the change)."""
+    if not refresh_token:
+        return True
+    db, Source = _up('db'), _up('source_model')
+    db.session.expire_all()
+    src = db.session.get(Source, source_id)
+    return bool(src) and (src.config or {}).get('refresh_token') == refresh_token
+
+
 def _release_lock(rdb, key: str, value: str):
     """Delete key only if it still holds value, atomically (Lua); a plain compare-then-
     delete fallback for a client without scripting."""
@@ -1323,6 +1509,8 @@ def settings_changed(source, old: dict, current: dict) -> None:
     """After the DAI panel saves the toggle: drop cached URLs on a flip, capture new
     devices' ad ids, and fetch the account's targeting values if they're missing."""
     _DAI_ON[0] = 0.0
+    if enabled(current) and not enabled(old):
+        _start_auto_pick(current, current.get('bearer_token'))
     # Never fails the save: the toggle is already stored.
     try:
         clear_cache_if_toggled(source, old, current)

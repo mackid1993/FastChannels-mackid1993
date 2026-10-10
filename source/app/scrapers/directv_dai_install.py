@@ -80,6 +80,7 @@ USES = {
     'scraper_update_cache': ('app.scrapers.base', 'BaseScraper._update_cache'),
     'known_devices': ('app.bridge_devices', 'known_devices'),
     'persist_cache': ('app.config_store', 'persist_source_cache_updates'),
+    'load_cache': ('app.config_store', 'load_source_cache'),
     'persist_config': ('app.config_store', 'persist_source_config_updates'),
     'source_model': ('app.models', 'Source'),
     'db': ('app.extensions', 'db'),
@@ -289,8 +290,12 @@ _PROBLEMS = {
     'error': ('a DAI hook raised (see the server log)', 'ok'),
     'fallback': ('the last DAI tune fell back to the non-DAI stream', 'ok'),
     'ad_uncut': ('an inserted ad went out without the loudness cut', 'ad_cut'),
+    'no_profid': ('a DAI tune went out without profid (the viewer profile)', 'profid_ok'),
+    'proxied': ('requests reach FastChannels through a proxy (X-Forwarded-For), so bridge boxes '
+                "can't be recognized by address and get no device ids; connect them directly", 'ok'),
 }
 _local_health: dict[str, dict] = {}
+_proxy_noted = [0.0]
 _rdb = [None, 0.0]
 
 
@@ -383,7 +388,9 @@ def _patch_scraper() -> None:
                         playback = {**playback, ccid: mine}
                         cache['directv_playback'] = playback
                 cached = playback.get(ccid)
-                if isinstance(cached, dict) and not directv_dai.cached_url_usable(cached, dai):
+                if isinstance(cached, dict) and (not directv_dai.cached_url_usable(cached, dai)
+                                                 or (dai and not directv_dai.session_current(
+                                                     cached, self.config, names, ccid))):
                     cache['directv_playback'] = {k: v for k, v in playback.items() if k != ccid}
             except Exception:
                 _note('error', 'resolve: cache check')
@@ -480,6 +487,8 @@ def _patch_scraper() -> None:
             reason = 'no DAI stream for this channel'
             try:
                 result = _fetch_dai_playback(bound, flags)
+                if result:
+                    result['dai_sig'] = directv_dai.targeting_signature(flags)
             except up('auth_expired_error'):
                 raise
             except Exception as exc:
@@ -519,7 +528,8 @@ def _device_session(cache, config, ccid: str) -> dict | None:
     mine = (((cache or {}).get(DEVICE_SESSIONS) or {}).get(address) or {}).get(ccid) if address else None
     if (not isinstance(mine, dict) or mine.get('bearer_tag') != _bearer_tag(config)
             or time.time() - float(mine.get('cached_at') or 0) >= _device_session_ttl()
-            or not directv_dai.cached_url_usable(mine, True)):
+            or not directv_dai.cached_url_usable(mine, True)
+            or not directv_dai.session_current(mine, config, (cache or {}).get('dai_channel_names'), ccid)):
         return None
     return {k: v for k, v in mine.items() if k != 'bearer_tag'}
 
@@ -536,8 +546,28 @@ def _save_device_session(scraper, ccid: str) -> None:
     store = {a: {c: e for c, e in (m or {}).items()
                  if isinstance(e, dict) and now - float(e.get('cached_at') or 0) < ttl}
              for a, m in (cache.get(DEVICE_SESSIONS) or {}).items()}
-    store.setdefault(address, {})[ccid] = {**entry, 'bearer_tag': _bearer_tag(scraper.config)}
-    getattr(scraper, up_name('scraper_update_cache'))(DEVICE_SESSIONS, {a: m for a, m in store.items() if m})
+    mine = {**entry, 'bearer_tag': _bearer_tag(scraper.config)}
+    store.setdefault(address, {})[ccid] = mine
+    # In this request's cache now; persisted by merging into the FRESH row in the
+    # background, so two boxes tuning at once (on different workers) can't drop each
+    # other's session (upstream would write this key as a whole-value replace).
+    getattr(scraper, up_name('scraper_cache'))[DEVICE_SESSIONS] = {a: m for a, m in store.items() if m}
+    from . import directv_dai_device
+    directv_dai_device.spawn(_persist_device_session, address, ccid, mine)
+
+
+def _persist_device_session(address: str, ccid: str, entry: dict) -> None:
+    Source = up('source_model')
+    src = Source.query.filter_by(name='directv').first()
+    if src is None:
+        return
+    fresh = (up('load_cache')(src.id) or {}).get(DEVICE_SESSIONS) or {}
+    now, ttl = time.time(), _device_session_ttl()
+    store = {a: {c: e for c, e in (m or {}).items()
+                 if isinstance(e, dict) and now - float(e.get('cached_at') or 0) < ttl}
+             for a, m in fresh.items() if isinstance(m, dict)}
+    store.setdefault(address, {})[ccid] = entry
+    up('persist_cache')(src.id, {DEVICE_SESSIONS: {a: m for a, m in store.items() if m}})
 
 
 def _ccid(raw_url) -> str:
@@ -571,8 +601,9 @@ def _fetch_dai_playback(args: dict, flags: dict) -> dict | None:
     ccid = args['ccid']
     session = requests.Session()
     session.headers.update({'Accept': '*/*', 'Authorization': f"Bearer {args.get('bearer_token') or ''}"})
-    # The bridge device's own app User-Agent; for any other requester, upstream's own.
-    ua = directv_dai_device.player_user_agent() or getattr(scraper_module, '_UA', None)
+    # The DirecTV app's User-Agent for every channel/v2 request: it is the app's endpoint,
+    # sent with d=android_tv, so it never goes out with upstream's desktop browser string.
+    ua = directv_dai_device.player_user_agent() or up('app_user_agent') or getattr(scraper_module, '_UA', None)
     if ua:
         session.headers['User-Agent'] = ua
     for c in args.get('cookies') or []:
@@ -584,7 +615,7 @@ def _fetch_dai_playback(args: dict, flags: dict) -> dict | None:
               'startOver': 'false', 'abrEnabled': 'true'}
     if args.get('client_context'):
         params['clientContext'] = args['client_context']
-    r = session.get(_CHANNEL_AUTH_V2, params=params, timeout=15)
+    r = session.get(_CHANNEL_AUTH_V2, params=params, timeout=(5, 10))
     if r.status_code != 200:
         logger.warning('[directv-dai] channel/v2 HTTP %s for ccid=%s', r.status_code, ccid)
         return None
@@ -687,6 +718,21 @@ def _register_relay_hooks(app) -> None:
     from . import dtv_aac_ads, dtv_aac_gain
 
     @app.before_request
+    def _directv_dai_proxy_check():
+        """Behind a reverse proxy every request comes from the proxy's address, so no bridge
+        box is recognized (no device ids). Reported (at most once a minute per process)."""
+        try:
+            if (request.path.startswith(RELAY_PREFIX) and request.headers.get('X-Forwarded-For')
+                    and time.time() - _proxy_noted[0] > 60):
+                from . import directv_dai, directv_dai_device
+                if directv_dai.dai_on() and not directv_dai_device._bridge_address(request.remote_addr or ''):
+                    _proxy_noted[0] = time.time()
+                    _note('proxied', f'request from {request.remote_addr} with X-Forwarded-For')
+        except Exception:
+            pass
+        return None
+
+    @app.before_request
     def _directv_dai_ad_segment():
         """An inserted-ad AAC segment (an allowlisted DirecTV CDN, full fetch) is served
         here with the −12 dB loudness cut; everything else goes to upstream's view."""
@@ -728,6 +774,9 @@ def _register_relay_hooks(app) -> None:
         return resp
 
 
+_AD_SEGMENT_MAX = 2 * 1024 * 1024
+
+
 def _serve_ad_segment(raw_url: str, Response):
     from . import dtv_aac_gain
     headers = {}
@@ -735,11 +784,28 @@ def _serve_ad_segment(raw_url: str, Response):
     if browser_ua:
         headers['User-Agent'] = browser_ua   # the app UA replaces it (see _patch_user_agent)
     try:
-        r = requests.get(raw_url, headers=headers, timeout=(5, 30))
+        r = requests.get(raw_url, headers=headers, timeout=(5, 30), stream=True)
     except Exception as exc:
         logger.warning('[directv-dai] ad segment fetch failed (%s); upstream serves it', exc)
         return None
-    body = r.content
+    # An inserted-ad audio segment is tens of KB; anything big isn't one: let upstream
+    # stream it (never buffer an arbitrary file in a worker).
+    try:
+        size = int(r.headers.get('Content-Length') or 0)
+    except ValueError:
+        size = 0
+    if size > _AD_SEGMENT_MAX:
+        r.close()
+        return None
+    chunks, total = [], 0
+    for chunk in r.iter_content(65536):
+        total += len(chunk)
+        if total > _AD_SEGMENT_MAX:
+            r.close()
+            logger.warning('[directv-dai] ad segment larger than %s bytes; upstream serves it', _AD_SEGMENT_MAX)
+            return None
+        chunks.append(chunk)
+    body = b''.join(chunks)
     if r.status_code == 200:
         try:
             cut = dtv_aac_gain.attenuate_ad_segment(body)
