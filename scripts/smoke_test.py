@@ -1389,4 +1389,30 @@ try:
 finally:
     dai._redis, dai._reachable = _real_r, _real_reach
 
+# (r) Two boxes' sessions saved at the same moment (different workers) both survive:
+# the read-merge-write is serialized and reads only the per-box key.
+_real_lc = up('load_cache')
+_seen_keys = []
+def _lc(name, keys=None, exclude=None):
+    _seen_keys.append(keys)
+    return _real_lc(name, keys=keys, exclude=exclude)
+try:
+    install.up_set('load_cache', _lc)
+    with app.app_context():
+        up('persist_cache')(_sid, {install.DEVICE_SESSIONS: {}})
+    _now = _t.time()
+    def _save(addr):
+        with app.app_context():
+            install._persist_device_session(addr, '123', {'fallback_url': 'u', 'dai': True, 'cached_at': _now})
+    _ths = [_th.Thread(target=_save, args=(f'10.0.1.{i}:5555',)) for i in range(6)]
+    for _x in _ths: _x.start()
+    for _x in _ths: _x.join(30)
+    with app.app_context():
+        up('db').session.expire_all()
+        _st = (_real_lc('directv', keys=[install.DEVICE_SESSIONS]) or {}).get(install.DEVICE_SESSIONS) or {}
+    assert len(_st) == 6, f'concurrent per-box session saves lost entries: {sorted(_st)}'
+    assert all(k == [install.DEVICE_SESSIONS] for k in _seen_keys), f'the save read more than its own key: {_seen_keys}'
+finally:
+    install.up_set('load_cache', _real_lc)
+
 print('Overlay smoke test passed.')

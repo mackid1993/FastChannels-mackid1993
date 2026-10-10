@@ -7,10 +7,10 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 ---
  app/scrapers/directv_dai.py         | 1543 +++++++++++++++++++++++++++
  app/scrapers/directv_dai_device.py  |  425 ++++++++
- app/scrapers/directv_dai_install.py | 1234 +++++++++++++++++++++
+ app/scrapers/directv_dai_install.py | 1253 ++++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 +
  app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++
- 5 files changed, 3914 insertions(+)
+ 5 files changed, 3933 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -1999,10 +1999,10 @@ index 0000000..a5c8b4a
 +    return {'manufacturer': manufacturer, 'model': model} if manufacturer else None
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..2d64803
+index 0000000..9765b7a
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,1234 @@
+@@ -0,0 +1,1253 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
@@ -2085,7 +2085,7 @@ index 0000000..2d64803
 +    'scraper_update_cache': ('app.scrapers.base', 'BaseScraper._update_cache'),
 +    'known_devices': ('app.bridge_devices', 'known_devices'),
 +    'persist_cache': ('app.config_store', 'persist_source_cache_updates'),
-+    'load_cache': ('app.config_store', 'load_source_cache'),
++    'load_cache': ('app.config_store', 'load_source_cache_by_name'),
 +    'persist_config': ('app.config_store', 'persist_source_config_updates'),
 +    'source_model': ('app.models', 'Source'),
 +    'db': ('app.extensions', 'db'),
@@ -2566,17 +2566,36 @@ index 0000000..2d64803
 +
 +
 +def _persist_device_session(address: str, ccid: str, entry: dict) -> None:
++    """Merge one box's session into the stored per-box sessions. The read-merge-write runs
++    under the overlay's own cross-process lock (only overlay code writes this key), so two
++    workers saving at once can't drop each other's entry. Upstream's per-source lock can't
++    be used here: persist_cache takes it itself. Only this one cache key is read."""
++    import os
++    from . import directv_dai, directv_dai_device
 +    Source = up('source_model')
 +    src = Source.query.filter_by(name='directv').first()
 +    if src is None:
 +        return
-+    fresh = (up('load_cache')(src.id) or {}).get(DEVICE_SESSIONS) or {}
-+    now, ttl = time.time(), _device_session_ttl()
-+    store = {a: {c: e for c, e in (m or {}).items()
-+                 if isinstance(e, dict) and now - float(e.get('cached_at') or 0) < ttl}
-+             for a, m in fresh.items() if isinstance(m, dict)}
-+    store.setdefault(address, {})[ccid] = entry
-+    up('persist_cache')(src.id, {DEVICE_SESSIONS: {a: m for a, m in store.items() if m}})
++    lock = None
++    try:
++        lock = open(os.path.join(os.path.dirname(directv_dai_device._devices_file()),
++                                 'directv_dai_sessions.lock'), 'w')
++        if not directv_dai._flock_polled(lock, timeout=10):
++            logger.warning('[directv-dai] per-box session store busy; saving without the lock')
++    except Exception:
++        lock = None
++    try:
++        up('db').session.expire_all()
++        fresh = (up('load_cache')(src.name, keys=[DEVICE_SESSIONS]) or {}).get(DEVICE_SESSIONS) or {}
++        now, ttl = time.time(), _device_session_ttl()
++        store = {a: {c: e for c, e in (m or {}).items()
++                     if isinstance(e, dict) and now - float(e.get('cached_at') or 0) < ttl}
++                 for a, m in fresh.items() if isinstance(m, dict)}
++        store.setdefault(address, {})[ccid] = entry
++        up('persist_cache')(src.id, {DEVICE_SESSIONS: {a: m for a, m in store.items() if m}})
++    finally:
++        if lock is not None:
++            lock.close()
 +
 +
 +def _ccid(raw_url) -> str:

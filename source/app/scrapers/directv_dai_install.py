@@ -80,7 +80,7 @@ USES = {
     'scraper_update_cache': ('app.scrapers.base', 'BaseScraper._update_cache'),
     'known_devices': ('app.bridge_devices', 'known_devices'),
     'persist_cache': ('app.config_store', 'persist_source_cache_updates'),
-    'load_cache': ('app.config_store', 'load_source_cache'),
+    'load_cache': ('app.config_store', 'load_source_cache_by_name'),
     'persist_config': ('app.config_store', 'persist_source_config_updates'),
     'source_model': ('app.models', 'Source'),
     'db': ('app.extensions', 'db'),
@@ -561,17 +561,36 @@ def _save_device_session(scraper, ccid: str) -> None:
 
 
 def _persist_device_session(address: str, ccid: str, entry: dict) -> None:
+    """Merge one box's session into the stored per-box sessions. The read-merge-write runs
+    under the overlay's own cross-process lock (only overlay code writes this key), so two
+    workers saving at once can't drop each other's entry. Upstream's per-source lock can't
+    be used here: persist_cache takes it itself. Only this one cache key is read."""
+    import os
+    from . import directv_dai, directv_dai_device
     Source = up('source_model')
     src = Source.query.filter_by(name='directv').first()
     if src is None:
         return
-    fresh = (up('load_cache')(src.id) or {}).get(DEVICE_SESSIONS) or {}
-    now, ttl = time.time(), _device_session_ttl()
-    store = {a: {c: e for c, e in (m or {}).items()
-                 if isinstance(e, dict) and now - float(e.get('cached_at') or 0) < ttl}
-             for a, m in fresh.items() if isinstance(m, dict)}
-    store.setdefault(address, {})[ccid] = entry
-    up('persist_cache')(src.id, {DEVICE_SESSIONS: {a: m for a, m in store.items() if m}})
+    lock = None
+    try:
+        lock = open(os.path.join(os.path.dirname(directv_dai_device._devices_file()),
+                                 'directv_dai_sessions.lock'), 'w')
+        if not directv_dai._flock_polled(lock, timeout=10):
+            logger.warning('[directv-dai] per-box session store busy; saving without the lock')
+    except Exception:
+        lock = None
+    try:
+        up('db').session.expire_all()
+        fresh = (up('load_cache')(src.name, keys=[DEVICE_SESSIONS]) or {}).get(DEVICE_SESSIONS) or {}
+        now, ttl = time.time(), _device_session_ttl()
+        store = {a: {c: e for c, e in (m or {}).items()
+                     if isinstance(e, dict) and now - float(e.get('cached_at') or 0) < ttl}
+                 for a, m in fresh.items() if isinstance(m, dict)}
+        store.setdefault(address, {})[ccid] = entry
+        up('persist_cache')(src.id, {DEVICE_SESSIONS: {a: m for a, m in store.items() if m}})
+    finally:
+        if lock is not None:
+            lock.close()
 
 
 def _ccid(raw_url) -> str:
