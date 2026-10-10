@@ -96,7 +96,7 @@ What the overlay relies on in upstream, all listed at the top of `directv_dai_in
 | `directv.apply_auth_result` | wrap | After upstream writes the session, `store_login_result` adds the DAI account values (DMA/ZIP/GPP fetched with the bearer, DAI on only; hhid/u). |
 | `directv_device_auth._result` | wrap | Carries `valuePairs.partnerProfileId`/`profileId` into the result (upstream keeps only the activation token). |
 | `directv_proxy._DIRECTV_BROWSER_CDN_SUFFIXES` | extended | Adds `yospace.com`, so Yospace playlists take the relay. |
-| `USES`: `_license_content_id_from_stream_url`, `DirectvAuthExpiredError`, `directv_device_auth.AUTH_METHOD`/`app_headers`/`is_device_session`, `_directv_browser_cdn_allowed`, `BaseScraper.cache`/`_update_cache`, `bridge_devices.known_devices`, `config_store.persist_source_cache_updates`/`persist_source_config_updates`, `models.Source`, `extensions.db` | called/read | Named so a rename fails with its name. |
+| `USES`: `_license_content_id_from_stream_url`, `DirectvAuthExpiredError`, `_PLAYBACK_CACHE_TTL` (the per-box session lifetime), `DirectvScraper._token_stale`/`can_reauth`/`_start_background_reauth` (re-queue a refresh the profile switch deferred), `directv_device_auth.AUTH_METHOD`/`app_headers`/`APP_USER_AGENT`/`_CLIENT_ID`/`is_device_session`, `_directv_browser_cdn_allowed`, `BaseScraper.cache`/`_update_cache`, `bridge_devices.known_devices`, `config_store.persist_source_cache_updates`/`persist_source_config_updates`, `models.Source`, `extensions.db` | called/read | Named so a rename fails with its name. |
 | `RELAY_PREFIX` `/play/directv/` | URL prefix | The HTTP-layer hooks (ad swap, loudness cut, User-Agent). |
 | `SOURCE_MARKERS`: `id="source-config-{{ source.id }}"` in `sources.html`; the refresh-lock key `directv:auth:refreshing:` in `directv.py` | strings | Where the panel mounts (it is also at `/directv-dai`); the profile swap waits on upstream's refresh lock. |
 
@@ -132,6 +132,8 @@ Invariants a port must keep:
 - DAI params are merged with exact-key dedup: a key already in the URL is never duplicated or overridden.
 - Changing the toggle must clear the cached playback URLs.
 - Never log token values or account values. Field names only.
+- Nothing in a tune or relay fetch waits on the network beyond the one channel authorization: the bridge-device list is cached (single-flight, stale-while-refresh), and the billing ZIP is fetched in the background.
+- Config writes go through `persist_config` (merged under upstream's per-source lock), never a commit of a config copied earlier.
 
 ## Resolving a conflict (and repairing drift)
 

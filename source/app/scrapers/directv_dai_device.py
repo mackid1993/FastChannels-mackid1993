@@ -96,14 +96,26 @@ def spawn(fn, *args) -> None:
         app = None
 
     def _run():
+        # fn always runs (its own cleanup with it), even if the app context can't be
+        # entered; it then just has no app context and fails/logs on its own.
+        ctx = None
         try:
             if app is not None:
-                with app.app_context():
-                    fn(*args)
-            else:
-                fn(*args)
+                try:
+                    ctx = app.app_context()
+                    ctx.push()
+                except Exception:
+                    ctx = None
+                    logger.warning('[directv-dai] background %s: no app context', getattr(fn, '__name__', 'task'))
+            fn(*args)
         except Exception as exc:
             logger.warning('[directv-dai] background %s failed: %s', getattr(fn, '__name__', 'task'), exc)
+        finally:
+            if ctx is not None:
+                try:
+                    ctx.pop()
+                except Exception:
+                    pass
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -138,45 +150,141 @@ def _store_device(address: str, props: dict) -> None:
 
 _RETRY_TTL = 60
 
-# Request IP -> bridge address. Looking it up asks upstream's bridge_devices, which
-# reads the database and asks ah4c over HTTP, and the relay looks it up on every
-# playlist and segment fetch, so a found box is kept for a minute and a miss (another
-# client, or an ah4c hiccup) for a few seconds.
-_BRIDGE_CACHE: dict[str, tuple[float, str | None]] = {}
+# Request IP -> bridge address. The device list comes from upstream's bridge_devices,
+# which reads the database and asks ah4c over HTTP (up to ~5 s when ah4c is slow or
+# down), and the relay looks a requester up on every playlist and segment fetch. So the
+# LIST is cached, not each IP:
+# - Reads run in the background, one at a time; no lock is ever held across the read.
+# - A list once read is served while a refresh runs after _BRIDGE_TTL.
+# - When ah4c reports an error (upstream returns it, it doesn't raise), the ah4c tuners
+#   from the last good list are kept (merged with what the database still lists), and
+#   unknown requesters stop triggering reads until ah4c answers again.
+# - An unknown requester (maybe a box added since) starts a refresh at most every
+#   _BRIDGE_MISS_REFRESH per IP and waits at most _BRIDGE_MISS_WAIT for it.
 _BRIDGE_TTL = 60
-_BRIDGE_MISS_TTL = 10
+_BRIDGE_FAIL_HOLD = 60        # after an ah4c/database failure, misses don't re-read for this long
+_BRIDGE_MISS_REFRESH = 10
+_BRIDGE_MISS_WAIT = 1.5
+_BRIDGE_FIRST_WAIT = 6        # the very first read in a process (ah4c's own timeout is 5 s)
+_BRIDGE_LIST: list = [0.0, None]   # [read at, [{'address', 'host'}] or None]
+_bridge_lock = threading.Lock()    # guards the in-flight slot only; never held across I/O
+_bridge_inflight: list = [None]    # threading.Event of the running read, or None
+_bridge_failed_at = [0.0]
+_bridge_outage_logged = [False]
+_bridge_miss_at: dict[str, float] = {}
+
+
+def _match(devices, ip: str) -> str | None:
+    return next((d['address'] for d in devices or []
+                 if d['host'] == ip or d['address'].split(':')[0] == ip), None)
 
 
 def _bridge_address(ip: str) -> str | None:
+    address = _match(_cached_bridge_devices(), ip)
+    if address:
+        return address
     now = time.time()
-    hit = _BRIDGE_CACHE.get(ip)
-    if hit and now < hit[0]:
-        return hit[1]
-    address = _lookup_bridge_address(ip)
-    _BRIDGE_CACHE[ip] = (now + (_BRIDGE_TTL if address else _BRIDGE_MISS_TTL), address)
-    return address
+    if (now - _bridge_miss_at.get(ip, 0) < _BRIDGE_MISS_REFRESH
+            or now - _bridge_failed_at[0] < _BRIDGE_FAIL_HOLD):
+        return None
+    _bridge_miss_at[ip] = now
+    if len(_bridge_miss_at) > 1024:   # bounded: drop the oldest half
+        for k in sorted(_bridge_miss_at, key=_bridge_miss_at.get)[:512]:
+            _bridge_miss_at.pop(k, None)
+    done = _start_bridge_refresh()
+    if done is not None:
+        done.wait(_BRIDGE_MISS_WAIT)
+    return _match(_BRIDGE_LIST[1], ip)
+
+
+def forget_bridge_devices() -> None:
+    """Drop the cached device list (the next lookup reads it again)."""
+    _BRIDGE_LIST[:] = [0.0, None]
+    _bridge_failed_at[0] = 0.0
+    _bridge_outage_logged[0] = False
+    _bridge_miss_at.clear()
+
+
+def _cached_bridge_devices() -> list[dict]:
+    read_at, devices = _BRIDGE_LIST
+    if devices is not None:
+        if time.time() - read_at > _BRIDGE_TTL:
+            _start_bridge_refresh()
+        return devices
+    # Nothing read yet in this process: wait (bounded) for the first read.
+    done = _start_bridge_refresh()
+    if done is not None:
+        done.wait(_BRIDGE_FIRST_WAIT)
+    return _BRIDGE_LIST[1] or []
+
+
+def _start_bridge_refresh():
+    """Start a background read unless one is running. Returns the running read's Event."""
+    with _bridge_lock:
+        done = _bridge_inflight[0]
+        if done is not None:
+            return done
+        done = _bridge_inflight[0] = threading.Event()
+
+    def _run():
+        try:
+            _read_bridge_devices()
+        finally:
+            _bridge_inflight[0] = None
+            done.set()
+    try:
+        spawn(_run)
+    except Exception:
+        logger.exception('[directv-dai] could not start the bridge-device read')
+        _bridge_inflight[0] = None
+        done.set()
+    return done
+
+
+def _read_bridge_devices() -> bool:
+    """One read of upstream's device list into the cache. False when ah4c (or the
+    database) failed; then the last good list's devices are kept."""
+    try:
+        devices, error = bridge_device_list()
+    except Exception as exc:
+        devices, error = [], f'{type(exc).__name__}: {exc}'
+    now = time.time()
+    if error:
+        _bridge_failed_at[0] = now
+        kept = {d['address']: d for d in (_BRIDGE_LIST[1] or [])}
+        kept.update({d['address']: d for d in devices})
+        _BRIDGE_LIST[:] = [now, list(kept.values())]
+        if not _bridge_outage_logged[0]:
+            _bridge_outage_logged[0] = True
+            logger.warning('[directv-dai] bridge device list incomplete (%s); keeping the last known '
+                           'devices until it answers again', error)
+        return False
+    if _bridge_outage_logged[0]:
+        _bridge_outage_logged[0] = False
+        logger.info('[directv-dai] bridge device list readable again')
+    _bridge_failed_at[0] = 0.0
+    _BRIDGE_LIST[:] = [now, devices]
+    return True
 
 
 def known_bridge_devices() -> list[dict]:
     """Every bridge device upstream knows (HDMI Capture, ah4c tuners, remembered boxes) as
-    [{'address': 'host:port', 'host': 'host'}]. The overlay's only read of upstream's
-    device list, so if upstream reshapes it, this is the one place to adapt."""
+    [{'address': 'host:port', 'host': 'host'}]."""
+    return bridge_device_list()[0]
+
+
+def bridge_device_list() -> tuple[list[dict], str | None]:
+    """(devices, error): upstream's device list and its ah4c error (upstream returns the
+    error rather than raising when ah4c can't be asked). The overlay's only read of
+    upstream's device list, so if upstream reshapes it, this is the one place to adapt."""
     from .directv_dai_install import up
+    raw, error = up('known_devices')()
     out = []
-    for d in up('known_devices')()[0]:
+    for d in raw:
         address = str((d or {}).get('address') or '').strip()
         if address:
             out.append({'address': address, 'host': str(d.get('host') or address.rsplit(':', 1)[0])})
-    return out
-
-
-def _lookup_bridge_address(ip: str) -> str | None:
-    try:
-        return next((d['address'] for d in known_bridge_devices()
-                     if d['host'] == ip or d['address'].split(':')[0] == ip), None)
-    except Exception as exc:
-        logger.debug('[directv-dai] bridge device lookup failed: %s', exc)
-        return None
+    return out, (str(error) if error else None)
 
 
 def _read_device(address: str) -> dict:

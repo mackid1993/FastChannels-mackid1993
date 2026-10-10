@@ -65,7 +65,8 @@ assert install.missing() == [], f'upstream moved DAI wiring targets: {install.mi
 _ROLES = {'app_user_agent', 'channel_fetch', 'apply_auth_result', 'resolve', 'license_request', 'lineup_rows',
           'code_signin_result', 'relay_cdn_suffixes', 'license_content_id', 'auth_expired_error',
           'code_signin_method', 'app_headers', 'is_code_signin', 'relay_cdn_allowed', 'scraper_cache',
-          'scraper_update_cache', 'known_devices', 'persist_cache', 'persist_config', 'source_model', 'db'}
+          'scraper_update_cache', 'known_devices', 'persist_cache', 'persist_config', 'source_model', 'db',
+          'code_signin_client_id', 'playback_cache_ttl', 'token_stale', 'can_reauth', 'start_reauth'}
 assert set(install.TARGETS) | set(install.USES) >= _ROLES and len(install.SOURCE_MARKERS) >= 2, \
     f'an upstream role or marker was dropped from directv_dai_install (point it at the new name instead): {sorted(_ROLES - set(install.TARGETS) - set(install.USES))}'
 assert any('refreshing' in text for path, text, _ in install.SOURCE_MARKERS), \
@@ -967,5 +968,159 @@ try:
 finally:
     _HTTPAdapter.send, device._client_device = _real_send, _real_client_device
     dtv_aac_gain.attenuate_ad_segment = _real_att
+
+# (n) Hardening, one check per fix.
+import threading as _th  # noqa: E402
+# 1. The bridge-device list. Upstream returns ah4c's error rather than raising, so the
+# stubs below return (devices, error) exactly as upstream's known_devices() does.
+# - The first read is waited for; after that a stale list is served while a background
+#   refresh runs, and no lock is held across a read (a box never waits on ah4c).
+# - ah4c down: the last good ah4c tuners are kept (merged with what the database lists),
+#   and unknown requesters stop triggering reads for a while.
+# - An unknown requester triggers at most one read per IP per few seconds.
+_real_kd, _real_spawn = up('known_devices'), device.spawn
+_spawned, _reads = [], []
+def _kd(devs, err=None):
+    def f():
+        _reads.append(1)
+        return ([{'address': a, 'host': a.rsplit(':', 1)[0]} for a in devs], err)
+    return f
+try:
+    device.forget_bridge_devices()
+    install.up_set('known_devices', _kd(['10.0.0.5:5555', '10.0.0.8:5555']))
+    assert device._bridge_address('10.0.0.5') == '10.0.0.5:5555' and len(_reads) == 1
+    assert device._bridge_address('10.0.0.5') == '10.0.0.5:5555' and len(_reads) == 1, 'a cached list was re-read'
+    # Stale list: served at once, the refresh goes to the background.
+    device.spawn = lambda fn, *a: _spawned.append(fn)
+    device._BRIDGE_LIST[0] -= device._BRIDGE_TTL + 1
+    _reads.clear()
+    assert device._bridge_address('10.0.0.5') == '10.0.0.5:5555', 'the last good list was not served while stale'
+    assert _reads == [] and len(_spawned) == 1, (_reads, _spawned)
+    # While that read is in flight, another box's lookup neither waits nor starts a second.
+    assert device._bridge_address('10.0.0.8') == '10.0.0.8:5555' and len(_spawned) == 1, _spawned
+    # ah4c down: upstream answers with only the database devices plus an error.
+    install.up_set('known_devices', _kd(['10.0.0.9:5555'], "Couldn't read ah4c's tuner list: timeout"))
+    _spawned.pop()()
+    assert {d['address'] for d in device._BRIDGE_LIST[1]} == {'10.0.0.5:5555', '10.0.0.8:5555', '10.0.0.9:5555'}, \
+        f'an ah4c outage dropped the last known ah4c tuners: {device._BRIDGE_LIST[1]}'
+    assert device._bridge_address('10.0.0.8') == '10.0.0.8:5555'
+    _reads.clear()
+    assert device._bridge_address('10.0.0.77') is None and _reads == [] and not _spawned, \
+        'an unknown requester triggered a read while ah4c was failing'
+    # ah4c back: a fresh list replaces the merged one.
+    device._bridge_failed_at[0] = 0.0
+    install.up_set('known_devices', _kd(['10.0.0.6:5555']))
+    device.spawn = _real_spawn
+    assert device._bridge_address('10.0.0.6') == '10.0.0.6:5555', 'a newly added box was not recognized'
+    _reads.clear()
+    device._bridge_address('10.0.0.78'); device._bridge_address('10.0.0.78')
+    assert len(_reads) == 1, f'an unknown requester re-read the list on every fetch: {len(_reads)}'
+    # A read that can't even start doesn't leave lookups stuck behind it.
+    device.forget_bridge_devices()
+    device.spawn = lambda fn, *a: (_ for _ in ()).throw(RuntimeError('no threads'))
+    assert device._bridge_address('10.0.0.6') is None and device._bridge_inflight[0] is None
+finally:
+    install.up_set('known_devices', _real_kd)
+    device.spawn = _real_spawn
+    device.forget_bridge_devices()
+
+# 2. A tune never waits on DirecTV for the billing ZIP: it is fetched in the background.
+_real_fac, _real_spawn2 = dai.fetch_account_context, device.spawn
+_bg = []
+try:
+    dai.fetch_account_context = lambda *a, **k: (_ for _ in ()).throw(AssertionError('ZIP fetched inside a tune'))
+    device.spawn = lambda fn, *a: _bg.append(fn.__name__)
+    dai._ZIP_TRIED.clear()
+    _q = dai.build_query({'use_dai': 'true', 'bearer_token': 'zip-bearer'}, {}, '123')
+    assert 'bZipCode' not in _q and _bg == ['_fetch_and_store_account_context'], (_q.get('bZipCode'), _bg)
+    dai.build_query({'use_dai': 'true', 'bearer_token': 'zip-bearer'}, {}, '123')
+    assert _bg == ['_fetch_and_store_account_context'], f'the ZIP fetch was queued on every tune: {_bg}'
+    assert dai.build_query({'dai_zip': '10965', 'bearer_token': 'zip-bearer'}, {}, '1')['bZipCode'] == '10965'
+finally:
+    dai.fetch_account_context, device.spawn = _real_fac, _real_spawn2
+    dai._ZIP_TRIED.clear()
+
+# 3. A box's own DAI session lives exactly as long as upstream's playback cache.
+assert install._device_session_ttl() == float(up('playback_cache_ttl')), \
+    (install._device_session_ttl(), up('playback_cache_ttl'))
+
+# 5. The profile exchange uses upstream's own code sign-in client id (by role, no fallback).
+assert dai._profile_client_id() == str(up('code_signin_client_id')) and dai._profile_client_id(), dai._profile_client_id()
+
+# 6. If upstream's app User-Agent names a device comscore_device can't match, it is reported.
+_real_presented = device.presented_device
+try:
+    device.presented_device = lambda: None
+    assert any(f.startswith('comscore_device') for f in install.status(app)['failed']), install.status(app)
+finally:
+    device.presented_device = _real_presented
+assert not any(f.startswith('comscore_device') for f in install.status(app)['failed'])
+
+# 4 + 7. The profile switch merges into the live config under upstream's lock (a token
+# written meanwhile survives), releases only its own refresh lock, re-queues a refresh
+# it may have deferred, and refuses while upstream's refresh holds the lock.
+class _FakeRedis:
+    def __init__(self):
+        self.d = {}
+    def set(self, k, v, nx=False, ex=None):
+        if nx and k in self.d:
+            return False
+        self.d[k] = v.encode() if isinstance(v, str) else v
+        return True
+    def get(self, k):
+        return self.d.get(k)
+    def delete(self, k):
+        self.d.pop(k, None)
+_fr = _FakeRedis()
+_real = (dai._redis, dai.profile_token_exchange, dai._requeue_stale_refresh)
+_requeued = []
+try:
+    dai._redis = lambda: _fr
+    dai._requeue_stale_refresh = lambda src: _requeued.append(src.id)
+    def _exchange(profile_id, rt):
+        with app.app_context():   # a refresh lands while the exchange is in flight
+            up('persist_config')(_sid, {'activation_token': 'ROTATED', 'bearer_token': 'NEW-BEARER'})
+        return {'valuePairs': {'partnerProfileID1': 'pp1-profile'}}
+    dai.profile_token_exchange = _exchange
+    with app.app_context():
+        _src = db.session.get(Source, _sid)
+        _res = dai.select_profile(_src, 'p1', 'David')
+        assert _res['ok'], _res
+        db.session.expire_all()
+        _c = db.session.get(Source, _sid).config
+        assert _c.get('dtv_android_profid') == 'pp1-profile' and _c.get('dtv_android_profile_id') == 'p1', _c
+        assert _c.get('activation_token') == 'ROTATED' and _c.get('bearer_token') == 'NEW-BEARER', \
+            'the profile switch overwrote a token written during the exchange'
+        assert _fr.d == {}, f'the profile switch left its refresh lock behind: {_fr.d}'
+        assert _requeued == [_sid], 'a refresh deferred by the profile switch was not re-queued'
+        _fr.d['directv:auth:refreshing:directv'] = b'1'   # upstream's refresh holds the lock
+        _res = dai.select_profile(db.session.get(Source, _sid), 'p1', 'David')
+        assert not _res['ok'] and 'refresh' in _res['error'], _res
+        assert _fr.d['directv:auth:refreshing:directv'] == b'1', "the profile switch released upstream's lock"
+        # A failed exchange still releases its lock and re-queues the deferred refresh.
+        del _fr.d['directv:auth:refreshing:directv']
+        _requeued.clear()
+        dai.profile_token_exchange = lambda *a: (_ for _ in ()).throw(RuntimeError('HTTP 500'))
+        _res = dai.select_profile(db.session.get(Source, _sid), 'p1', 'David')
+        assert not _res['ok'] and _fr.d == {} and _requeued == [_sid], (_res, _fr.d, _requeued)
+finally:
+    dai._redis, dai.profile_token_exchange, dai._requeue_stale_refresh = _real
+# 7b. The re-queue itself goes through upstream's own refresh path, only when stale.
+_real_sr = up('start_reauth')
+_started = []
+try:
+    install.up_set('start_reauth', lambda self: _started.append(1))
+    with app.app_context():
+        _s = db.session.get(Source, _sid)
+        _s.config = {**_s.config, 'token_captured_at': _t.time()}
+        db.session.commit()
+        dai._requeue_stale_refresh(_s)
+        assert _started == [], 'a fresh session was refreshed'
+        _s.config = {**_s.config, 'token_captured_at': 0}
+        db.session.commit()
+        dai._requeue_stale_refresh(_s)
+        assert _started == [1], "a stale session deferred by the profile switch was not refreshed"
+finally:
+    install.up_set('start_reauth', _real_sr)
 
 print('Overlay smoke test passed.')

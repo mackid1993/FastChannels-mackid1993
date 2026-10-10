@@ -5,12 +5,12 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
  the inserted-ad audio fix, wired in by one hook
 
 ---
- app/scrapers/directv_dai.py         | 1084 ++++++++++++++++++++++++++
- app/scrapers/directv_dai_device.py  |  268 +++++++
- app/scrapers/directv_dai_install.py | 1125 +++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py         | 1156 ++++++++++++++++++++++++++
+ app/scrapers/directv_dai_device.py  |  376 +++++++++
+ app/scrapers/directv_dai_install.py | 1158 +++++++++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 ++
- app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++++++
- 5 files changed, 3189 insertions(+)
+ app/scrapers/dtv_aac_gain.py        |  663 +++++++++++++++
+ 5 files changed, 3402 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -19,10 +19,10 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..236cc53
+index 0000000..c40c18d
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,1084 @@
+@@ -0,0 +1,1156 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -684,25 +684,53 @@ index 0000000..236cc53
 +    return device_ad_flags(device._client_device(), _saved_adids().get(address or ''))
 +
 +
-+_ZIP_CACHE: dict[str, str] = {}
++_ZIP_TRIED: dict[str, float] = {}   # bearer tag -> when a background ZIP fetch started
++_ZIP_RETRY = 3600
++_zip_lock = threading.Lock()
 +
 +
 +def _account_zip(config: dict) -> str | None:
-+    """The account's billing ZIP (for bZipCode) when login didn't store one yet,
-+    fetched once per process with the stored sign-in."""
-+    bearer = config.get('bearer_token')
++    """The account's billing ZIP (for bZipCode) when login didn't store one yet. A tune
++    never waits on DirecTV for it: the tune goes without bZipCode, and the account's
++    targeting values are fetched in the background and saved (dai_zip and friends), so
++    later tunes carry it. At most one fetch per sign-in per hour per process."""
++    bearer = str(config.get('bearer_token') or '')
 +    if not bearer:
 +        return None
-+    if bearer in _ZIP_CACHE:
-+        return _ZIP_CACHE[bearer] or None
-+    session = requests.Session()
-+    for c in config.get('cookies') or []:
-+        try:
-+            session.cookies.set(c['name'], c['value'], domain=c.get('domain') or None, path=c.get('path') or '/')
-+        except Exception:
-+            continue
-+    _ZIP_CACHE[bearer] = fetch_account_context(session, bearer).get('zip') or ''
-+    return _ZIP_CACHE[bearer] or None
++    import hashlib
++    tag = hashlib.sha256(bearer.encode()).hexdigest()[:12]
++    now = time.time()
++    with _zip_lock:
++        if now - _ZIP_TRIED.get(tag, 0) < _ZIP_RETRY:
++            return None
++        for k in [k for k, t in _ZIP_TRIED.items() if now - t >= _ZIP_RETRY]:
++            del _ZIP_TRIED[k]
++        _ZIP_TRIED[tag] = now
++    device.spawn(_fetch_and_store_account_context, bearer)
++    return None
++
++
++def _fetch_and_store_account_context(bearer: str) -> None:
++    """Background: the account's DMA/ZIP/consent with this bearer, saved to the DirecTV
++    source config for every value it found (only if that sign-in is still current)."""
++    account = requests.Session()
++    account.headers.update(_up('app_headers')())
++    ctx = fetch_account_context(account, bearer)
++    updates = {f'dai_{k}': v for k, v in ctx.items() if v}
++    if not updates.get('dai_zip'):
++        logger.warning('[directv-dai] the account lookup returned no billing ZIP; tunes go without '
++                       'bZipCode (retried in %s min)', _ZIP_RETRY // 60)
++    if not updates:
++        return
++    Source = _up('source_model')
++    src = Source.query.filter_by(name='directv').first()
++    if src is None or (src.config or {}).get('bearer_token') != bearer:
++        return
++    if _up('persist_config')(src.id, updates):
++        logger.info('[directv-dai] fetched the account targeting values (%s)', ', '.join(sorted(updates)))
++    else:
++        logger.warning('[directv-dai] could not save the account targeting values; retried in %s min',
++                       _ZIP_RETRY // 60)
 +
 +
 +def gpp_targeted_ad_opt_out(gpp: str) -> bool | None:
@@ -898,7 +926,10 @@ index 0000000..236cc53
 +
 +
 +def _profile_client_id() -> str:
-+    return getattr(_up_owner('app_headers'), '_CLIENT_ID', None) or 'UNIFIED_Android_TV_02'
++    """The code sign-in's own client id (upstream's, by role), so the profile exchange is
++    always made as the same app client the session was issued to. No fallback: a rename
++    upstream fails validate.sh/smoke_test.py by name instead of sending a stale id."""
++    return str(_up('code_signin_client_id'))
 +
 +
 +def profiles_supported(config: dict | None) -> bool:
@@ -1001,13 +1032,14 @@ index 0000000..236cc53
 +    if not rt:
 +        return {'ok': False, 'profid': False, 'error': 'no refresh token: sign in first'}
 +
-+    db = _up('db')
 +    rdb = _redis()
 +    lock_key = f'directv:auth:refreshing:{source.name}'
++    # Our own value (upstream writes '1'), so the release below drops only our lock.
++    lock_value = f'directv-dai-profile:{os.getpid()}:{time.time_ns()}'
 +    have_lock = True
 +    if rdb is not None:
 +        try:
-+            have_lock = bool(rdb.set(lock_key, '1', nx=True, ex=_PROFILE_LOCK_TTL))
++            have_lock = bool(rdb.set(lock_key, lock_value, nx=True, ex=_PROFILE_LOCK_TTL))
 +        except Exception:
 +            have_lock = True  # redis down: don't wedge a user action
 +    if not have_lock:
@@ -1019,34 +1051,40 @@ index 0000000..236cc53
 +        except Exception as exc:
 +            return {'ok': False, 'profid': False, 'error': str(exc)}
 +        profid = _partner_profile_id1(data)
++        # Merged into the live row under upstream's per-source lock (persist_config),
++        # never a commit of the copy read at the start: a refresh or a DRM self-heal
++        # that wrote the config meanwhile is kept.
++        updates = {'dtv_android_profile_id': profile_id}
++        if profid:
++            updates['dtv_android_profid'] = profid
++        # Persist a rotated refresh token only if the exchange returned one; otherwise
++        # leave the account session untouched (the profile-scoped bearer it mints isn't
++        # adopted by the app, so we don't adopt it either).
++        vp = data.get('valuePairs') if isinstance(data.get('valuePairs'), dict) else {}
++        new_refresh = (data.get('refresh_token') or data.get('refreshToken')
++                       or vp.get('refreshToken') or '').strip()
++        if new_refresh:
++            updates['refresh_token'] = new_refresh
 +        try:
-+            fresh = dict(source.config or {})
-+            fresh['dtv_android_profile_id'] = profile_id
-+            if profid:
-+                fresh['dtv_android_profid'] = profid
-+            # Persist a rotated refresh token only if the exchange returned one; otherwise
-+            # leave the account session untouched (the profile-scoped bearer it mints isn't
-+            # adopted by the app, so we don't adopt it either).
-+            vp = data.get('valuePairs') if isinstance(data.get('valuePairs'), dict) else {}
-+            new_refresh = (data.get('refresh_token') or data.get('refreshToken')
-+                           or vp.get('refreshToken') or '').strip()
-+            if new_refresh:
-+                fresh['refresh_token'] = new_refresh
-+            source.config = fresh
-+            db.session.commit()
++            saved = _up('persist_config')(source.id, updates)
 +        except Exception:
-+            try:
-+                db.session.rollback()
-+            except Exception:
-+                pass
-+            logger.debug('[directv-dai] could not persist profile selection', exc_info=True)
-+            return {'ok': False, 'profid': False, 'error': 'could not save the selection'}
++            saved = False
++            logger.warning('[directv-dai] could not persist profile selection', exc_info=True)
++        if not saved:
++            return {'ok': False, 'profid': False, 'error': 'could not save the selection; try again'}
 +    finally:
++        # Drop the lock only if it is still ours (it may have expired and been taken by
++        # upstream's refresh meanwhile): an atomic compare-and-delete. Then, success or
++        # not, queue the refresh upstream may have skipped while we held it.
++        released = rdb is None
 +        if rdb is not None:
 +            try:
-+                rdb.delete(lock_key)
++                released = bool(_release_lock(rdb, lock_key, lock_value))
 +            except Exception:
-+                pass
++                logger.warning('[directv-dai] could not release the profile-switch lock; it expires in %ss',
++                               _PROFILE_LOCK_TTL, exc_info=True)
++        if released:
++            _requeue_stale_refresh(source)
 +    # The next tune opens a session with the new profid.
 +    try:
 +        persist_source_cache_updates = _up('persist_cache')
@@ -1062,6 +1100,40 @@ index 0000000..236cc53
 +                   'response; profid left unset', who)
 +    return {'ok': False, 'profid': False,
 +            'error': 'the profile exchange returned no profile id (nothing was changed to a bad value)'}
++
++
++_RELEASE_LUA = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
++
++
++def _release_lock(rdb, key: str, value: str):
++    """Delete key only if it still holds value, atomically (Lua); a plain compare-then-
++    delete fallback for a client without scripting."""
++    try:
++        return rdb.eval(_RELEASE_LUA, 1, key, value)
++    except Exception:   # no scripting (old client, ACL, or a stub): compare-then-delete
++        held = rdb.get(key)
++        if (held.decode() if isinstance(held, bytes) else held) == value:
++            rdb.delete(key)
++            return 1
++        return 0
++
++
++def _requeue_stale_refresh(source) -> None:
++    """While the profile exchange held upstream's refresh lock, upstream's own background
++    re-auth would have seen "already in progress" and skipped. If the session went stale
++    meanwhile, queue that refresh now (upstream's own path) instead of waiting for its
++    15-minute watchdog. Only the age check (_token_stale) is re-run: a token DirecTV
++    rejected outright (0015) during that window is left to upstream's next tune, which
++    re-detects it, or its watchdog. Best-effort."""
++    try:
++        Source = _up('source_model')
++        src = Source.query.get(source.id) or source
++        scraper = _up_owner('resolve')(dict(src.config or {}))
++        if _up('token_stale')(scraper) and _up('can_reauth')(scraper.config):
++            _up('start_reauth')(scraper)
++            logger.info('[directv-dai] queued the token refresh deferred by the profile switch')
++    except Exception:
++        logger.warning('[directv-dai] could not re-check the token after the profile switch', exc_info=True)
 +
 +
 +# ── Settings ─────────────────────────────────────────────────────────────────
@@ -1109,10 +1181,10 @@ index 0000000..236cc53
 +        capture_in_background(uncaptured_addresses())
 diff --git a/app/scrapers/directv_dai_device.py b/app/scrapers/directv_dai_device.py
 new file mode 100644
-index 0000000..c34f4b6
+index 0000000..8484e97
 --- /dev/null
 +++ b/app/scrapers/directv_dai_device.py
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,376 @@
 +"""The bridge device a DirecTV DAI tune plays on: its identity and app User-Agent.
 +
 +DAI targets the playback device the way DirecTV's Android TV app does, so this reads
@@ -1211,14 +1283,26 @@ index 0000000..c34f4b6
 +        app = None
 +
 +    def _run():
++        # fn always runs (its own cleanup with it), even if the app context can't be
++        # entered; it then just has no app context and fails/logs on its own.
++        ctx = None
 +        try:
 +            if app is not None:
-+                with app.app_context():
-+                    fn(*args)
-+            else:
-+                fn(*args)
++                try:
++                    ctx = app.app_context()
++                    ctx.push()
++                except Exception:
++                    ctx = None
++                    logger.warning('[directv-dai] background %s: no app context', getattr(fn, '__name__', 'task'))
++            fn(*args)
 +        except Exception as exc:
 +            logger.warning('[directv-dai] background %s failed: %s', getattr(fn, '__name__', 'task'), exc)
++        finally:
++            if ctx is not None:
++                try:
++                    ctx.pop()
++                except Exception:
++                    pass
 +    threading.Thread(target=_run, daemon=True).start()
 +
 +
@@ -1253,45 +1337,141 @@ index 0000000..c34f4b6
 +
 +_RETRY_TTL = 60
 +
-+# Request IP -> bridge address. Looking it up asks upstream's bridge_devices, which
-+# reads the database and asks ah4c over HTTP, and the relay looks it up on every
-+# playlist and segment fetch, so a found box is kept for a minute and a miss (another
-+# client, or an ah4c hiccup) for a few seconds.
-+_BRIDGE_CACHE: dict[str, tuple[float, str | None]] = {}
++# Request IP -> bridge address. The device list comes from upstream's bridge_devices,
++# which reads the database and asks ah4c over HTTP (up to ~5 s when ah4c is slow or
++# down), and the relay looks a requester up on every playlist and segment fetch. So the
++# LIST is cached, not each IP:
++# - Reads run in the background, one at a time; no lock is ever held across the read.
++# - A list once read is served while a refresh runs after _BRIDGE_TTL.
++# - When ah4c reports an error (upstream returns it, it doesn't raise), the ah4c tuners
++#   from the last good list are kept (merged with what the database still lists), and
++#   unknown requesters stop triggering reads until ah4c answers again.
++# - An unknown requester (maybe a box added since) starts a refresh at most every
++#   _BRIDGE_MISS_REFRESH per IP and waits at most _BRIDGE_MISS_WAIT for it.
 +_BRIDGE_TTL = 60
-+_BRIDGE_MISS_TTL = 10
++_BRIDGE_FAIL_HOLD = 60        # after an ah4c/database failure, misses don't re-read for this long
++_BRIDGE_MISS_REFRESH = 10
++_BRIDGE_MISS_WAIT = 1.5
++_BRIDGE_FIRST_WAIT = 6        # the very first read in a process (ah4c's own timeout is 5 s)
++_BRIDGE_LIST: list = [0.0, None]   # [read at, [{'address', 'host'}] or None]
++_bridge_lock = threading.Lock()    # guards the in-flight slot only; never held across I/O
++_bridge_inflight: list = [None]    # threading.Event of the running read, or None
++_bridge_failed_at = [0.0]
++_bridge_outage_logged = [False]
++_bridge_miss_at: dict[str, float] = {}
++
++
++def _match(devices, ip: str) -> str | None:
++    return next((d['address'] for d in devices or []
++                 if d['host'] == ip or d['address'].split(':')[0] == ip), None)
 +
 +
 +def _bridge_address(ip: str) -> str | None:
++    address = _match(_cached_bridge_devices(), ip)
++    if address:
++        return address
 +    now = time.time()
-+    hit = _BRIDGE_CACHE.get(ip)
-+    if hit and now < hit[0]:
-+        return hit[1]
-+    address = _lookup_bridge_address(ip)
-+    _BRIDGE_CACHE[ip] = (now + (_BRIDGE_TTL if address else _BRIDGE_MISS_TTL), address)
-+    return address
++    if (now - _bridge_miss_at.get(ip, 0) < _BRIDGE_MISS_REFRESH
++            or now - _bridge_failed_at[0] < _BRIDGE_FAIL_HOLD):
++        return None
++    _bridge_miss_at[ip] = now
++    if len(_bridge_miss_at) > 1024:   # bounded: drop the oldest half
++        for k in sorted(_bridge_miss_at, key=_bridge_miss_at.get)[:512]:
++            _bridge_miss_at.pop(k, None)
++    done = _start_bridge_refresh()
++    if done is not None:
++        done.wait(_BRIDGE_MISS_WAIT)
++    return _match(_BRIDGE_LIST[1], ip)
++
++
++def forget_bridge_devices() -> None:
++    """Drop the cached device list (the next lookup reads it again)."""
++    _BRIDGE_LIST[:] = [0.0, None]
++    _bridge_failed_at[0] = 0.0
++    _bridge_outage_logged[0] = False
++    _bridge_miss_at.clear()
++
++
++def _cached_bridge_devices() -> list[dict]:
++    read_at, devices = _BRIDGE_LIST
++    if devices is not None:
++        if time.time() - read_at > _BRIDGE_TTL:
++            _start_bridge_refresh()
++        return devices
++    # Nothing read yet in this process: wait (bounded) for the first read.
++    done = _start_bridge_refresh()
++    if done is not None:
++        done.wait(_BRIDGE_FIRST_WAIT)
++    return _BRIDGE_LIST[1] or []
++
++
++def _start_bridge_refresh():
++    """Start a background read unless one is running. Returns the running read's Event."""
++    with _bridge_lock:
++        done = _bridge_inflight[0]
++        if done is not None:
++            return done
++        done = _bridge_inflight[0] = threading.Event()
++
++    def _run():
++        try:
++            _read_bridge_devices()
++        finally:
++            _bridge_inflight[0] = None
++            done.set()
++    try:
++        spawn(_run)
++    except Exception:
++        logger.exception('[directv-dai] could not start the bridge-device read')
++        _bridge_inflight[0] = None
++        done.set()
++    return done
++
++
++def _read_bridge_devices() -> bool:
++    """One read of upstream's device list into the cache. False when ah4c (or the
++    database) failed; then the last good list's devices are kept."""
++    try:
++        devices, error = bridge_device_list()
++    except Exception as exc:
++        devices, error = [], f'{type(exc).__name__}: {exc}'
++    now = time.time()
++    if error:
++        _bridge_failed_at[0] = now
++        kept = {d['address']: d for d in (_BRIDGE_LIST[1] or [])}
++        kept.update({d['address']: d for d in devices})
++        _BRIDGE_LIST[:] = [now, list(kept.values())]
++        if not _bridge_outage_logged[0]:
++            _bridge_outage_logged[0] = True
++            logger.warning('[directv-dai] bridge device list incomplete (%s); keeping the last known '
++                           'devices until it answers again', error)
++        return False
++    if _bridge_outage_logged[0]:
++        _bridge_outage_logged[0] = False
++        logger.info('[directv-dai] bridge device list readable again')
++    _bridge_failed_at[0] = 0.0
++    _BRIDGE_LIST[:] = [now, devices]
++    return True
 +
 +
 +def known_bridge_devices() -> list[dict]:
 +    """Every bridge device upstream knows (HDMI Capture, ah4c tuners, remembered boxes) as
-+    [{'address': 'host:port', 'host': 'host'}]. The overlay's only read of upstream's
-+    device list, so if upstream reshapes it, this is the one place to adapt."""
++    [{'address': 'host:port', 'host': 'host'}]."""
++    return bridge_device_list()[0]
++
++
++def bridge_device_list() -> tuple[list[dict], str | None]:
++    """(devices, error): upstream's device list and its ah4c error (upstream returns the
++    error rather than raising when ah4c can't be asked). The overlay's only read of
++    upstream's device list, so if upstream reshapes it, this is the one place to adapt."""
 +    from .directv_dai_install import up
++    raw, error = up('known_devices')()
 +    out = []
-+    for d in up('known_devices')()[0]:
++    for d in raw:
 +        address = str((d or {}).get('address') or '').strip()
 +        if address:
 +            out.append({'address': address, 'host': str(d.get('host') or address.rsplit(':', 1)[0])})
-+    return out
-+
-+
-+def _lookup_bridge_address(ip: str) -> str | None:
-+    try:
-+        return next((d['address'] for d in known_bridge_devices()
-+                     if d['host'] == ip or d['address'].split(':')[0] == ip), None)
-+    except Exception as exc:
-+        logger.debug('[directv-dai] bridge device lookup failed: %s', exc)
-+        return None
++    return out, (str(error) if error else None)
 +
 +
 +def _read_device(address: str) -> dict:
@@ -1383,10 +1563,10 @@ index 0000000..c34f4b6
 +    return {'manufacturer': manufacturer, 'model': model} if manufacturer else None
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..54fb725
+index 0000000..6a9ec8f
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,1125 @@
+@@ -0,0 +1,1158 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
@@ -1458,6 +1638,11 @@ index 0000000..54fb725
 +    'code_signin_method': ('app.scrapers.directv_device_auth', 'AUTH_METHOD'),
 +    'app_headers': ('app.scrapers.directv_device_auth', 'app_headers'),
 +    'app_user_agent': ('app.scrapers.directv_device_auth', 'APP_USER_AGENT'),
++    'code_signin_client_id': ('app.scrapers.directv_device_auth', '_CLIENT_ID'),
++    'playback_cache_ttl': ('app.scrapers.directv', '_PLAYBACK_CACHE_TTL'),
++    'token_stale': ('app.scrapers.directv', 'DirectvScraper._token_stale'),
++    'can_reauth': ('app.scrapers.directv', 'DirectvScraper.can_reauth'),
++    'start_reauth': ('app.scrapers.directv', 'DirectvScraper._start_background_reauth'),
 +    'is_code_signin': ('app.scrapers.directv_device_auth', 'is_device_session'),
 +    'relay_cdn_allowed': ('app.routes.directv_proxy', '_directv_browser_cdn_allowed'),
 +    'scraper_cache': ('app.scrapers.base', 'BaseScraper.cache'),
@@ -1489,7 +1674,15 @@ index 0000000..54fb725
 +# upstream's per-channel directv_playback, so two boxes on one channel don't keep
 +# replacing each other's session (each needs its own: the device id is in the URL).
 +DEVICE_SESSIONS = 'dai_playback_by_device'
-+_DEVICE_SESSION_TTL = 3600
++# A box's own session lives exactly as long as upstream keeps its per-channel playback
++# (its _PLAYBACK_CACHE_TTL, sized under DirecTV's entitlement), never longer, so the
++# license wrapper never hands out a play token upstream would already have refetched.
++# If that role can't be read (missing() reports it), boxes simply don't reuse sessions.
++def _device_session_ttl() -> float:
++    try:
++        return float(up('playback_cache_ttl'))
++    except Exception:
++        return 0.0
 +_ABS_URL = re.compile(r'https?://[^\s"]+')
 +
 +# The scraper (config + channel names + a result slot) behind the current
@@ -1587,7 +1780,27 @@ index 0000000..54fb725
 +    if root:
 +        markers = missing_markers(root)
 +    return {'missing': missing(), 'markers': markers + relay,
-+            'failed': sorted(set(_failed)), 'runtime': runtime_warnings()}
++            'failed': sorted(set(_failed + identity_problems())), 'runtime': runtime_warnings()}
++
++
++def identity_problems() -> list[str]:
++    """The one client identity the session presents must hold together: comscore_device
++    names the device upstream's fixed app User-Agent presents. If upstream changes that
++    string to a device directv_dai_device can't name, comscore_device would quietly fall
++    back to each box's own values; say so instead (CI and the panel)."""
++    try:
++        from . import directv_dai_device
++        ua = up('app_user_agent')
++    except Exception:
++        return []   # the role itself is gone: missing() names it
++    try:
++        if directv_dai_device.presented_device() is None:
++            return [f"comscore_device: upstream's app User-Agent ({str(ua)[:120]!r}) names a "
++                    'device directv_dai_device._UA_MANUFACTURERS does not map; comscore_device falls back to '
++                    "each box's own values (add its board)"]
++    except Exception:
++        return ['comscore_device: could not read the device upstream\'s app User-Agent presents']
++    return []
 +
 +
 +def install(app) -> None:
@@ -1872,7 +2085,7 @@ index 0000000..54fb725
 +    address = directv_dai._current_bridge_address()
 +    mine = (((cache or {}).get(DEVICE_SESSIONS) or {}).get(address) or {}).get(ccid) if address else None
 +    if (not isinstance(mine, dict) or mine.get('bearer_tag') != _bearer_tag(config)
-+            or time.time() - float(mine.get('cached_at') or 0) > _DEVICE_SESSION_TTL
++            or time.time() - float(mine.get('cached_at') or 0) >= _device_session_ttl()
 +            or not directv_dai.cached_url_usable(mine, True)):
 +        return None
 +    return {k: v for k, v in mine.items() if k != 'bearer_tag'}
@@ -1886,9 +2099,9 @@ index 0000000..54fb725
 +    entry = (cache.get('directv_playback') or {}).get(ccid)
 +    if not address or not isinstance(entry, dict) or not entry.get('dai'):
 +        return
-+    now = time.time()
++    now, ttl = time.time(), _device_session_ttl()
 +    store = {a: {c: e for c, e in (m or {}).items()
-+                 if isinstance(e, dict) and now - float(e.get('cached_at') or 0) <= _DEVICE_SESSION_TTL}
++                 if isinstance(e, dict) and now - float(e.get('cached_at') or 0) < ttl}
 +             for a, m in (cache.get(DEVICE_SESSIONS) or {}).items()}
 +    store.setdefault(address, {})[ccid] = {**entry, 'bearer_tag': _bearer_tag(scraper.config)}
 +    getattr(scraper, up_name('scraper_update_cache'))(DEVICE_SESSIONS, {a: m for a, m in store.items() if m})

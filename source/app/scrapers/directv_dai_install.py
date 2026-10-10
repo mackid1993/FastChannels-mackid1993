@@ -69,6 +69,11 @@ USES = {
     'code_signin_method': ('app.scrapers.directv_device_auth', 'AUTH_METHOD'),
     'app_headers': ('app.scrapers.directv_device_auth', 'app_headers'),
     'app_user_agent': ('app.scrapers.directv_device_auth', 'APP_USER_AGENT'),
+    'code_signin_client_id': ('app.scrapers.directv_device_auth', '_CLIENT_ID'),
+    'playback_cache_ttl': ('app.scrapers.directv', '_PLAYBACK_CACHE_TTL'),
+    'token_stale': ('app.scrapers.directv', 'DirectvScraper._token_stale'),
+    'can_reauth': ('app.scrapers.directv', 'DirectvScraper.can_reauth'),
+    'start_reauth': ('app.scrapers.directv', 'DirectvScraper._start_background_reauth'),
     'is_code_signin': ('app.scrapers.directv_device_auth', 'is_device_session'),
     'relay_cdn_allowed': ('app.routes.directv_proxy', '_directv_browser_cdn_allowed'),
     'scraper_cache': ('app.scrapers.base', 'BaseScraper.cache'),
@@ -100,7 +105,15 @@ _CHANNEL_AUTH_V2 = 'https://api.cld.dtvce.com/right/authorization/channel/v2'
 # upstream's per-channel directv_playback, so two boxes on one channel don't keep
 # replacing each other's session (each needs its own: the device id is in the URL).
 DEVICE_SESSIONS = 'dai_playback_by_device'
-_DEVICE_SESSION_TTL = 3600
+# A box's own session lives exactly as long as upstream keeps its per-channel playback
+# (its _PLAYBACK_CACHE_TTL, sized under DirecTV's entitlement), never longer, so the
+# license wrapper never hands out a play token upstream would already have refetched.
+# If that role can't be read (missing() reports it), boxes simply don't reuse sessions.
+def _device_session_ttl() -> float:
+    try:
+        return float(up('playback_cache_ttl'))
+    except Exception:
+        return 0.0
 _ABS_URL = re.compile(r'https?://[^\s"]+')
 
 # The scraper (config + channel names + a result slot) behind the current
@@ -198,7 +211,27 @@ def status(app=None) -> dict:
     if root:
         markers = missing_markers(root)
     return {'missing': missing(), 'markers': markers + relay,
-            'failed': sorted(set(_failed)), 'runtime': runtime_warnings()}
+            'failed': sorted(set(_failed + identity_problems())), 'runtime': runtime_warnings()}
+
+
+def identity_problems() -> list[str]:
+    """The one client identity the session presents must hold together: comscore_device
+    names the device upstream's fixed app User-Agent presents. If upstream changes that
+    string to a device directv_dai_device can't name, comscore_device would quietly fall
+    back to each box's own values; say so instead (CI and the panel)."""
+    try:
+        from . import directv_dai_device
+        ua = up('app_user_agent')
+    except Exception:
+        return []   # the role itself is gone: missing() names it
+    try:
+        if directv_dai_device.presented_device() is None:
+            return [f"comscore_device: upstream's app User-Agent ({str(ua)[:120]!r}) names a "
+                    'device directv_dai_device._UA_MANUFACTURERS does not map; comscore_device falls back to '
+                    "each box's own values (add its board)"]
+    except Exception:
+        return ['comscore_device: could not read the device upstream\'s app User-Agent presents']
+    return []
 
 
 def install(app) -> None:
@@ -483,7 +516,7 @@ def _device_session(cache, config, ccid: str) -> dict | None:
     address = directv_dai._current_bridge_address()
     mine = (((cache or {}).get(DEVICE_SESSIONS) or {}).get(address) or {}).get(ccid) if address else None
     if (not isinstance(mine, dict) or mine.get('bearer_tag') != _bearer_tag(config)
-            or time.time() - float(mine.get('cached_at') or 0) > _DEVICE_SESSION_TTL
+            or time.time() - float(mine.get('cached_at') or 0) >= _device_session_ttl()
             or not directv_dai.cached_url_usable(mine, True)):
         return None
     return {k: v for k, v in mine.items() if k != 'bearer_tag'}
@@ -497,9 +530,9 @@ def _save_device_session(scraper, ccid: str) -> None:
     entry = (cache.get('directv_playback') or {}).get(ccid)
     if not address or not isinstance(entry, dict) or not entry.get('dai'):
         return
-    now = time.time()
+    now, ttl = time.time(), _device_session_ttl()
     store = {a: {c: e for c, e in (m or {}).items()
-                 if isinstance(e, dict) and now - float(e.get('cached_at') or 0) <= _DEVICE_SESSION_TTL}
+                 if isinstance(e, dict) and now - float(e.get('cached_at') or 0) < ttl}
              for a, m in (cache.get(DEVICE_SESSIONS) or {}).items()}
     store.setdefault(address, {})[ccid] = {**entry, 'bearer_tag': _bearer_tag(scraper.config)}
     getattr(scraper, up_name('scraper_update_cache'))(DEVICE_SESSIONS, {a: m for a, m in store.items() if m})

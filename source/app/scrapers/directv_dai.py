@@ -659,25 +659,53 @@ def _current_device_ad_flags() -> dict:
     return device_ad_flags(device._client_device(), _saved_adids().get(address or ''))
 
 
-_ZIP_CACHE: dict[str, str] = {}
+_ZIP_TRIED: dict[str, float] = {}   # bearer tag -> when a background ZIP fetch started
+_ZIP_RETRY = 3600
+_zip_lock = threading.Lock()
 
 
 def _account_zip(config: dict) -> str | None:
-    """The account's billing ZIP (for bZipCode) when login didn't store one yet,
-    fetched once per process with the stored sign-in."""
-    bearer = config.get('bearer_token')
+    """The account's billing ZIP (for bZipCode) when login didn't store one yet. A tune
+    never waits on DirecTV for it: the tune goes without bZipCode, and the account's
+    targeting values are fetched in the background and saved (dai_zip and friends), so
+    later tunes carry it. At most one fetch per sign-in per hour per process."""
+    bearer = str(config.get('bearer_token') or '')
     if not bearer:
         return None
-    if bearer in _ZIP_CACHE:
-        return _ZIP_CACHE[bearer] or None
-    session = requests.Session()
-    for c in config.get('cookies') or []:
-        try:
-            session.cookies.set(c['name'], c['value'], domain=c.get('domain') or None, path=c.get('path') or '/')
-        except Exception:
-            continue
-    _ZIP_CACHE[bearer] = fetch_account_context(session, bearer).get('zip') or ''
-    return _ZIP_CACHE[bearer] or None
+    import hashlib
+    tag = hashlib.sha256(bearer.encode()).hexdigest()[:12]
+    now = time.time()
+    with _zip_lock:
+        if now - _ZIP_TRIED.get(tag, 0) < _ZIP_RETRY:
+            return None
+        for k in [k for k, t in _ZIP_TRIED.items() if now - t >= _ZIP_RETRY]:
+            del _ZIP_TRIED[k]
+        _ZIP_TRIED[tag] = now
+    device.spawn(_fetch_and_store_account_context, bearer)
+    return None
+
+
+def _fetch_and_store_account_context(bearer: str) -> None:
+    """Background: the account's DMA/ZIP/consent with this bearer, saved to the DirecTV
+    source config for every value it found (only if that sign-in is still current)."""
+    account = requests.Session()
+    account.headers.update(_up('app_headers')())
+    ctx = fetch_account_context(account, bearer)
+    updates = {f'dai_{k}': v for k, v in ctx.items() if v}
+    if not updates.get('dai_zip'):
+        logger.warning('[directv-dai] the account lookup returned no billing ZIP; tunes go without '
+                       'bZipCode (retried in %s min)', _ZIP_RETRY // 60)
+    if not updates:
+        return
+    Source = _up('source_model')
+    src = Source.query.filter_by(name='directv').first()
+    if src is None or (src.config or {}).get('bearer_token') != bearer:
+        return
+    if _up('persist_config')(src.id, updates):
+        logger.info('[directv-dai] fetched the account targeting values (%s)', ', '.join(sorted(updates)))
+    else:
+        logger.warning('[directv-dai] could not save the account targeting values; retried in %s min',
+                       _ZIP_RETRY // 60)
 
 
 def gpp_targeted_ad_opt_out(gpp: str) -> bool | None:
@@ -873,7 +901,10 @@ def _profile_headers() -> dict:
 
 
 def _profile_client_id() -> str:
-    return getattr(_up_owner('app_headers'), '_CLIENT_ID', None) or 'UNIFIED_Android_TV_02'
+    """The code sign-in's own client id (upstream's, by role), so the profile exchange is
+    always made as the same app client the session was issued to. No fallback: a rename
+    upstream fails validate.sh/smoke_test.py by name instead of sending a stale id."""
+    return str(_up('code_signin_client_id'))
 
 
 def profiles_supported(config: dict | None) -> bool:
@@ -976,13 +1007,14 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
     if not rt:
         return {'ok': False, 'profid': False, 'error': 'no refresh token: sign in first'}
 
-    db = _up('db')
     rdb = _redis()
     lock_key = f'directv:auth:refreshing:{source.name}'
+    # Our own value (upstream writes '1'), so the release below drops only our lock.
+    lock_value = f'directv-dai-profile:{os.getpid()}:{time.time_ns()}'
     have_lock = True
     if rdb is not None:
         try:
-            have_lock = bool(rdb.set(lock_key, '1', nx=True, ex=_PROFILE_LOCK_TTL))
+            have_lock = bool(rdb.set(lock_key, lock_value, nx=True, ex=_PROFILE_LOCK_TTL))
         except Exception:
             have_lock = True  # redis down: don't wedge a user action
     if not have_lock:
@@ -994,34 +1026,40 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
         except Exception as exc:
             return {'ok': False, 'profid': False, 'error': str(exc)}
         profid = _partner_profile_id1(data)
+        # Merged into the live row under upstream's per-source lock (persist_config),
+        # never a commit of the copy read at the start: a refresh or a DRM self-heal
+        # that wrote the config meanwhile is kept.
+        updates = {'dtv_android_profile_id': profile_id}
+        if profid:
+            updates['dtv_android_profid'] = profid
+        # Persist a rotated refresh token only if the exchange returned one; otherwise
+        # leave the account session untouched (the profile-scoped bearer it mints isn't
+        # adopted by the app, so we don't adopt it either).
+        vp = data.get('valuePairs') if isinstance(data.get('valuePairs'), dict) else {}
+        new_refresh = (data.get('refresh_token') or data.get('refreshToken')
+                       or vp.get('refreshToken') or '').strip()
+        if new_refresh:
+            updates['refresh_token'] = new_refresh
         try:
-            fresh = dict(source.config or {})
-            fresh['dtv_android_profile_id'] = profile_id
-            if profid:
-                fresh['dtv_android_profid'] = profid
-            # Persist a rotated refresh token only if the exchange returned one; otherwise
-            # leave the account session untouched (the profile-scoped bearer it mints isn't
-            # adopted by the app, so we don't adopt it either).
-            vp = data.get('valuePairs') if isinstance(data.get('valuePairs'), dict) else {}
-            new_refresh = (data.get('refresh_token') or data.get('refreshToken')
-                           or vp.get('refreshToken') or '').strip()
-            if new_refresh:
-                fresh['refresh_token'] = new_refresh
-            source.config = fresh
-            db.session.commit()
+            saved = _up('persist_config')(source.id, updates)
         except Exception:
-            try:
-                db.session.rollback()
-            except Exception:
-                pass
-            logger.debug('[directv-dai] could not persist profile selection', exc_info=True)
-            return {'ok': False, 'profid': False, 'error': 'could not save the selection'}
+            saved = False
+            logger.warning('[directv-dai] could not persist profile selection', exc_info=True)
+        if not saved:
+            return {'ok': False, 'profid': False, 'error': 'could not save the selection; try again'}
     finally:
+        # Drop the lock only if it is still ours (it may have expired and been taken by
+        # upstream's refresh meanwhile): an atomic compare-and-delete. Then, success or
+        # not, queue the refresh upstream may have skipped while we held it.
+        released = rdb is None
         if rdb is not None:
             try:
-                rdb.delete(lock_key)
+                released = bool(_release_lock(rdb, lock_key, lock_value))
             except Exception:
-                pass
+                logger.warning('[directv-dai] could not release the profile-switch lock; it expires in %ss',
+                               _PROFILE_LOCK_TTL, exc_info=True)
+        if released:
+            _requeue_stale_refresh(source)
     # The next tune opens a session with the new profid.
     try:
         persist_source_cache_updates = _up('persist_cache')
@@ -1037,6 +1075,40 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
                    'response; profid left unset', who)
     return {'ok': False, 'profid': False,
             'error': 'the profile exchange returned no profile id (nothing was changed to a bad value)'}
+
+
+_RELEASE_LUA = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
+
+
+def _release_lock(rdb, key: str, value: str):
+    """Delete key only if it still holds value, atomically (Lua); a plain compare-then-
+    delete fallback for a client without scripting."""
+    try:
+        return rdb.eval(_RELEASE_LUA, 1, key, value)
+    except Exception:   # no scripting (old client, ACL, or a stub): compare-then-delete
+        held = rdb.get(key)
+        if (held.decode() if isinstance(held, bytes) else held) == value:
+            rdb.delete(key)
+            return 1
+        return 0
+
+
+def _requeue_stale_refresh(source) -> None:
+    """While the profile exchange held upstream's refresh lock, upstream's own background
+    re-auth would have seen "already in progress" and skipped. If the session went stale
+    meanwhile, queue that refresh now (upstream's own path) instead of waiting for its
+    15-minute watchdog. Only the age check (_token_stale) is re-run: a token DirecTV
+    rejected outright (0015) during that window is left to upstream's next tune, which
+    re-detects it, or its watchdog. Best-effort."""
+    try:
+        Source = _up('source_model')
+        src = Source.query.get(source.id) or source
+        scraper = _up_owner('resolve')(dict(src.config or {}))
+        if _up('token_stale')(scraper) and _up('can_reauth')(scraper.config):
+            _up('start_reauth')(scraper)
+            logger.info('[directv-dai] queued the token refresh deferred by the profile switch')
+    except Exception:
+        logger.warning('[directv-dai] could not re-check the token after the profile switch', exc_info=True)
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────
