@@ -182,8 +182,7 @@ for key, value in expected.items():
 assert 'profid' not in query, 'a sign-in profileId was sent as profid (only the picker sets it)'
 
 # A viewer profile id the old overlay's profile picker stored (dtv_android_profid, still in
-# the config) is what the app sends as profid, and it wins over the
-# web-login dai_profile_id.
+# the config) is what the app sends as profid; nothing else is ever sent as profid.
 assert dai.build_query({**config, 'dtv_android_profid': 'pp1-android'}, {}, '123')['profid'] == 'pp1-android', \
     'profid must come from dtv_android_profid (the chosen viewer profile) when present'
 

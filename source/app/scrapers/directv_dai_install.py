@@ -291,11 +291,8 @@ _PROBLEMS = {
     'fallback': ('the last DAI tune fell back to the non-DAI stream', 'ok'),
     'ad_uncut': ('an inserted ad went out without the loudness cut', 'ad_cut'),
     'no_profid': ('a DAI tune went out without profid (the viewer profile)', 'profid_ok'),
-    'proxied': ('requests reach FastChannels through a proxy (X-Forwarded-For), so bridge boxes '
-                "can't be recognized by address and get no device ids; connect them directly", 'ok'),
 }
 _local_health: dict[str, dict] = {}
-_proxy_noted = [0.0]
 _rdb = [None, 0.0]
 
 
@@ -738,25 +735,6 @@ def _patch_user_agent() -> None:
 def _register_relay_hooks(app) -> None:
     from flask import Response, request
     from . import dtv_aac_ads, dtv_aac_gain
-
-    @app.before_request
-    def _directv_dai_proxy_check():
-        """Behind a reverse proxy every request comes from the proxy's address, so no bridge
-        box is recognized (no device ids). Reported (at most once a minute per process)."""
-        try:
-            if (request.path.startswith(RELAY_PREFIX) and request.headers.get('X-Forwarded-For')
-                    and time.time() - _proxy_noted[0] > 60):
-                from . import directv_dai, directv_dai_device
-                forwarded = request.headers.get('X-Forwarded-For').split(',')[0].strip()
-                # Only when a bridge box itself is behind the proxy (its address arrives in
-                # X-Forwarded-For); a proxied non-box client (e.g. Channels) is fine.
-                if (directv_dai.dai_on() and directv_dai_device._bridge_address(forwarded)
-                        and not directv_dai_device._bridge_address(request.remote_addr or '')):
-                    _proxy_noted[0] = time.time()
-                    _note('proxied', f'request from {request.remote_addr} with X-Forwarded-For')
-        except Exception:
-            pass
-        return None
 
     @app.before_request
     def _directv_dai_ad_segment():

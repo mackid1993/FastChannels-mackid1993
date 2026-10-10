@@ -5,12 +5,12 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
  the inserted-ad audio fix, wired in by one hook
 
 ---
- app/scrapers/directv_dai.py         | 1543 +++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py         | 1549 +++++++++++++++++++++++++++
  app/scrapers/directv_dai_device.py  |  425 ++++++++
- app/scrapers/directv_dai_install.py | 1253 ++++++++++++++++++++++
+ app/scrapers/directv_dai_install.py | 1231 +++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 +
  app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++
- 5 files changed, 3933 insertions(+)
+ 5 files changed, 3917 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -19,10 +19,10 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..92289ef
+index 0000000..840658d
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,1543 @@
+@@ -0,0 +1,1549 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -604,8 +604,9 @@ index 0000000..92289ef
 +            return 'none'
 +        _adid_inflight.add(address)
 +    rdb, lock_key = _redis(), f'directv_dai:capture:{address}'
++    lock_value = f'{os.getpid()}:{time.time_ns()}'
 +    try:
-+        busy = rdb is not None and not rdb.set(lock_key, '1', nx=True, ex=180)
++        busy = rdb is not None and not rdb.set(lock_key, lock_value, nx=True, ex=180)
 +    except Exception:
 +        busy, rdb = False, None
 +    if busy:
@@ -637,7 +638,7 @@ index 0000000..92289ef
 +            _adid_inflight.discard(address)
 +        if rdb is not None:
 +            try:
-+                rdb.delete(lock_key)
++                _release_lock(rdb, lock_key, lock_value)   # only if still ours
 +            except Exception:
 +                pass
 +
@@ -1436,7 +1437,12 @@ index 0000000..92289ef
 +                               _PROFILE_LOCK_TTL, exc_info=True)
 +        if released:
 +            _requeue_stale_refresh(source)
-+    # The next tune opens a session with the new profid.
++    # The next tune opens a session with the new profid (nothing to clear if none was saved).
++    if not profid:
++        logger.warning('[directv-dai] profile "%s": exchange succeeded but no partnerProfileID1 in the '
++                       'response; nothing changed', (profile_name or '').strip() or 'the selected profile')
++        return {'ok': False, 'profid': False,
++                'error': 'the profile exchange returned no profile id (nothing was changed to a bad value)'}
 +    try:
 +        persist_source_cache_updates = _up('persist_cache')
 +        persist_source_cache_updates(source.id, {'directv_playback': {}, 'dai_playback_by_device': {}})
@@ -1999,10 +2005,10 @@ index 0000000..a5c8b4a
 +    return {'manufacturer': manufacturer, 'model': model} if manufacturer else None
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..9765b7a
+index 0000000..5a5a5fb
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,1253 @@
+@@ -0,0 +1,1231 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
@@ -2296,11 +2302,8 @@ index 0000000..9765b7a
 +    'fallback': ('the last DAI tune fell back to the non-DAI stream', 'ok'),
 +    'ad_uncut': ('an inserted ad went out without the loudness cut', 'ad_cut'),
 +    'no_profid': ('a DAI tune went out without profid (the viewer profile)', 'profid_ok'),
-+    'proxied': ('requests reach FastChannels through a proxy (X-Forwarded-For), so bridge boxes '
-+                "can't be recognized by address and get no device ids; connect them directly", 'ok'),
 +}
 +_local_health: dict[str, dict] = {}
-+_proxy_noted = [0.0]
 +_rdb = [None, 0.0]
 +
 +
@@ -2743,25 +2746,6 @@ index 0000000..9765b7a
 +def _register_relay_hooks(app) -> None:
 +    from flask import Response, request
 +    from . import dtv_aac_ads, dtv_aac_gain
-+
-+    @app.before_request
-+    def _directv_dai_proxy_check():
-+        """Behind a reverse proxy every request comes from the proxy's address, so no bridge
-+        box is recognized (no device ids). Reported (at most once a minute per process)."""
-+        try:
-+            if (request.path.startswith(RELAY_PREFIX) and request.headers.get('X-Forwarded-For')
-+                    and time.time() - _proxy_noted[0] > 60):
-+                from . import directv_dai, directv_dai_device
-+                forwarded = request.headers.get('X-Forwarded-For').split(',')[0].strip()
-+                # Only when a bridge box itself is behind the proxy (its address arrives in
-+                # X-Forwarded-For); a proxied non-box client (e.g. Channels) is fine.
-+                if (directv_dai.dai_on() and directv_dai_device._bridge_address(forwarded)
-+                        and not directv_dai_device._bridge_address(request.remote_addr or '')):
-+                    _proxy_noted[0] = time.time()
-+                    _note('proxied', f'request from {request.remote_addr} with X-Forwarded-For')
-+        except Exception:
-+            pass
-+        return None
 +
 +    @app.before_request
 +    def _directv_dai_ad_segment():

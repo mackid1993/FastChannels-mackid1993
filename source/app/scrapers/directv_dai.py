@@ -579,8 +579,9 @@ def _capture_and_store(address: str) -> str:
             return 'none'
         _adid_inflight.add(address)
     rdb, lock_key = _redis(), f'directv_dai:capture:{address}'
+    lock_value = f'{os.getpid()}:{time.time_ns()}'
     try:
-        busy = rdb is not None and not rdb.set(lock_key, '1', nx=True, ex=180)
+        busy = rdb is not None and not rdb.set(lock_key, lock_value, nx=True, ex=180)
     except Exception:
         busy, rdb = False, None
     if busy:
@@ -612,7 +613,7 @@ def _capture_and_store(address: str) -> str:
             _adid_inflight.discard(address)
         if rdb is not None:
             try:
-                rdb.delete(lock_key)
+                _release_lock(rdb, lock_key, lock_value)   # only if still ours
             except Exception:
                 pass
 
@@ -1411,7 +1412,12 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
                                _PROFILE_LOCK_TTL, exc_info=True)
         if released:
             _requeue_stale_refresh(source)
-    # The next tune opens a session with the new profid.
+    # The next tune opens a session with the new profid (nothing to clear if none was saved).
+    if not profid:
+        logger.warning('[directv-dai] profile "%s": exchange succeeded but no partnerProfileID1 in the '
+                       'response; nothing changed', (profile_name or '').strip() or 'the selected profile')
+        return {'ok': False, 'profid': False,
+                'error': 'the profile exchange returned no profile id (nothing was changed to a bad value)'}
     try:
         persist_source_cache_updates = _up('persist_cache')
         persist_source_cache_updates(source.id, {'directv_playback': {}, 'dai_playback_by_device': {}})
