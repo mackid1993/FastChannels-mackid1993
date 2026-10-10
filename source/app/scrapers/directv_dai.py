@@ -580,10 +580,15 @@ def _capture_and_store(address: str) -> str:
         _adid_inflight.add(address)
     rdb, lock_key = _redis(), f'directv_dai:capture:{address}'
     try:
-        if rdb is not None and not rdb.set(lock_key, '1', nx=True, ex=180):
-            return 'none'   # another worker is capturing this box right now
+        busy = rdb is not None and not rdb.set(lock_key, '1', nx=True, ex=180)
     except Exception:
-        pass
+        busy, rdb = False, None
+    if busy:
+        # Another worker is capturing this box right now: clear OUR mark (so a later run
+        # here isn't blocked) and leave its lock alone.
+        with _adid_lock:
+            _adid_inflight.discard(address)
+        return 'busy'
     try:
         if not _reachable(address):
             return 'unreachable'   # box off / adb down; kept pending so a re-run picks it up
@@ -644,7 +649,7 @@ def capture_registered_devices(addresses: list[str] | None = None) -> dict:
     an explicit action (DAI toggle-on, or the admin capture button) — never on a schedule
     and never at tune time. Must run inside a Flask app context (device list + store)."""
     addrs = addresses if addresses is not None else _bridge_addresses()
-    counts = {'captured': 0, 'playing': 0, 'unreachable': 0, 'none': 0}
+    counts = {'captured': 0, 'playing': 0, 'unreachable': 0, 'none': 0, 'busy': 0}
     for addr in addrs:
         counts[_capture_and_store(addr)] += 1
     if counts['captured']:
@@ -757,7 +762,8 @@ def _profid_check(config: dict, have: bool) -> None:
     (rate-limited) and report it in red on the panel until a tune carries one."""
     try:
         from .directv_dai_install import _note
-        if have:
+        if have or not profiles_supported(config):
+            # A web (email/password) session can't run viewer profiles: nothing to report.
             _note('profid_ok')
             return
         _note('no_profid', 'no viewer profile set yet; running as the account\'s default profile '

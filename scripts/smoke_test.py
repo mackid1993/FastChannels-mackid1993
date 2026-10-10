@@ -1372,4 +1372,21 @@ try:
 finally:
     device.spawn = _real_sp2
 
+# (q) A box another worker is capturing is reported 'busy', and this worker's in-progress
+# mark is cleared, so a later capture here is not skipped forever.
+class _Busy:
+    def set(self, *a, **k): return False
+    def delete(self, *a): raise AssertionError("deleted the other worker's capture lock")
+_real_r, _real_reach = dai._redis, dai._reachable
+try:
+    dai._redis = lambda: _Busy()
+    dai._reachable = lambda a: (_ for _ in ()).throw(AssertionError('captured a box another worker holds'))
+    assert dai._capture_and_store('10.0.0.50:5555') == 'busy'
+    assert '10.0.0.50:5555' not in dai._adid_inflight, 'the losing worker kept the box marked in progress'
+    dai._redis = lambda: None
+    dai._reachable = lambda a: False
+    assert dai._capture_and_store('10.0.0.50:5555') == 'unreachable', 'a later capture on this worker was skipped'
+finally:
+    dai._redis, dai._reachable = _real_r, _real_reach
+
 print('Overlay smoke test passed.')

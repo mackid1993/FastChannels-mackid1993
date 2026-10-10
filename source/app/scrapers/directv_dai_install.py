@@ -429,7 +429,7 @@ def _patch_scraper() -> None:
                     config = bound.arguments.get('config')
                     channel_id = bound.arguments.get('channel_id')
                     # The license must carry the play token of the session THIS box plays.
-                    mine = (_device_session(config, config, str(channel_id))
+                    mine = (_device_session(config, config, str(channel_id), check_targeting=False)
                             if channel_id and directv_dai.enabled(config) else None)
                     if mine:
                         config = {**config, 'directv_playback': {**(config.get('directv_playback') or {}),
@@ -521,15 +521,19 @@ def _bearer_tag(config) -> str:
     return hashlib.sha256(str((config or {}).get('bearer_token') or '').encode()).hexdigest()[:12]
 
 
-def _device_session(cache, config, ccid: str) -> dict | None:
-    """The requesting bridge box's own saved DAI session for this channel, if still good."""
+def _device_session(cache, config, ccid: str, check_targeting: bool = True) -> dict | None:
+    """The requesting bridge box's own saved DAI session for this channel, if still good.
+    ``check_targeting=False`` for the license path: the license must carry the play token
+    of the session the box is already playing, even if newer targeting has arrived since
+    (its next tune gets a fresh session)."""
     from . import directv_dai
     address = directv_dai._current_bridge_address()
     mine = (((cache or {}).get(DEVICE_SESSIONS) or {}).get(address) or {}).get(ccid) if address else None
     if (not isinstance(mine, dict) or mine.get('bearer_tag') != _bearer_tag(config)
             or time.time() - float(mine.get('cached_at') or 0) >= _device_session_ttl()
             or not directv_dai.cached_url_usable(mine, True)
-            or not directv_dai.session_current(mine, config, (cache or {}).get('dai_channel_names'), ccid)):
+            or (check_targeting and not directv_dai.session_current(
+                mine, config, (cache or {}).get('dai_channel_names'), ccid))):
         return None
     return {k: v for k, v in mine.items() if k != 'bearer_tag'}
 
@@ -724,7 +728,11 @@ def _register_relay_hooks(app) -> None:
             if (request.path.startswith(RELAY_PREFIX) and request.headers.get('X-Forwarded-For')
                     and time.time() - _proxy_noted[0] > 60):
                 from . import directv_dai, directv_dai_device
-                if directv_dai.dai_on() and not directv_dai_device._bridge_address(request.remote_addr or ''):
+                forwarded = request.headers.get('X-Forwarded-For').split(',')[0].strip()
+                # Only when a bridge box itself is behind the proxy (its address arrives in
+                # X-Forwarded-For); a proxied non-box client (e.g. Channels) is fine.
+                if (directv_dai.dai_on() and directv_dai_device._bridge_address(forwarded)
+                        and not directv_dai_device._bridge_address(request.remote_addr or '')):
                     _proxy_noted[0] = time.time()
                     _note('proxied', f'request from {request.remote_addr} with X-Forwarded-For')
         except Exception:
@@ -1190,6 +1198,7 @@ _ADMIN_JS = r"""
         if (d.playing) parts.push(`${d.playing} skipped — ${d.playing === 1 ? 'a device is' : 'devices are'} playing (re-run when idle)`);
         if (d.unreachable) parts.push(`${d.unreachable} couldn't be reached (check ${d.unreachable === 1 ? "it's" : "they're"} on and connected)`);
         if (d.none) parts.push(`${d.none} with no advertising ID`);
+        if (d.busy) parts.push(`${d.busy} already being captured (try again in a moment)`);
         message = parts.join('; ') + '.';
       } else if (d.enabled !== false) { message = d.error || 'Capture failed'; }
     } catch (e) { message = 'Network error'; }

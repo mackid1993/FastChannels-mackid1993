@@ -5,12 +5,12 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
  the inserted-ad audio fix, wired in by one hook
 
 ---
- app/scrapers/directv_dai.py         | 1537 +++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py         | 1543 +++++++++++++++++++++++++++
  app/scrapers/directv_dai_device.py  |  425 ++++++++
- app/scrapers/directv_dai_install.py | 1225 +++++++++++++++++++++
+ app/scrapers/directv_dai_install.py | 1234 +++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 +
  app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++
- 5 files changed, 3899 insertions(+)
+ 5 files changed, 3914 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -19,10 +19,10 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..419bb81
+index 0000000..92289ef
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,1537 @@
+@@ -0,0 +1,1543 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -605,10 +605,15 @@ index 0000000..419bb81
 +        _adid_inflight.add(address)
 +    rdb, lock_key = _redis(), f'directv_dai:capture:{address}'
 +    try:
-+        if rdb is not None and not rdb.set(lock_key, '1', nx=True, ex=180):
-+            return 'none'   # another worker is capturing this box right now
++        busy = rdb is not None and not rdb.set(lock_key, '1', nx=True, ex=180)
 +    except Exception:
-+        pass
++        busy, rdb = False, None
++    if busy:
++        # Another worker is capturing this box right now: clear OUR mark (so a later run
++        # here isn't blocked) and leave its lock alone.
++        with _adid_lock:
++            _adid_inflight.discard(address)
++        return 'busy'
 +    try:
 +        if not _reachable(address):
 +            return 'unreachable'   # box off / adb down; kept pending so a re-run picks it up
@@ -669,7 +674,7 @@ index 0000000..419bb81
 +    an explicit action (DAI toggle-on, or the admin capture button) — never on a schedule
 +    and never at tune time. Must run inside a Flask app context (device list + store)."""
 +    addrs = addresses if addresses is not None else _bridge_addresses()
-+    counts = {'captured': 0, 'playing': 0, 'unreachable': 0, 'none': 0}
++    counts = {'captured': 0, 'playing': 0, 'unreachable': 0, 'none': 0, 'busy': 0}
 +    for addr in addrs:
 +        counts[_capture_and_store(addr)] += 1
 +    if counts['captured']:
@@ -782,7 +787,8 @@ index 0000000..419bb81
 +    (rate-limited) and report it in red on the panel until a tune carries one."""
 +    try:
 +        from .directv_dai_install import _note
-+        if have:
++        if have or not profiles_supported(config):
++            # A web (email/password) session can't run viewer profiles: nothing to report.
 +            _note('profid_ok')
 +            return
 +        _note('no_profid', 'no viewer profile set yet; running as the account\'s default profile '
@@ -1993,10 +1999,10 @@ index 0000000..a5c8b4a
 +    return {'manufacturer': manufacturer, 'model': model} if manufacturer else None
 diff --git a/app/scrapers/directv_dai_install.py b/app/scrapers/directv_dai_install.py
 new file mode 100644
-index 0000000..c045f1c
+index 0000000..2d64803
 --- /dev/null
 +++ b/app/scrapers/directv_dai_install.py
-@@ -0,0 +1,1225 @@
+@@ -0,0 +1,1234 @@
 +"""Wires DirecTV DAI into upstream FastChannels at runtime, from ONE line in create_app.
 +
 +Upstream's files carry a single hook (``directv_dai_install.install(app)`` in
@@ -2428,7 +2434,7 @@ index 0000000..c045f1c
 +                    config = bound.arguments.get('config')
 +                    channel_id = bound.arguments.get('channel_id')
 +                    # The license must carry the play token of the session THIS box plays.
-+                    mine = (_device_session(config, config, str(channel_id))
++                    mine = (_device_session(config, config, str(channel_id), check_targeting=False)
 +                            if channel_id and directv_dai.enabled(config) else None)
 +                    if mine:
 +                        config = {**config, 'directv_playback': {**(config.get('directv_playback') or {}),
@@ -2520,15 +2526,19 @@ index 0000000..c045f1c
 +    return hashlib.sha256(str((config or {}).get('bearer_token') or '').encode()).hexdigest()[:12]
 +
 +
-+def _device_session(cache, config, ccid: str) -> dict | None:
-+    """The requesting bridge box's own saved DAI session for this channel, if still good."""
++def _device_session(cache, config, ccid: str, check_targeting: bool = True) -> dict | None:
++    """The requesting bridge box's own saved DAI session for this channel, if still good.
++    ``check_targeting=False`` for the license path: the license must carry the play token
++    of the session the box is already playing, even if newer targeting has arrived since
++    (its next tune gets a fresh session)."""
 +    from . import directv_dai
 +    address = directv_dai._current_bridge_address()
 +    mine = (((cache or {}).get(DEVICE_SESSIONS) or {}).get(address) or {}).get(ccid) if address else None
 +    if (not isinstance(mine, dict) or mine.get('bearer_tag') != _bearer_tag(config)
 +            or time.time() - float(mine.get('cached_at') or 0) >= _device_session_ttl()
 +            or not directv_dai.cached_url_usable(mine, True)
-+            or not directv_dai.session_current(mine, config, (cache or {}).get('dai_channel_names'), ccid)):
++            or (check_targeting and not directv_dai.session_current(
++                mine, config, (cache or {}).get('dai_channel_names'), ccid))):
 +        return None
 +    return {k: v for k, v in mine.items() if k != 'bearer_tag'}
 +
@@ -2723,7 +2733,11 @@ index 0000000..c045f1c
 +            if (request.path.startswith(RELAY_PREFIX) and request.headers.get('X-Forwarded-For')
 +                    and time.time() - _proxy_noted[0] > 60):
 +                from . import directv_dai, directv_dai_device
-+                if directv_dai.dai_on() and not directv_dai_device._bridge_address(request.remote_addr or ''):
++                forwarded = request.headers.get('X-Forwarded-For').split(',')[0].strip()
++                # Only when a bridge box itself is behind the proxy (its address arrives in
++                # X-Forwarded-For); a proxied non-box client (e.g. Channels) is fine.
++                if (directv_dai.dai_on() and directv_dai_device._bridge_address(forwarded)
++                        and not directv_dai_device._bridge_address(request.remote_addr or '')):
 +                    _proxy_noted[0] = time.time()
 +                    _note('proxied', f'request from {request.remote_addr} with X-Forwarded-For')
 +        except Exception:
@@ -3189,6 +3203,7 @@ index 0000000..c045f1c
 +        if (d.playing) parts.push(`${d.playing} skipped — ${d.playing === 1 ? 'a device is' : 'devices are'} playing (re-run when idle)`);
 +        if (d.unreachable) parts.push(`${d.unreachable} couldn't be reached (check ${d.unreachable === 1 ? "it's" : "they're"} on and connected)`);
 +        if (d.none) parts.push(`${d.none} with no advertising ID`);
++        if (d.busy) parts.push(`${d.busy} already being captured (try again in a moment)`);
 +        message = parts.join('; ') + '.';
 +      } else if (d.enabled !== false) { message = d.error || 'Capture failed'; }
 +    } catch (e) { message = 'Network error'; }
