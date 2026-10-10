@@ -659,53 +659,87 @@ def _current_device_ad_flags() -> dict:
     return device_ad_flags(device._client_device(), _saved_adids().get(address or ''))
 
 
-_ZIP_TRIED: dict[str, float] = {}   # bearer tag -> when a background ZIP fetch started
-_ZIP_RETRY = 3600
+# The billing ZIP (bZipCode) is part of the account's targeting and every DAI session must
+# carry it. Sign-in fetches it (store_login_result) and turning DAI on fetches it
+# (settings_changed), both before any tune. If a tune still finds none stored (an older
+# session, or that lookup failed), it fetches it right then: only the location lookup,
+# with a short timeout, one fetch per sign-in at a time (concurrent tunes wait for it),
+# saved to dai_zip so it happens once. A failed lookup is retried after _ZIP_RETRY.
+_ZIP_TIMEOUT = 6
+_ZIP_RETRY = 30
+_ZIP_FOUND: dict[str, str] = {}          # bearer tag -> zip (this process)
+_ZIP_FAILED: dict[str, float] = {}       # bearer tag -> when a lookup last failed
+_ZIP_INFLIGHT: dict[str, threading.Event] = {}
 _zip_lock = threading.Lock()
 
 
+def _bearer_tag(bearer: str) -> str:
+    import hashlib
+    return hashlib.sha256(bearer.encode()).hexdigest()[:12]
+
+
 def _account_zip(config: dict) -> str | None:
-    """The account's billing ZIP (for bZipCode) when login didn't store one yet. A tune
-    never waits on DirecTV for it: the tune goes without bZipCode, and the account's
-    targeting values are fetched in the background and saved (dai_zip and friends), so
-    later tunes carry it. At most one fetch per sign-in per hour per process."""
+    """The account's billing ZIP for a tune whose config has no dai_zip: fetched now
+    (bounded, single-flight per sign-in) and saved, so this tune already carries it."""
     bearer = str(config.get('bearer_token') or '')
     if not bearer:
         return None
-    import hashlib
-    tag = hashlib.sha256(bearer.encode()).hexdigest()[:12]
-    now = time.time()
+    tag = _bearer_tag(bearer)
     with _zip_lock:
-        if now - _ZIP_TRIED.get(tag, 0) < _ZIP_RETRY:
+        if tag in _ZIP_FOUND:
+            return _ZIP_FOUND[tag]
+        if time.time() - _ZIP_FAILED.get(tag, 0) < _ZIP_RETRY:
             return None
-        for k in [k for k, t in _ZIP_TRIED.items() if now - t >= _ZIP_RETRY]:
-            del _ZIP_TRIED[k]
-        _ZIP_TRIED[tag] = now
-    device.spawn(_fetch_and_store_account_context, bearer)
-    return None
+        done = _ZIP_INFLIGHT.get(tag)
+        leader = done is None
+        if leader:
+            done = _ZIP_INFLIGHT[tag] = threading.Event()
+    if not leader:
+        done.wait(_ZIP_TIMEOUT + 1)
+        return _ZIP_FOUND.get(tag)
+    zip_code = None
+    try:
+        account = requests.Session()
+        account.headers.update(_up('app_headers')())
+        ctx = fetch_location_context(account, bearer, timeout=_ZIP_TIMEOUT)
+        zip_code = ctx.get('zip')
+        if zip_code:
+            with _zip_lock:
+                if len(_ZIP_FOUND) > 64:
+                    _ZIP_FOUND.clear()
+                _ZIP_FOUND[tag] = zip_code
+            _save_account_values(bearer, {f'dai_{k}': v for k, v in ctx.items() if v})
+        else:
+            with _zip_lock:
+                _ZIP_FAILED[tag] = time.time()
+            logger.warning('[directv-dai] no billing ZIP from the account lookup; this tune goes without '
+                           'bZipCode (retried in %ss)', _ZIP_RETRY)
+    except Exception as exc:
+        with _zip_lock:
+            _ZIP_FAILED[tag] = time.time()
+        logger.warning('[directv-dai] billing ZIP lookup failed (%s); retried in %ss', exc, _ZIP_RETRY)
+    finally:
+        with _zip_lock:
+            _ZIP_INFLIGHT.pop(tag, None)
+        done.set()
+    return zip_code
 
 
-def _fetch_and_store_account_context(bearer: str) -> None:
-    """Background: the account's DMA/ZIP/consent with this bearer, saved to the DirecTV
-    source config for every value it found (only if that sign-in is still current)."""
-    account = requests.Session()
-    account.headers.update(_up('app_headers')())
-    ctx = fetch_account_context(account, bearer)
-    updates = {f'dai_{k}': v for k, v in ctx.items() if v}
-    if not updates.get('dai_zip'):
-        logger.warning('[directv-dai] the account lookup returned no billing ZIP; tunes go without '
-                       'bZipCode (retried in %s min)', _ZIP_RETRY // 60)
+def _save_account_values(bearer: str, updates: dict) -> None:
+    """Save account targeting values to the DirecTV source, only if that sign-in is current."""
     if not updates:
         return
-    Source = _up('source_model')
-    src = Source.query.filter_by(name='directv').first()
-    if src is None or (src.config or {}).get('bearer_token') != bearer:
-        return
-    if _up('persist_config')(src.id, updates):
-        logger.info('[directv-dai] fetched the account targeting values (%s)', ', '.join(sorted(updates)))
-    else:
-        logger.warning('[directv-dai] could not save the account targeting values; retried in %s min',
-                       _ZIP_RETRY // 60)
+    try:
+        Source = _up('source_model')
+        src = Source.query.filter_by(name='directv').first()
+        if src is None or (src.config or {}).get('bearer_token') != bearer:
+            return
+        if _up('persist_config')(src.id, updates):
+            logger.info('[directv-dai] saved the account targeting values (%s)', ', '.join(sorted(updates)))
+        else:
+            logger.warning('[directv-dai] could not save the account targeting values (%s)', ', '.join(sorted(updates)))
+    except Exception:
+        logger.warning('[directv-dai] could not save the account targeting values', exc_info=True)
 
 
 def gpp_targeted_ad_opt_out(gpp: str) -> bool | None:
@@ -776,7 +810,8 @@ def store_login_result(cfg: dict, result: dict) -> None:
     # Only with DAI on: with it off, sign-in makes no extra DirecTV requests (turning DAI
     # on fetches them then; see settings_changed).
     if (enabled(cfg) and 'dai_context' not in result and result.get('bearer_token')
-            and (result.get('auth_method') == 'device_code' or not cfg.get('dai_dma_id'))):
+            and (result.get('auth_method') == 'device_code' or not cfg.get('dai_dma_id')
+                 or not cfg.get('dai_zip'))):
         try:
             account = requests.Session()
             account.headers.update(_up('app_headers')())
@@ -800,6 +835,32 @@ def store_login_result(cfg: dict, result: dict) -> None:
             cfg[f'dai_{k}'] = v
 
 
+def fetch_location_context(session, bearer: str, timeout: float = 15) -> dict:
+    """The account's DMA and billing ZIP from the location service ({} on any failure)."""
+    ctx: dict = {}
+    try:
+        app = dict(_up('app_headers')() or {})
+    except Exception:
+        app = {}
+    hdrs = {**app, 'Accept': 'application/json, text/plain, */*', 'Authorization': f'Bearer {bearer}'}
+    try:
+        r = session.get(_LOCATION_URL, params={'includeTVOD': 'false'}, headers=hdrs, timeout=timeout)
+        if r.ok:
+            data = r.json()
+            dma = _find_first_key(data, 'dmaId')
+            if dma:
+                ctx['dma_id'] = str(dma)
+            billing = data.get('billingDmas') if isinstance(data, dict) else None
+            zip_code = _find_first_key(billing, 'zipcode') or _find_first_key(data, 'zipcode')
+            if zip_code:
+                ctx['zip'] = str(zip_code)
+        else:
+            logger.warning('[directv-dai] location lookup HTTP %s', r.status_code)
+    except Exception as exc:
+        logger.warning('[directv-dai] location lookup failed: %s', exc)
+    return ctx
+
+
 def fetch_account_context(session, bearer: str) -> dict:
     """Best-effort fetch of the account's real DMA and privacy-consent string, the
     values DirecTV's apps put on their DAI session request. Sent as the same client as
@@ -812,19 +873,7 @@ def fetch_account_context(session, bearer: str) -> dict:
     except Exception:
         app = {}
     hdrs = {**app, 'Accept': 'application/json, text/plain, */*', 'Authorization': f'Bearer {bearer}'}
-    try:
-        r = session.get(_LOCATION_URL, params={'includeTVOD': 'false'}, headers=hdrs, timeout=15)
-        if r.ok:
-            data = r.json()
-            dma = _find_first_key(data, 'dmaId')
-            if dma:
-                ctx['dma_id'] = str(dma)
-            billing = data.get('billingDmas') if isinstance(data, dict) else None
-            zip_code = _find_first_key(billing, 'zipcode') or _find_first_key(data, 'zipcode')
-            if zip_code:
-                ctx['zip'] = str(zip_code)
-    except Exception as exc:
-        logger.debug('[directv-dai] location lookup failed: %s', exc)
+    ctx.update(fetch_location_context(session, bearer))
     try:
         r = session.get(_BASICINFO_URL, params={'requestIds': 'true', 'requestShortIds': 'true'},
                         headers=hdrs, timeout=15)
@@ -1118,8 +1167,10 @@ def settings_changed(source, old: dict, current: dict) -> None:
     devices' ad ids, and fetch the account's targeting values if they're missing."""
     _DAI_ON[0] = 0.0
     clear_cache_if_toggled(source, old, current)
-    if enabled(current) and not current.get('dai_dma_id') and current.get('bearer_token'):
-        device.spawn(_fetch_missing_account_context, source.id)
+    if (enabled(current) and current.get('bearer_token')
+            and not (current.get('dai_dma_id') and current.get('dai_zip'))):
+        # In the save request itself, so the values are stored before the next tune.
+        _fetch_missing_account_context(source.id)
 
 
 def _fetch_missing_account_context(source_id: int) -> None:
@@ -1129,12 +1180,15 @@ def _fetch_missing_account_context(source_id: int) -> None:
     Source = _up('source_model')
     src = Source.query.get(source_id)
     cfg = dict((src.config if src else None) or {})
-    if not cfg.get('bearer_token') or cfg.get('dai_dma_id'):
+    if not cfg.get('bearer_token') or (cfg.get('dai_dma_id') and cfg.get('dai_zip')):
         return
     account = requests.Session()
     account.headers.update(_up('app_headers')())
     ctx = fetch_account_context(account, cfg['bearer_token'])
     updates = {f'dai_{k}': v for k, v in ctx.items() if v}
+    if not updates.get('dai_zip'):
+        logger.warning('[directv-dai] turning DAI on: the account lookup returned no billing ZIP; '
+                       'the first tune will look it up again')
     if updates:
         persist_source_config_updates(source_id, updates)
         logger.info('[directv-dai] fetched the account targeting values (%s)', ', '.join(sorted(updates)))

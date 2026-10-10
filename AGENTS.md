@@ -132,7 +132,7 @@ Invariants a port must keep:
 - DAI params are merged with exact-key dedup: a key already in the URL is never duplicated or overridden.
 - Changing the toggle must clear the cached playback URLs.
 - Never log token values or account values. Field names only.
-- Nothing in a tune or relay fetch waits on the network beyond the one channel authorization: the bridge-device list is cached (single-flight, stale-while-refresh), and the billing ZIP is fetched in the background.
+- Nothing in a tune or relay fetch waits on the network beyond the one channel authorization: the bridge-device list is cached (single-flight, stale-while-refresh). The one exception: a tune with no stored `dai_zip` looks the billing ZIP up before it goes out (bounded, once per sign-in), because every DAI session must carry `bZipCode`.
 - Config writes go through `persist_config` (merged under upstream's per-source lock), never a commit of a config copied earlier.
 
 ## Resolving a conflict (and repairing drift)

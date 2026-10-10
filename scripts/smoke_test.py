@@ -1024,21 +1024,48 @@ finally:
     device.spawn = _real_spawn
     device.forget_bridge_devices()
 
-# 2. A tune never waits on DirecTV for the billing ZIP: it is fetched in the background.
-_real_fac, _real_spawn2 = dai.fetch_account_context, device.spawn
-_bg = []
+# 2. Every DAI session carries the billing ZIP. Sign-in and turning DAI on store it; a
+# tune that still finds none fetches it right then (location lookup only, single-flight,
+# saved), so even the first tune of a new sign-in carries bZipCode.
+_real_flc = dai.fetch_location_context
+_lookups = []
 try:
-    dai.fetch_account_context = lambda *a, **k: (_ for _ in ()).throw(AssertionError('ZIP fetched inside a tune'))
-    device.spawn = lambda fn, *a: _bg.append(fn.__name__)
-    dai._ZIP_TRIED.clear()
+    dai.fetch_location_context = lambda s, b, timeout=15: (_lookups.append(b) or {'zip': '10965', 'dma_id': '501'})
+    dai._ZIP_FOUND.clear(); dai._ZIP_FAILED.clear()
     _q = dai.build_query({'use_dai': 'true', 'bearer_token': 'zip-bearer'}, {}, '123')
-    assert 'bZipCode' not in _q and _bg == ['_fetch_and_store_account_context'], (_q.get('bZipCode'), _bg)
+    assert _q.get('bZipCode') == '10965', f'the first tune of a sign-in went without bZipCode: {_q.get("bZipCode")}'
     dai.build_query({'use_dai': 'true', 'bearer_token': 'zip-bearer'}, {}, '123')
-    assert _bg == ['_fetch_and_store_account_context'], f'the ZIP fetch was queued on every tune: {_bg}'
-    assert dai.build_query({'dai_zip': '10965', 'bearer_token': 'zip-bearer'}, {}, '1')['bZipCode'] == '10965'
+    assert _lookups == ['zip-bearer'], f'the ZIP was looked up again on every tune: {_lookups}'
+    # Concurrent first tunes share one lookup.
+    dai._ZIP_FOUND.clear(); _lookups.clear()
+    _gate = _th.Event()
+    dai.fetch_location_context = lambda s, b, timeout=15: (_gate.wait(2), _lookups.append(b), {'zip': '10965'})[2]
+    _out = []
+    _ts = [_th.Thread(target=lambda: _out.append(dai._account_zip({'bearer_token': 'zip-2'}))) for _ in range(3)]
+    for _x in _ts: _x.start()
+    _t.sleep(0.2); _gate.set()
+    for _x in _ts: _x.join(5)
+    assert _out == ['10965'] * 3 and _lookups == ['zip-2'], (_out, _lookups)
+    # A failed lookup: that tune goes without (never invented), retried shortly after.
+    dai._ZIP_FOUND.clear(); dai._ZIP_FAILED.clear(); _lookups.clear()
+    dai.fetch_location_context = lambda s, b, timeout=15: (_lookups.append(b) or {})
+    assert 'bZipCode' not in dai.build_query({'bearer_token': 'zip-3'}, {}, '1')
+    dai.build_query({'bearer_token': 'zip-3'}, {}, '1')
+    assert len(_lookups) == 1, 'a failed ZIP lookup was hammered on every tune'
+    assert dai.build_query({'dai_zip': '10965', 'bearer_token': 'zip-3'}, {}, '1')['bZipCode'] == '10965'
+    # Sign-in fetches the account values even for a non-code session missing the ZIP.
+    _real_fac = dai.fetch_account_context
+    _fetched = []
+    dai.fetch_account_context = lambda session, bearer: (_fetched.append(bearer) or {'zip': '10965', 'dma_id': '501'})
+    try:
+        _c = {'use_dai': 'true', 'dai_dma_id': '501'}
+        dai.store_login_result(_c, {'bearer_token': 'web', 'auth_method': 'curl_cffi'})
+        assert _fetched == ['web'] and _c.get('dai_zip') == '10965', _c
+    finally:
+        dai.fetch_account_context = _real_fac
 finally:
-    dai.fetch_account_context, device.spawn = _real_fac, _real_spawn2
-    dai._ZIP_TRIED.clear()
+    dai.fetch_location_context = _real_flc
+    dai._ZIP_FOUND.clear(); dai._ZIP_FAILED.clear()
 
 # 3. A box's own DAI session lives exactly as long as upstream's playback cache.
 assert install._device_session_ttl() == float(up('playback_cache_ttl')), \
