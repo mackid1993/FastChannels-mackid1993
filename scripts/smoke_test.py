@@ -237,17 +237,25 @@ assert 'comscore_device' not in query, 'comscore_device only comes from a real b
 _SHOWN = 'Android_Amazon_AFTKRT'
 fire = {'manufacturer': 'Amazon', 'model': 'AFTKRT', 'board': 'karat', 'release': '11',
         'limit_ad_tracking': '0', 'android_id': 'abcdef0123456789'}
-_cap = {'advertising_id': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', 'optout': False}
+# The prefix names the id's own kind: a Fire OS capture (source 'fire') is an Amazon
+# advertising id (the app's Fire TV branch: amazon_advertising_id:), a Play Services
+# capture (source 'gms') keeps google_advertising_id:.
+_cap = {'advertising_id': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', 'optout': False, 'source': 'fire'}
 assert dai.device_ad_flags(fire, _cap) == {'comscore_device': _SHOWN, 'is_lat': '0',
-    '_fw_did': 'google_advertising_id:bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f',
+    '_fw_did': 'amazon_advertising_id:bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f',
     'adid': 'bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f'}
-assert dai.device_ad_flags(fire, {'advertising_id': '', 'optout': True})['_fw_did'] == 'google_advertising_id:optout'
-assert dai.device_ad_flags(fire, {'advertising_id': '00000000-0000-0000-0000-000000000000', 'optout': False}
-    )['_fw_did'] == 'google_advertising_id:optout', 'an all-zero (deleted) id is the optout form, never sent as an id'
+assert dai.device_ad_flags(_gtv_pre := {'manufacturer': 'onn', 'model': 'onn. 4K Plus Streaming'},
+    {**_cap, 'source': 'gms'})['_fw_did'] == 'google_advertising_id:bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', \
+    'a Play Services id keeps the Google prefix'
+assert dai.device_ad_flags(fire, {'advertising_id': _cap['advertising_id'], 'optout': False}
+    )['_fw_did'].startswith('amazon_advertising_id:'), 'an Amazon box with no recorded source is a Fire OS id'
+assert dai.device_ad_flags(fire, {'advertising_id': '', 'optout': True, 'source': 'fire'})['_fw_did'] == 'amazon_advertising_id:optout'
+assert dai.device_ad_flags(fire, {'advertising_id': '00000000-0000-0000-0000-000000000000', 'optout': False, 'source': 'fire'}
+    )['_fw_did'] == 'amazon_advertising_id:optout', 'an all-zero (deleted) id is the optout form, never sent as an id'
 # No captured advertising id -> android_id last resort; limited tracking -> optout form.
 assert dai.device_ad_flags(fire) == {'comscore_device': _SHOWN, 'is_lat': '0',
     '_fw_did': 'android_id:abcdef0123456789'}
-assert dai.device_ad_flags({**fire, 'limit_ad_tracking': '1'})['_fw_did'] == 'google_advertising_id:optout'
+assert dai.device_ad_flags({**fire, 'limit_ad_tracking': '1'})['_fw_did'] == 'amazon_advertising_id:optout'
 shield = {'manufacturer': 'NVIDIA', 'model': 'SHIELD Android TV', 'android_id': 'abcdef0123456789'}
 assert dai.device_ad_flags(shield) == {'comscore_device': 'Android_NVIDIA_SHIELDAndroidTV', 'is_lat': '0',
     '_fw_did': 'android_id:abcdef0123456789'}
@@ -331,6 +339,10 @@ _gaid_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8'},
     {'_fw_did': 'google_advertising_id:bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f'})
 assert not dai.cached_url_usable({'fallback_url': _gaid_url, 'dai': True}, True), \
     "a non-bridge requester must not reuse another device's real-GAID session"
+for _amz in ('amazon_advertising_id:bb650b6a-5432-4dd2-9c0d-c0e4d9f7127f', 'amazon_advertising_id:optout'):
+    _amz_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8'}, {'_fw_did': _amz})
+    assert not dai.cached_url_usable({'fallback_url': _amz_url, 'dai': True}, True), \
+        f"a non-bridge requester must not reuse a Fire TV box's session ({_amz.split(':')[1][:6]})"
 _optout_url = dai.pick_stream_url({'streamURL': 'https://x.yospace.com/a.m3u8'},
     {'_fw_did': 'google_advertising_id:optout'})
 assert dai.cached_url_usable({'fallback_url': _optout_url, 'dai': True}, True), \

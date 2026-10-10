@@ -197,11 +197,12 @@ def cached_url_usable(cached: dict | None, dai: bool) -> bool:
         if fw_did:
             return f'_fw_did={quote(fw_did, safe=",:~")}' in url
         # Not a bridge device (e.g. Channels playing the URL itself): reuse only a session
-        # not pinned to a specific device. Reject a cached android_id OR a real advertising
-        # id; the shared google_advertising_id:optout form is fine (a non-bridge requester
-        # produces that itself from the account's consent).
+        # not pinned to a specific device. Reject a cached android_id, a real advertising
+        # id, or a device's own optout form; only the shared google_advertising_id:optout
+        # (what a non-bridge requester produces itself from the account's consent) is fine.
         return ('_fw_did=android_id:' not in url
-                and not re.search(r'_fw_did=google_advertising_id:(?!optout)', url))
+                and not re.search(r'_fw_did=google_advertising_id:(?!optout)', url)
+                and '_fw_did=amazon_advertising_id:' not in url)
     return True
 
 
@@ -271,15 +272,25 @@ def build_query(config: dict, dai_channel_names: dict, ccid: str, zip_lookup: bo
     return q
 
 
+def _fw_did_prefix(ad_id: dict | None, props: dict) -> str:
+    """FreeWheel's id-type prefix for this device's advertising id: Amazon's for an id
+    read from Fire OS (capture source 'fire', or an Amazon box with no recorded source),
+    Google's otherwise."""
+    source = (ad_id or {}).get('source')
+    if source == 'fire' or (not source and str(props.get('manufacturer', '')).lower() == 'amazon'):
+        return 'amazon_advertising_id:'
+    return 'google_advertising_id:'
+
+
 def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
     """The device ad flags the DirecTV Android TV app sends, built from this bridge
     device's own values. Priority, matching the app:
     - The device's real platform advertising id, when one was captured for it
-      (``ad_id`` from capture_registered_devices): google_advertising_id:<id> +
-      adid=<id> with is_lat=0 — exactly what the app sends. is_lat=0 is what
+      (``ad_id`` from capture_registered_devices): amazon_advertising_id:<id> for a
+      Fire OS id, google_advertising_id:<id> for a Play Services id, + adid=<id> with is_lat=0 — exactly what the app sends. is_lat=0 is what
       gets local and political ads.
     - Its opted-out form when that advertising id was deleted/limited (``ad_id``
-      optout, or Fire OS limit_ad_tracking=1): google_advertising_id:optout,
+      optout, or Fire OS limit_ad_tracking=1): <prefix>optout,
       adid=optout, is_lat=1.
     - Absolute last resort, when no advertising id can be read: _fw_did=android_id:
       <Android ID> with is_lat=0. DirecTV's own prefix for an Android device id,
@@ -299,10 +310,16 @@ def device_ad_flags(props: dict, ad_id: dict | None = None) -> dict:
     optout = bool((ad_id or {}).get('optout')) or gaid == _ZERO_GAID
     if gaid == _ZERO_GAID:
         gaid = ''
+    # The id's own kind, from where it was captured: a Fire OS id (Settings.Secure) is an
+    # Amazon advertising id, which DirecTV's Fire TV build sends as amazon_advertising_id:
+    # (makeFWAdvertisingIdFn(ADID_PREFIX_FIRETV)); a Google Play Services id keeps
+    # google_advertising_id:. Labelling an Amazon id as Google's hid it from the identity
+    # match (David, 2026-10-10). d stays android_tv.
+    prefix = _fw_did_prefix(ad_id, props)
     if gaid and not optout:
-        flags.update({'is_lat': '0', '_fw_did': f'google_advertising_id:{gaid}', 'adid': gaid})
+        flags.update({'is_lat': '0', '_fw_did': f'{prefix}{gaid}', 'adid': gaid})
     elif optout or props.get('limit_ad_tracking') == '1':
-        flags.update({'is_lat': '1', '_fw_did': 'google_advertising_id:optout', 'adid': 'optout'})
+        flags.update({'is_lat': '1', '_fw_did': f'{prefix}optout', 'adid': 'optout'})
     elif len(props.get('android_id', '')) >= 8:
         flags.update({'is_lat': '0', '_fw_did': f"android_id:{props['android_id']}"})
     return flags
