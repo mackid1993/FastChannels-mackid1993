@@ -431,7 +431,7 @@ def _patch_scraper() -> None:
                         a, kw = bound.args[1:], bound.kwargs
                 except Exception:
                     logger.exception('[directv-dai] could not read the license request config')
-                token = _TUNE.set((config, None, {'called': False, 'dai': False}) if config else None)
+                token = _TUNE.set((config, None, {'called': False, 'dai': False, 'license': True}) if config else None)
                 try:
                     return fn(klass, *a, **kw)
                 finally:
@@ -467,7 +467,9 @@ def _patch_scraper() -> None:
                     b = sig.bind(*args, **kwargs)
                     b.apply_defaults()
                     bound = b.arguments
-                    flags = directv_dai.request_flags(tune[0], tune[1], bound['ccid'])
+                    # The license path's play-token fallback never waits on a ZIP lookup.
+                    lic = len(tune) > 2 and bool((tune[2] or {}).get('license'))
+                    flags = directv_dai.request_flags(tune[0], tune[1], bound['ccid'], zip_lookup=not lic)
                 except Exception:
                     _note('error', 'could not build the DAI request')
                     logger.exception('[directv-dai] could not build the DAI request; playing without DAI')

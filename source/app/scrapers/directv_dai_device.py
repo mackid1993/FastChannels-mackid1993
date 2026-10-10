@@ -187,10 +187,11 @@ def _bridge_address(ip: str) -> str | None:
     if (now - _bridge_miss_at.get(ip, 0) < _BRIDGE_MISS_REFRESH
             or now - _bridge_failed_at[0] < _BRIDGE_FAIL_HOLD):
         return None
-    _bridge_miss_at[ip] = now
-    if len(_bridge_miss_at) > 1024:   # bounded: drop the oldest half
-        for k in sorted(_bridge_miss_at, key=_bridge_miss_at.get)[:512]:
-            _bridge_miss_at.pop(k, None)
+    with _bridge_lock:   # never held across I/O
+        _bridge_miss_at[ip] = now
+        if len(_bridge_miss_at) > 1024:   # bounded: drop the oldest half
+            for k in sorted(_bridge_miss_at, key=_bridge_miss_at.get)[:512]:
+                _bridge_miss_at.pop(k, None)
     done = _start_bridge_refresh()
     if done is not None:
         done.wait(_BRIDGE_MISS_WAIT)

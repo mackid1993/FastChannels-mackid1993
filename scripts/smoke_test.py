@@ -403,20 +403,31 @@ cfg = {}
 dai.store_login_result(cfg, {'bearer_token': f'h.{claims}.s', 'dai_context': {'dma_id': '501'}})
 assert cfg['dai_partner_profile_id'] == 'pp-9' and cfg['dai_dma_id'] == '501'
 assert not {'dai_adid', 'dai_fw_did', 'dai_comscore_device'} & set(cfg), 'random device ids minted'
-# A code sign-in session (opaque tokens) gets its DMA/consent fetched with its bearer.
-_fetched = []
+# A code sign-in session (opaque tokens) gets its DMA/consent fetched with its bearer, in
+# the background: nothing slow runs inside upstream's read-modify-commit of the config.
+_spawned_fetch = []
+_real_spawn_si = device.spawn
 _real_fac = dai.fetch_account_context
-dai.fetch_account_context = lambda session, bearer: (_fetched.append(bearer) or {'dma_id': '501', 'gpp_sid': '7'})
+dai.fetch_account_context = lambda *a, **k: (_ for _ in ()).throw(AssertionError('account lookup ran inside apply_auth_result'))
+device.spawn = lambda fn, *a: _spawned_fetch.append((fn.__name__, a))
 try:
     cfg = {'use_dai': 'true'}
     dai.store_login_result(cfg, {'bearer_token': 'opaque', 'auth_method': 'device_code', 'partner_profile_id': 'pp-1'})
-    assert _fetched == ['opaque'] and cfg['dai_dma_id'] == '501' and cfg['dai_partner_profile_id'] == 'pp-1', cfg
+    assert _spawned_fetch == [('_fetch_account_values_after_signin', ('opaque',))] and cfg['dai_partner_profile_id'] == 'pp-1', (_spawned_fetch, cfg)
     # With DAI off, a sign-in makes no extra DirecTV requests (turning DAI on fetches them).
-    _fetched.clear(); cfg = {}
+    _spawned_fetch.clear(); cfg = {}
     dai.store_login_result(cfg, {'bearer_token': 'opaque', 'auth_method': 'device_code', 'partner_profile_id': 'pp-1'})
-    assert _fetched == [] and 'dai_dma_id' not in cfg and cfg['dai_partner_profile_id'] == 'pp-1', cfg
+    assert _spawned_fetch == [] and 'dai_dma_id' not in cfg and cfg['dai_partner_profile_id'] == 'pp-1', cfg
+    # A sign-in to a different account drops the previous account's values and profile.
+    cfg = {'dai_account': 'pp-1', 'dai_zip': '10965', 'dai_dma_id': '501', 'dtv_android_profid': 'x'}
+    dai.store_login_result(cfg, {'bearer_token': 'opaque', 'auth_method': 'curl_cffi', 'partner_profile_id': 'pp-OTHER'})
+    assert cfg['dai_account'] == 'pp-OTHER' and not {'dai_zip', 'dai_dma_id', 'dtv_android_profid'} & set(cfg), cfg
+    cfg = {'dai_account': 'pp-1', 'dai_zip': '10965'}
+    dai.store_login_result(cfg, {'bearer_token': 'opaque', 'partner_profile_id': 'pp-1'})
+    assert cfg['dai_zip'] == '10965', 'the same account lost its values on a refresh'
 finally:
     dai.fetch_account_context = _real_fac
+    device.spawn = _real_spawn_si
 
 
 class _Scraper:
@@ -1032,6 +1043,8 @@ _lookups = []
 try:
     dai.fetch_location_context = lambda s, b, timeout=15: (_lookups.append(b) or {'zip': '10965', 'dma_id': '501'})
     dai._ZIP_FOUND.clear(); dai._ZIP_FAILED.clear()
+    _real_sav = dai._save_account_values
+    dai._save_account_values = lambda *a, **k: True
     _q = dai.build_query({'use_dai': 'true', 'bearer_token': 'zip-bearer'}, {}, '123')
     assert _q.get('bZipCode') == '10965', f'the first tune of a sign-in went without bZipCode: {_q.get("bZipCode")}'
     dai.build_query({'use_dai': 'true', 'bearer_token': 'zip-bearer'}, {}, '123')
@@ -1052,17 +1065,59 @@ try:
     assert 'bZipCode' not in dai.build_query({'bearer_token': 'zip-3'}, {}, '1')
     dai.build_query({'bearer_token': 'zip-3'}, {}, '1')
     assert len(_lookups) == 1, 'a failed ZIP lookup was hammered on every tune'
+    assert dai._ZIP_FAILED[dai._bearer_tag('zip-3')][1] == dai._ZIP_RETRY
+    # The service answered but has no ZIP for the account: not asked again this sign-in.
+    _lookups.clear()
+    dai.fetch_location_context = lambda s, b, timeout=15: (_lookups.append(b) or {'dma_id': '501'})
+    dai._account_zip({'bearer_token': 'zip-4'})
+    assert dai._ZIP_FAILED[dai._bearer_tag('zip-4')][1] == dai._ZIP_NONE_RETRY, 'a ZIP-less account is retried every 30 s'
+    # A hard deadline: a hung lookup never holds a tune past _ZIP_DEADLINE, and the tune
+    # that started it waits too (it goes without bZipCode, never an invented one).
+    _hang = _th.Event()
+    dai.fetch_location_context = lambda s, b, timeout=15: (_hang.wait(10), {'zip': '10965'})[1]
+    _real_dl, dai._ZIP_DEADLINE = dai._ZIP_DEADLINE, 0.5
+    _t0 = _t.time()
+    assert dai._account_zip({'bearer_token': 'zip-5'}) is None
+    assert _t.time() - _t0 < 2, f'a hung ZIP lookup held the tune {_t.time() - _t0:.1f}s'
+    _hang.set(); dai._ZIP_DEADLINE = _real_dl
+    # Waiters are released as soon as the ZIP is known, before the (slow) save.
+    _save_gate = _th.Event()
+    dai._save_account_values = lambda *a, **k: _save_gate.wait(5)
+    dai.fetch_location_context = lambda s, b, timeout=15: {'zip': '10965'}
+    _t0 = _t.time()
+    assert dai._account_zip({'bearer_token': 'zip-6'}) == '10965'
+    assert _t.time() - _t0 < 2, 'the tune waited for the ZIP to be saved'
+    _save_gate.set()
+    dai._save_account_values = lambda *a, **k: True
+    # The license path's play-token fallback never waits on a ZIP lookup.
+    _lookups.clear()
+    dai.fetch_location_context = lambda s, b, timeout=15: (_lookups.append(b) or {'zip': '10965'})
+    assert 'bZipCode' not in dai.request_flags({'use_dai': 'true', 'bearer_token': 'zip-7'}, {}, '1', zip_lookup=False)
+    assert _lookups == [], 'the license fallback looked the ZIP up'
     assert dai.build_query({'dai_zip': '10965', 'bearer_token': 'zip-3'}, {}, '1')['bZipCode'] == '10965'
-    # Sign-in fetches the account values even for a non-code session missing the ZIP.
-    _real_fac = dai.fetch_account_context
-    _fetched = []
-    dai.fetch_account_context = lambda session, bearer: (_fetched.append(bearer) or {'zip': '10965', 'dma_id': '501'})
+    dai._save_account_values = _real_sav
+    # Sign-in starts the account lookup even for a non-code session missing the ZIP; once
+    # the sign-in is stored it is merged in, and a config write made meanwhile survives.
+    _real_fac, _real_spawn_z = dai.fetch_account_context, device.spawn
+    _bg_fn = []
+    dai.fetch_account_context = lambda session, bearer, timeout=15: {'zip': '10965', 'dma_id': '501'}
+    device.spawn = lambda fn, *a: _bg_fn.append((fn, a))
     try:
         _c = {'use_dai': 'true', 'dai_dma_id': '501'}
         dai.store_login_result(_c, {'bearer_token': 'web', 'auth_method': 'curl_cffi'})
-        assert _fetched == ['web'] and _c.get('dai_zip') == '10965', _c
+        assert [f.__name__ for f, _ in _bg_fn] == ['_fetch_account_values_after_signin'], _bg_fn
+        with app.app_context():
+            _keep = dict(db.session.get(Source, _sid).config)
+            up('persist_config')(_sid, {'bearer_token': 'web', 'dtv_android_profid': 'written-meanwhile'})
+            _bg_fn[0][0](*_bg_fn[0][1])
+            db.session.expire_all()
+            _cfg = db.session.get(Source, _sid).config
+            assert _cfg.get('dai_zip') == '10965' and _cfg.get('dtv_android_profid') == 'written-meanwhile', _cfg
+            # A lookup for a sign-in that is no longer stored is not saved.
+            assert dai._save_account_values('stale-bearer', {'dai_zip': '99999'}) is False
+            _s = db.session.get(Source, _sid); _s.config = _keep; db.session.commit()
     finally:
-        dai.fetch_account_context = _real_fac
+        dai.fetch_account_context, device.spawn = _real_fac, _real_spawn_z
     # The ZIP a tune looks up is saved to the live source row (inside a request, as a tune is).
     dai._ZIP_FOUND.clear(); dai._ZIP_FAILED.clear()
     dai.fetch_location_context = lambda s, b, timeout=15: {'zip': '10965', 'dma_id': '501'}
@@ -1070,6 +1125,11 @@ try:
         _keep = dict(db.session.get(Source, _sid).config)
         up('persist_config')(_sid, {'bearer_token': 'zip-save'})
         assert dai._account_zip({'bearer_token': 'zip-save'}) == '10965'
+        for _ in range(40):   # saved in the background, after the tune is released
+            db.session.expire_all()
+            if db.session.get(Source, _sid).config.get('dai_zip') == '10965':
+                break
+            _t.sleep(0.1)
         db.session.expire_all()
         assert db.session.get(Source, _sid).config.get('dai_zip') == '10965', 'a tune\'s ZIP lookup was not saved'
         _s = db.session.get(Source, _sid)
@@ -1087,6 +1147,13 @@ try:
             dai.settings_changed(_s, {}, _on)   # raises inside: must not propagate
             dai.settings_changed(_s, _on, _on)  # a re-save with DAI already on: no lookup
             assert _fmac == [_sid], f'turning DAI on looked the account up {_fmac}'
+            # A failing cache clear / capture start doesn't fail the save either.
+            _real_ccit = dai.clear_cache_if_toggled
+            dai.clear_cache_if_toggled = lambda *a: (_ for _ in ()).throw(RuntimeError('db locked'))
+            try:
+                dai.settings_changed(_s, {}, {'use_dai': 'true'})
+            finally:
+                dai.clear_cache_if_toggled = _real_ccit
     finally:
         dai._fetch_missing_account_context, dai.capture_in_background = _real_fmac, _real_cib
 finally:
