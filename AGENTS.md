@@ -104,6 +104,14 @@ Our routes (our blueprint): `/directv-dai` (the panel page), `/directv-dai/admin
 
 `TARGETS` and `USES` are dicts keyed by a fixed **role** (`'channel_fetch'`, `'source_model'`, ...) whose value is upstream's `(module, 'name' or 'Class.name')`. The overlay's modules **and `smoke_test.py`** reach upstream only through the role (`install.up(role)`, `up_name`, `up_owner`, `up_set`), never by name, so if upstream renames or moves something, **the fix is that role's value, one line**, and the tests follow it (rehearsed: a rename of `_fetch_channel_playback` plus that one-line change passes `validate.sh` and `smoke_test.py`). **Never edit an upstream file, never rename or drop a role to make a check pass** (the smoke test requires every role).
 
+**A role must point at the thing that does the job, not just at a name that exists.** `smoke_test.py` checks the roles the overlay only reads by what they do in upstream, so picking a look-alike fails with the role named:
+- `playback_cache_ttl` must be the age limit upstream's own `resolve()` applies to its cached `directv_playback` (younger is served from cache, older is fetched again).
+- `code_signin_client_id` must be exactly what upstream's code sign-in sends DirecTV as `clientId`/`clientID`, and a `UNIFIED_` id.
+- `token_stale`, `can_reauth` and `start_reauth` must be the stale check, re-auth gate and refresh queueing that upstream's own `pre_run_setup` calls, in that order.
+- `load_cache` must read one cache key by source name (`keys=[...]`); six concurrent per-box session saves must all survive.
+
+When one of these fails, find the upstream object that does that job (read the code that uses it, not just the names in `upstream_index.txt`) and point the role there.
+
 ### Our modules
 
 - **`directv_dai.py`**: the DAI feature.

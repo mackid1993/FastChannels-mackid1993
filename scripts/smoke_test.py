@@ -1414,4 +1414,74 @@ try:
 finally:
     install.up_set('load_cache', _real_lc)
 
+# (s) The upstream names the overlay only reads (USES) are checked by what they DO in
+# upstream, not just that the name exists: a rename fix (by hand or by the AI repair) that
+# points a role at the wrong object fails here, naming the role. (load_cache is (r).)
+import ast as _ast  # noqa: E402
+
+# 1. playback_cache_ttl is the age limit upstream's own resolve() applies to its cached
+# playback: younger is served from the cache, older is fetched again.
+_ttl = float(up('playback_cache_ttl'))
+_real_cf = install.up_owner('channel_fetch').__dict__[install.up_name('channel_fetch')]
+_fetched = []
+def _cf_stub(*a, **k):
+    _fetched.append(1)
+    raise RuntimeError('fetched')
+try:
+    install.up_set('channel_fetch', _cf_stub)
+    with app.test_request_context(environ_base={'REMOTE_ADDR': '203.0.113.9'}):
+        for _age, _want_fetch in ((_ttl - 30, False), (_ttl + 30, True)):
+            _fetched.clear()
+            _s = Scraper({'bearer_token': 'B'})
+            _s._cache = {'directv_playback': {'123': {'fallback_url': 'https://cached.example/x.m3u8',
+                                                      'cached_at': _t.time() - _age}}}
+            try:
+                _out = _s.resolve('directv://123/res')
+            except Exception:
+                _out = None
+            assert bool(_fetched) == _want_fetch and (_want_fetch or _out == 'https://cached.example/x.m3u8'), \
+                (f"role 'playback_cache_ttl' ({install.up_name('playback_cache_ttl')} = {_ttl}) is not the age "
+                 f"limit upstream's resolve() applies to its cached playback (age {_age:.0f}s)")
+finally:
+    setattr(install.up_owner('channel_fetch'), install.up_name('channel_fetch'), _real_cf)
+
+# 2. code_signin_client_id is the client id upstream's code sign-in sends to DirecTV (the
+# value of every clientId/clientID it passes), and a DirecTV UNIFIED_ client id.
+_auth_mod = install.up_owner('code_signin_client_id')
+_sent_as = {kw.value.id if isinstance(kw.value, _ast.Name) else _ast.dump(kw.value)
+            for kw in [*(_ast.keyword(arg=k.value, value=v)
+                         for n in _ast.walk(_ast.parse(inspect.getsource(_auth_mod)))
+                         if isinstance(n, _ast.Dict)
+                         for k, v in zip(n.keys, n.values) if isinstance(k, _ast.Constant))]
+            if kw.arg in ('clientId', 'clientID')}
+assert _sent_as == {install.up_name('code_signin_client_id')}, \
+    (f"role 'code_signin_client_id' ({install.up_name('code_signin_client_id')}) is not what upstream's "
+     f"code sign-in sends as its client id ({sorted(_sent_as)})")
+assert str(up('code_signin_client_id')).startswith('UNIFIED_'), up('code_signin_client_id')
+
+# 3. token_stale, can_reauth and start_reauth are the check, the gate and the queueing that
+# upstream's own scheduled-run refresh (pre_run_setup) uses: with each replaced by a stub,
+# that refresh must go through the stubs.
+_roles = ('token_stale', 'can_reauth', 'start_reauth')
+_saved = {r: install.up_owner(r).__dict__[install.up_name(r)] for r in _roles}
+_calls = []
+try:
+    install.up_set('token_stale', lambda self: (_calls.append('stale'), True)[1])
+    install.up_set('can_reauth', classmethod(lambda cls, cfg: (_calls.append('can'), True)[1]))
+    install.up_set('start_reauth', lambda self: _calls.append('start'))
+    try:
+        Scraper({'bearer_token': 'B'}).pre_run_setup()
+    except Exception:
+        pass   # upstream skips the run while it refreshes
+    assert _calls == ['stale', 'can', 'start'], \
+        (f"roles {_roles} ({[install.up_name(r) for r in _roles]}) are not the stale check, re-auth "
+         f"gate and refresh upstream's own pre_run_setup uses (calls: {_calls})")
+    _calls.clear()
+    install.up_set('token_stale', lambda self: (_calls.append('stale'), False)[1])
+    Scraper({'bearer_token': 'B'}).pre_run_setup()
+    assert _calls == ['stale'], f'a fresh session was refreshed: {_calls}'
+finally:
+    for _r, _v in _saved.items():
+        setattr(install.up_owner(_r), install.up_name(_r), _v)
+
 print('Overlay smoke test passed.')
