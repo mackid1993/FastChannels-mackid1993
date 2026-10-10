@@ -1063,6 +1063,32 @@ try:
         assert _fetched == ['web'] and _c.get('dai_zip') == '10965', _c
     finally:
         dai.fetch_account_context = _real_fac
+    # The ZIP a tune looks up is saved to the live source row (inside a request, as a tune is).
+    dai._ZIP_FOUND.clear(); dai._ZIP_FAILED.clear()
+    dai.fetch_location_context = lambda s, b, timeout=15: {'zip': '10965', 'dma_id': '501'}
+    with app.app_context():
+        _keep = dict(db.session.get(Source, _sid).config)
+        up('persist_config')(_sid, {'bearer_token': 'zip-save'})
+        assert dai._account_zip({'bearer_token': 'zip-save'}) == '10965'
+        db.session.expire_all()
+        assert db.session.get(Source, _sid).config.get('dai_zip') == '10965', 'a tune\'s ZIP lookup was not saved'
+        _s = db.session.get(Source, _sid)
+        _s.config = _keep
+        db.session.commit()
+    # Turning DAI on looks the account values up once, and a failed lookup never fails the save.
+    _real_fmac, _real_cib = dai._fetch_missing_account_context, dai.capture_in_background
+    _fmac = []
+    try:
+        dai.capture_in_background = lambda addrs=None: 0
+        dai._fetch_missing_account_context = lambda sid: (_fmac.append(sid), (_ for _ in ()).throw(RuntimeError('boom')))
+        with app.app_context():
+            _s = db.session.get(Source, _sid)
+            _on = {'use_dai': 'true', 'bearer_token': 'b'}
+            dai.settings_changed(_s, {}, _on)   # raises inside: must not propagate
+            dai.settings_changed(_s, _on, _on)  # a re-save with DAI already on: no lookup
+            assert _fmac == [_sid], f'turning DAI on looked the account up {_fmac}'
+    finally:
+        dai._fetch_missing_account_context, dai.capture_in_background = _real_fmac, _real_cib
 finally:
     dai.fetch_location_context = _real_flc
     dai._ZIP_FOUND.clear(); dai._ZIP_FAILED.clear()

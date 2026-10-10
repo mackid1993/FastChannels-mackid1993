@@ -1167,10 +1167,17 @@ def settings_changed(source, old: dict, current: dict) -> None:
     devices' ad ids, and fetch the account's targeting values if they're missing."""
     _DAI_ON[0] = 0.0
     clear_cache_if_toggled(source, old, current)
-    if (enabled(current) and current.get('bearer_token')
+    if (enabled(current) and not enabled(old) and current.get('bearer_token')
             and not (current.get('dai_dma_id') and current.get('dai_zip'))):
-        # In the save request itself, so the values are stored before the next tune.
-        _fetch_missing_account_context(source.id)
+        # In the save request itself, so the values are stored before the next tune. Only
+        # when DAI is turned on (a re-save doesn't repeat the lookup), and never fails the
+        # save: the toggle is already stored, and a tune still finding no dai_zip looks it
+        # up itself (_account_zip).
+        try:
+            _fetch_missing_account_context(source.id)
+        except Exception:
+            logger.warning('[directv-dai] turning DAI on: could not fetch the account targeting values',
+                           exc_info=True)
 
 
 def _fetch_missing_account_context(source_id: int) -> None:
@@ -1190,8 +1197,11 @@ def _fetch_missing_account_context(source_id: int) -> None:
         logger.warning('[directv-dai] turning DAI on: the account lookup returned no billing ZIP; '
                        'the first tune will look it up again')
     if updates:
-        persist_source_config_updates(source_id, updates)
-        logger.info('[directv-dai] fetched the account targeting values (%s)', ', '.join(sorted(updates)))
+        if persist_source_config_updates(source_id, updates):
+            logger.info('[directv-dai] fetched the account targeting values (%s)', ', '.join(sorted(updates)))
+        else:
+            logger.warning('[directv-dai] could not save the account targeting values (%s)',
+                           ', '.join(sorted(updates)))
 
 
 def clear_cache_if_toggled(source, old: dict, current: dict) -> None:
