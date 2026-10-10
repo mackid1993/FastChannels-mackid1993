@@ -890,7 +890,7 @@ def _register_admin(app) -> None:
             return jsonify({'enabled': False, 'ok': True, 'pending': 0})
         if request.method == 'GET':
             return jsonify({'enabled': True, 'pending': len(directv_dai.uncaptured_addresses())})
-        counts = directv_dai.capture_registered_devices(directv_dai.uncaptured_addresses())
+        counts = directv_dai.capture_registered_devices(directv_dai.uncaptured_addresses(fresh=True))
         return jsonify({'enabled': True, 'ok': True, **counts,
                         'pending': len(directv_dai.uncaptured_addresses())})
 

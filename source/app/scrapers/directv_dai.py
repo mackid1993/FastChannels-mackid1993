@@ -623,10 +623,19 @@ def capture_registered_devices(addresses: list[str] | None = None) -> dict:
     return counts
 
 
+# capture_in_background(UNCAPTURED): the devices with no id yet, worked out in the
+# background from a FRESH device list (so a box added a moment ago is included and the
+# save request never waits on ah4c).
+UNCAPTURED = object()
+
+
 def capture_in_background(addresses: list[str] | None = None) -> int:
     """Run capture_registered_devices in a daemon thread with the current Flask app
-    context (the device list and the store need one). Resolves the device list in the
-    calling request thread. Returns how many devices it will visit."""
+    context (the device list and the store need one). Returns how many devices it will
+    visit (-1 for UNCAPTURED, which is resolved in the background)."""
+    if addresses is UNCAPTURED:
+        device.spawn(lambda: capture_registered_devices(uncaptured_addresses(fresh=True)))
+        return -1
     if addresses is None:
         addresses = _bridge_addresses()
     addresses = list(addresses or [])
@@ -635,16 +644,18 @@ def capture_in_background(addresses: list[str] | None = None) -> int:
     return len(addresses)
 
 
-def uncaptured_addresses() -> list[str]:
+def uncaptured_addresses(fresh: bool = False) -> list[str]:
     """Registered bridge devices with no captured advertising id yet (new boxes), used to
     show the admin capture button only when there is something to capture. Excludes a box
     we recently tried and couldn't read (unreachable / non-English deleted) so the button
-    doesn't nag forever; it reappears after _ADID_TRIED_TTL. Needs an app context."""
+    doesn't nag forever; it reappears after _ADID_TRIED_TTL. Needs an app context.
+    ``fresh`` reads the device list now (for a capture); otherwise the cached list (for
+    display, no ah4c call)."""
     saved = _saved_adids()
     now = time.time()
     with _adid_lock:
         recent = {a for a, t in _adid_tried.items() if now - t < _ADID_TRIED_TTL}
-    return [a for a in _bridge_addresses(fresh=False) if a and a not in saved and a not in recent]
+    return [a for a in _bridge_addresses(fresh=fresh) if a and a not in saved and a not in recent]
 
 
 def _current_bridge_address() -> str | None:
@@ -841,12 +852,10 @@ def note_channels(scraper, rows) -> None:
 
 # ── Login ────────────────────────────────────────────────────────────────────
 
-# The account values that came from a lookup (dai_dma_id, dai_zip, dai_gpp, dai_gpp_sid)
-# and the chosen viewer profile belong to one DirecTV account. dai_account records which
-# (its partnerProfileId), so a sign-in to a different account drops them instead of
-# sending another account's market, ZIP or profile.
-_ACCOUNT_VALUES = ('dai_dma_id', 'dai_zip', 'dai_gpp', 'dai_gpp_sid',
-                   'dtv_android_profid', 'dtv_android_profile_id', 'dai_profile_id')
+# The account values that came from a lookup and the chosen viewer profile belong to one
+# DirecTV account. dai_account records which (its partnerProfileId, and dai_account_source
+# where that id came from), so a sign-in to a different account doesn't send another
+# account's market, ZIP or profile (see _note_account).
 _ACCOUNT_FETCH_WAIT = 30
 
 
@@ -861,19 +870,21 @@ def store_login_result(cfg: dict, result: dict) -> None:
     sign-in carries bZipCode."""
     partner_profile_id = result.get('partner_profile_id')
     profile_id = result.get('profile_id')
+    # Where the household id came from: the code sign-in's grant (valuePairs) or a web
+    # token's own claims. The two have not been confirmed to carry the same value for one
+    # account, so ids are only compared within the same source (see below).
+    id_source = 'grant' if partner_profile_id else ''
     # Paths with no token-exchange valuePairs fall back to the bearer JWT's own claims
     # (the code sign-in's tokens are opaque, so there it's the valuePairs or nothing).
     if not partner_profile_id or not profile_id:
         jwt_pp, jwt_pf = ids_from_bearer_jwt(result.get('bearer_token') or '')
+        if not partner_profile_id and jwt_pp:
+            id_source = 'jwt'
         partner_profile_id = partner_profile_id or jwt_pp
         profile_id = profile_id or jwt_pf
+    bearer = result.get('bearer_token')
     if partner_profile_id:
-        owner = cfg.get('dai_account')
-        if owner and owner != partner_profile_id:
-            dropped = [k for k in _ACCOUNT_VALUES if cfg.pop(k, None) is not None]
-            logger.info('[directv-dai] signed in to a different DirecTV account; dropped the previous '
-                        "account's values (%s)", ', '.join(dropped) or 'none')
-        cfg['dai_account'] = partner_profile_id
+        _note_account(cfg, partner_profile_id, id_source, bearer)
         cfg['dai_partner_profile_id'] = partner_profile_id
     if profile_id:
         cfg['dai_profile_id'] = profile_id
@@ -883,7 +894,6 @@ def store_login_result(cfg: dict, result: dict) -> None:
     # Only with DAI on: with it off, sign-in makes no extra DirecTV requests (turning DAI
     # on fetches them then; see settings_changed). A code session refetches on every
     # sign-in/refresh, as before; any session missing a value fetches it.
-    bearer = result.get('bearer_token')
     if (enabled(cfg) and bearer and 'dai_context' not in result
             and (result.get('auth_method') == 'device_code' or not cfg.get('dai_dma_id')
                  or not cfg.get('dai_zip'))):
@@ -891,6 +901,64 @@ def store_login_result(cfg: dict, result: dict) -> None:
             device.spawn(_fetch_account_values_after_signin, bearer)
         except Exception:
             logger.warning('[directv-dai] could not start the account lookup after sign-in', exc_info=True)
+
+
+# The looked-up account values (refetched automatically on the next sign-in or tune) and
+# the chosen viewer profile (picked by a person, so never dropped on a guess).
+_LOOKUP_VALUES = ('dai_dma_id', 'dai_zip', 'dai_gpp', 'dai_gpp_sid')
+_PROFILE_VALUES = ('dtv_android_profid', 'dtv_android_profile_id')
+
+
+def _note_account(cfg: dict, account_id: str, id_source: str, bearer) -> None:
+    """Record which DirecTV account the stored values belong to, and react to a change:
+    - same id source, different id: a different account for certain; drop its looked-up
+      values and its chosen profile (warning);
+    - different id sources with different ids (a code sign-in after a web sign-in, or the
+      reverse): not known to be a different account, so the looked-up values are dropped
+      (they are refetched at once, so nothing is lost) and the chosen profile is kept but
+      checked against this account's own profile list in the background, dropped only if
+      it isn't one of them (warning either way)."""
+    owner = str(cfg.get('dai_account') or '')
+    owner_source = str(cfg.get('dai_account_source') or '')
+    cfg['dai_account'] = account_id
+    if id_source:
+        cfg['dai_account_source'] = id_source
+    if not owner or owner == account_id:
+        return
+    certain = bool(owner_source and id_source and owner_source == id_source)
+    dropped = [k for k in _LOOKUP_VALUES if cfg.pop(k, None) is not None]
+    cfg.pop('dai_profile_id', None)   # comes from this sign-in's own result, if anywhere
+    if certain:
+        dropped += [k for k in _PROFILE_VALUES if cfg.pop(k, None) is not None]
+        logger.warning('[directv-dai] signed in to a different DirecTV account; dropped the previous '
+                       "account's values (%s)", ', '.join(dropped) or 'none')
+        return
+    logger.warning('[directv-dai] the household id differs between the %s and %s sign-in; refetching the '
+                   'market/ZIP/consent (%s) and checking the chosen profile against this account',
+                   owner_source or 'earlier', id_source or 'new', ', '.join(dropped) or 'none')
+    if cfg.get('dtv_android_profile_id') and bearer:
+        try:
+            device.spawn(_check_profile_after_signin, str(bearer), str(cfg['dtv_android_profile_id']))
+        except Exception:
+            logger.warning('[directv-dai] could not start the profile check', exc_info=True)
+
+
+def _check_profile_after_signin(bearer: str, profile_id: str) -> None:
+    """Background: keep the chosen profile only if this account has it. An unreadable
+    profile list keeps it (it is never dropped on a guess) and says so."""
+    info = list_profiles(bearer)
+    ids = {p.get('id') for p in (info.get('profiles') or [])}
+    if not ids:
+        logger.warning('[directv-dai] could not read the account\'s profiles; the chosen profile is kept '
+                       'unverified (re-pick it in the DirecTV settings if ads look untargeted)')
+        return
+    if profile_id in ids:
+        logger.info('[directv-dai] the chosen DirecTV profile belongs to this account; kept')
+        return
+    if _save_account_values(bearer, {'dtv_android_profid': None, 'dtv_android_profile_id': None},
+                            wait=_ACCOUNT_FETCH_WAIT):
+        logger.warning('[directv-dai] the chosen DirecTV profile is not on this account; cleared it '
+                       '(pick one in the DirecTV settings)')
 
 
 def _fetch_account_values_after_signin(bearer: str) -> None:
@@ -1164,7 +1232,8 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
         if new_refresh:
             updates['refresh_token'] = new_refresh
         saved = False
-        for attempt in range(3 if new_refresh else 1):
+        attempts = 3 if new_refresh else 1
+        for attempt in range(attempts):
             try:
                 saved = _up('persist_config')(source.id, updates)
             except Exception:
@@ -1172,7 +1241,8 @@ def select_profile(source, profile_id: str, profile_name: str = '') -> dict:
                 logger.warning('[directv-dai] could not persist profile selection', exc_info=True)
             if saved:
                 break
-            time.sleep(1 + attempt)
+            if attempt < attempts - 1:
+                time.sleep(1 + attempt)
         if not saved and new_refresh:
             logger.error('[directv-dai] the profile exchange rotated the refresh_token but it could not be '
                          'saved; if DirecTV retired the old one, sign in again')
@@ -1307,4 +1377,4 @@ def clear_cache_if_toggled(source, old: dict, current: dict) -> None:
         # doesn't have one yet (all of them right after turning DAI on). Background, skipping
         # any box that's currently playing. This save-time pass is the ONLY automatic
         # trigger -- a tune never captures (a Google TV box is never interrupted mid-stream).
-        capture_in_background(uncaptured_addresses())
+        capture_in_background(UNCAPTURED)

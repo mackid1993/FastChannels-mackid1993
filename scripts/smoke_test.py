@@ -418,13 +418,43 @@ try:
     _spawned_fetch.clear(); cfg = {}
     dai.store_login_result(cfg, {'bearer_token': 'opaque', 'auth_method': 'device_code', 'partner_profile_id': 'pp-1'})
     assert _spawned_fetch == [] and 'dai_dma_id' not in cfg and cfg['dai_partner_profile_id'] == 'pp-1', cfg
-    # A sign-in to a different account drops the previous account's values and profile.
-    cfg = {'dai_account': 'pp-1', 'dai_zip': '10965', 'dai_dma_id': '501', 'dtv_android_profid': 'x'}
-    dai.store_login_result(cfg, {'bearer_token': 'opaque', 'auth_method': 'curl_cffi', 'partner_profile_id': 'pp-OTHER'})
+    # A sign-in to a different account (same id source) drops the previous account's
+    # values and profile.
+    _spawned_fetch.clear()
+    cfg = {'dai_account': 'pp-1', 'dai_account_source': 'grant', 'dai_zip': '10965', 'dai_dma_id': '501',
+           'dtv_android_profid': 'x', 'dtv_android_profile_id': 'p1'}
+    dai.store_login_result(cfg, {'bearer_token': 'opaque', 'auth_method': 'device_code', 'partner_profile_id': 'pp-OTHER'})
     assert cfg['dai_account'] == 'pp-OTHER' and not {'dai_zip', 'dai_dma_id', 'dtv_android_profid'} & set(cfg), cfg
-    cfg = {'dai_account': 'pp-1', 'dai_zip': '10965'}
+    cfg = {'dai_account': 'pp-1', 'dai_account_source': 'grant', 'dai_zip': '10965'}
     dai.store_login_result(cfg, {'bearer_token': 'opaque', 'partner_profile_id': 'pp-1'})
     assert cfg['dai_zip'] == '10965', 'the same account lost its values on a refresh'
+    # Different id sources (code grant vs a web token's claims) aren't known to be one
+    # account: market/ZIP are refetched, the chosen profile is KEPT and checked in the
+    # background against the account's own profile list.
+    _spawned_fetch.clear()
+    _wclaims = b64url(json.dumps({'partnerProfileId': 'pp-WEB'}).encode())
+    cfg = {'use_dai': 'true', 'dai_account': 'pp-1', 'dai_account_source': 'grant', 'dai_zip': '10965',
+           'dai_dma_id': '501', 'dtv_android_profid': 'x', 'dtv_android_profile_id': 'p1'}
+    dai.store_login_result(cfg, {'bearer_token': f'h.{_wclaims}.s', 'auth_method': 'curl_cffi'})
+    assert cfg['dtv_android_profid'] == 'x' and cfg['dtv_android_profile_id'] == 'p1', \
+        'a code/web id mismatch wiped the chosen profile on a guess'
+    assert 'dai_zip' not in cfg and cfg['dai_account_source'] == 'jwt', cfg
+    _names = [n for n, _ in _spawned_fetch]
+    assert '_check_profile_after_signin' in _names and '_fetch_account_values_after_signin' in _names, _names
+    # The check keeps a profile the account has, clears one it doesn't, keeps on an unreadable list.
+    _real_lp, _real_sav2 = dai.list_profiles, dai._save_account_values
+    _cleared = []
+    dai._save_account_values = lambda b, u, wait=0: (_cleared.append(u) or True)
+    try:
+        dai.list_profiles = lambda b: {'profiles': [{'id': 'p1'}]}
+        dai._check_profile_after_signin('b', 'p1'); assert _cleared == []
+        dai.list_profiles = lambda b: {}
+        dai._check_profile_after_signin('b', 'p1'); assert _cleared == [], 'an unreadable profile list cleared the profile'
+        dai.list_profiles = lambda b: {'profiles': [{'id': 'p2'}]}
+        dai._check_profile_after_signin('b', 'p1')
+        assert _cleared == [{'dtv_android_profid': None, 'dtv_android_profile_id': None}], _cleared
+    finally:
+        dai.list_profiles, dai._save_account_values = _real_lp, _real_sav2
 finally:
     dai.fetch_account_context = _real_fac
     device.spawn = _real_spawn_si
@@ -781,6 +811,17 @@ _real_list, _real_capture = dai.list_profiles, dai.capture_in_background
 _captures = []
 dai.list_profiles = lambda bearer: {'profiles': [{'id': 'p1', 'name': 'David', 'primary': True}], 'current_id': 'p1'}
 dai.capture_in_background = lambda addrs=None: _captures.append(addrs) or 0
+# Capture paths read a FRESH device list (a box added a moment ago is included); display
+# reads the cached one.
+_real_kbd2, _real_cbd2 = device.known_bridge_devices, device._cached_bridge_devices
+device.known_bridge_devices = lambda: [{'address': '10.0.0.40:5555', 'host': '10.0.0.40'}]
+device._cached_bridge_devices = lambda: []
+try:
+    with app.app_context():
+        assert '10.0.0.40:5555' in dai.uncaptured_addresses(fresh=True), 'a capture missed a just-added box'
+        assert dai.uncaptured_addresses() == [], 'the display path called ah4c'
+finally:
+    device.known_bridge_devices, device._cached_bridge_devices = _real_kbd2, _real_cbd2
 try:
     with app.app_context():
         db.create_all()
@@ -1242,5 +1283,23 @@ try:
         assert _started == [1], "a stale session deferred by the profile switch was not refreshed"
 finally:
     install.up_set('start_reauth', _real_sr)
+
+# The profile save's retry never sleeps after its last attempt.
+_real_pc, _real_sleep = up('persist_config'), dai.time.sleep
+_sleeps = []
+try:
+    _fr2 = _FakeRedis()
+    dai._redis = lambda: _fr2
+    dai.profile_token_exchange = lambda *a: {'valuePairs': {'partnerProfileID1': 'pp'}, 'refreshToken': 'NEW'}
+    dai._requeue_stale_refresh = lambda src: None
+    install.up_set('persist_config', lambda *a, **k: False)
+    dai.time.sleep = lambda n: _sleeps.append(n)
+    with app.app_context():
+        _r = dai.select_profile(db.session.get(Source, _sid), 'p1', 'David')
+    assert not _r['ok'] and _sleeps == [1, 2], f'retry sleeps: {_sleeps}'
+finally:
+    install.up_set('persist_config', _real_pc)
+    dai.time.sleep = _real_sleep
+    dai._redis, dai.profile_token_exchange, dai._requeue_stale_refresh = _real
 
 print('Overlay smoke test passed.')
