@@ -6,11 +6,11 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 ---
  app/scrapers/directv_dai.py         | 1549 +++++++++++++++++++++++++++
- app/scrapers/directv_dai_device.py  |  425 ++++++++
+ app/scrapers/directv_dai_device.py  |  429 ++++++++
  app/scrapers/directv_dai_install.py | 1231 +++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 +
  app/scrapers/dtv_aac_gain.py        |  663 ++++++++++++
- 5 files changed, 3917 insertions(+)
+ 5 files changed, 3921 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -1574,10 +1574,10 @@ index 0000000..840658d
 +        capture_in_background(UNCAPTURED)
 diff --git a/app/scrapers/directv_dai_device.py b/app/scrapers/directv_dai_device.py
 new file mode 100644
-index 0000000..a5c8b4a
+index 0000000..da1aa1a
 --- /dev/null
 +++ b/app/scrapers/directv_dai_device.py
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,429 @@
 +"""The bridge device a DirecTV DAI tune plays on: its identity and app User-Agent.
 +
 +DAI targets the playback device the way DirecTV's Android TV app does, so this reads
@@ -1795,7 +1795,11 @@ index 0000000..a5c8b4a
 +
 +
 +def forget_bridge_devices() -> None:
-+    """Drop the cached device list (the next lookup reads it again)."""
++    """Drop the cached device list, in memory and on disk (the next lookup reads it again)."""
++    try:
++        os.remove(_bridges_file())
++    except OSError:
++        pass
 +    _BRIDGE_LIST[:] = [0.0, None]
 +    _bridge_failed_at[0] = 0.0
 +    _bridge_outage_logged[0] = False

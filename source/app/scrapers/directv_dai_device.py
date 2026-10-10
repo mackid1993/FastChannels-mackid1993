@@ -215,7 +215,11 @@ def _bridge_address(ip: str) -> str | None:
 
 
 def forget_bridge_devices() -> None:
-    """Drop the cached device list (the next lookup reads it again)."""
+    """Drop the cached device list, in memory and on disk (the next lookup reads it again)."""
+    try:
+        os.remove(_bridges_file())
+    except OSError:
+        pass
     _BRIDGE_LIST[:] = [0.0, None]
     _bridge_failed_at[0] = 0.0
     _bridge_outage_logged[0] = False
