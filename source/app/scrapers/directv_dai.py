@@ -634,7 +634,7 @@ def capture_in_background(addresses: list[str] | None = None) -> int:
     context (the device list and the store need one). Returns how many devices it will
     visit (-1 for UNCAPTURED, which is resolved in the background)."""
     if addresses is UNCAPTURED:
-        device.spawn(lambda: capture_registered_devices(uncaptured_addresses(fresh=True)))
+        device.spawn(_capture_uncaptured)
         return -1
     if addresses is None:
         addresses = _bridge_addresses()
@@ -642,6 +642,11 @@ def capture_in_background(addresses: list[str] | None = None) -> int:
     if addresses:
         device.spawn(capture_registered_devices, addresses)
     return len(addresses)
+
+
+def _capture_uncaptured() -> dict:
+    """Background: capture every device with no advertising id yet, from a fresh list."""
+    return capture_registered_devices(uncaptured_addresses(fresh=True))
 
 
 def uncaptured_addresses(fresh: bool = False) -> list[str]:

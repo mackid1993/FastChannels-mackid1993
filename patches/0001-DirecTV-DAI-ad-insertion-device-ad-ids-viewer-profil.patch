@@ -5,12 +5,12 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
  the inserted-ad audio fix, wired in by one hook
 
 ---
- app/scrapers/directv_dai.py         | 1380 +++++++++++++++++++++++++++
+ app/scrapers/directv_dai.py         | 1385 +++++++++++++++++++++++++++
  app/scrapers/directv_dai_device.py  |  377 ++++++++
  app/scrapers/directv_dai_install.py | 1160 ++++++++++++++++++++++
  app/scrapers/dtv_aac_ads.py         |   49 +
  app/scrapers/dtv_aac_gain.py        |  663 +++++++++++++
- 5 files changed, 3629 insertions(+)
+ 5 files changed, 3634 insertions(+)
  create mode 100644 app/scrapers/directv_dai.py
  create mode 100644 app/scrapers/directv_dai_device.py
  create mode 100644 app/scrapers/directv_dai_install.py
@@ -19,10 +19,10 @@ Subject: [PATCH] DirecTV DAI: ad insertion, device ad ids, viewer profiles and
 
 diff --git a/app/scrapers/directv_dai.py b/app/scrapers/directv_dai.py
 new file mode 100644
-index 0000000..820cc50
+index 0000000..e65130f
 --- /dev/null
 +++ b/app/scrapers/directv_dai.py
-@@ -0,0 +1,1380 @@
+@@ -0,0 +1,1385 @@
 +"""DirecTV ad insertion (DAI): the opt-in 'Use DirecTV ad insertion (DAI)' toggle.
 +
 +When on, playback uses the stream DirecTV's own apps use: the Yospace
@@ -659,7 +659,7 @@ index 0000000..820cc50
 +    context (the device list and the store need one). Returns how many devices it will
 +    visit (-1 for UNCAPTURED, which is resolved in the background)."""
 +    if addresses is UNCAPTURED:
-+        device.spawn(lambda: capture_registered_devices(uncaptured_addresses(fresh=True)))
++        device.spawn(_capture_uncaptured)
 +        return -1
 +    if addresses is None:
 +        addresses = _bridge_addresses()
@@ -667,6 +667,11 @@ index 0000000..820cc50
 +    if addresses:
 +        device.spawn(capture_registered_devices, addresses)
 +    return len(addresses)
++
++
++def _capture_uncaptured() -> dict:
++    """Background: capture every device with no advertising id yet, from a fresh list."""
++    return capture_registered_devices(uncaptured_addresses(fresh=True))
 +
 +
 +def uncaptured_addresses(fresh: bool = False) -> list[str]:
