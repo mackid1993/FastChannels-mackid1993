@@ -1,9 +1,14 @@
 name: Model preflight
 
-# One-off sanity check: does the configured AI_MODEL actually answer through
-# OpenRouter under THIS account's privacy/data policies, using the same secret the
-# conflict/drift resolver uses? Run it from the Actions tab (Run workflow) after
-# changing AI_MODEL, before trusting the auto-fix. Costs a few tokens.
+# One-off sanity check: does the configured AI_MODEL actually answer, with the key the
+# conflict/drift repair uses, keep earlier messages in a long request (what Aider relies on:
+# the files go in earlier messages, the task in the last one), and edit a file through Aider
+# exactly as the repair calls it? Run it from the Actions tab after changing AI_MODEL.
+# Costs a few cents at most.
+#
+# AI_MODEL "anthropic/<id>" (default, Claude Haiku 5.5) uses ANTHROPIC_API_KEY against
+# Anthropic's API; "openrouter/<id>" uses OPENROUTER_API_KEY with the same provider routing
+# the repair uses (scripts/openrouter_provider.py).
 
 on:
   workflow_dispatch:
@@ -15,144 +20,97 @@ jobs:
   preflight:
     runs-on: ubuntu-latest
     steps:
-      - name: Call AI_MODEL through OpenRouter with the resolver's key
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
-        run: |
-          [ -n "$OPENROUTER_API_KEY" ] || { echo "::error::OPENROUTER_API_KEY secret is not set"; exit 1; }
-          # Aider routes with an "openrouter/" prefix; the raw API wants just the model id.
-          model="${AI_MODEL#openrouter/}"
-          echo "Testing model '$model' under this account's OpenRouter data policies..."
-          # Generous max_tokens: reasoning models (e.g. GLM 5.3 Flash) spend tokens
-          # thinking before any visible content, so a tiny budget yields empty content.
-          code=$(curl -sS -o resp.json -w '%{http_code}' https://openrouter.ai/api/v1/chat/completions \
-            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}],\"max_tokens\":2048}")
-          echo "HTTP $code"
-          content=$(jq -r '.choices[0].message.content // empty' resp.json 2>/dev/null)
-          provider=$(jq -r '.provider // empty' resp.json 2>/dev/null)
-          finish=$(jq -r '.choices[0].finish_reason // empty' resp.json 2>/dev/null)
-          usage=$(jq -rc '.usage // empty' resp.json 2>/dev/null)
-          err=$(jq -r '(.error.message // .error) // empty' resp.json 2>/dev/null)
-          echo "provider routed: ${provider:-（none）}"
-          echo "finish_reason: ${finish:-（none）}   usage: ${usage:-（none）}"
-          echo "content: ${content:-（none）}"
-          [ -n "$err" ] && echo "error: $err"
-          if [ "$code" != "200" ] || [ -z "$content" ]; then
-            echo "::error::'$model' did not return a usable completion (HTTP $code). Most likely your OpenRouter privacy/data policy blocks every provider for this model, or the id is wrong. Allow a provider for it, or pick a different model, then re-run."
-            exit 1
-          fi
-          echo "::notice::OK — '$model' answered through OpenRouter under the current privacy policies (provider: ${provider:-unknown})."
+      - name: Check out this repo
+        uses: actions/checkout@v5
 
-      - name: Show the model's context window per provider
-        # The AI repair sends the overlay's files, its tests and the failure log in one
-        # request; if that's longer than the model's context window, OpenRouter silently
-        # drops the middle ("middle-out") and the model never sees the files.
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
-        run: |
-          model="${AI_MODEL#openrouter/}"
-          curl -sS "https://openrouter.ai/api/v1/models/$model/endpoints" \
-            -H "Authorization: Bearer $OPENROUTER_API_KEY" -o endpoints.json
-          jq -r '.data.endpoints[]? | "\(.provider_name): context \(.context_length), max output \(.max_completion_tokens // "?")"' endpoints.json \
-            || head -c 500 endpoints.json
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Check the model sees earlier messages (what Aider relies on)
-        # Aider sends the files in earlier messages and the task in the last one. A
-        # provider that drops earlier turns leaves the model saying no files were added.
-        # Tries a few times (OpenRouter may route each call to a different provider) and
-        # names the provider each time.
+      - name: Call AI_MODEL with the repair's key (short and long requests)
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'anthropic/claude-haiku-5-5' }}
         run: |
-          model="${AI_MODEL#openrouter/}"
-          fails=0
-          for i in 1 2 3 4 5 6; do
-            jq -n --arg m "$model" '{model: $m, max_tokens: 2048, messages: [
-              {role: "system", content: "You are a helpful assistant."},
-              {role: "user", content: "Remember this code word for later: PINEAPPLE-4217. Reply only OK."},
-              {role: "assistant", content: "OK"},
-              {role: "user", content: "Here is a file:\n```\nx = 1\n```"},
-              {role: "assistant", content: "Noted."},
-              {role: "user", content: "What was the code word I gave you earlier? Reply with just the code word."}]}' > req.json
-            curl -sS https://openrouter.ai/api/v1/chat/completions -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-              -H "Content-Type: application/json" -d @req.json -o resp.json
-            provider=$(jq -r '.provider // "?"' resp.json); answer=$(jq -r '.choices[0].message.content // .error.message // "?"' resp.json | tr -d '\n' | cut -c1-80)
-            if echo "$answer" | grep -q 'PINEAPPLE-4217'; then echo "try $i: OK   provider=$provider"; else echo "try $i: LOST earlier messages  provider=$provider  answer=$answer"; fails=$((fails+1)); fi
-          done
-          [ "$fails" = 0 ] || echo "::warning::$fails of 6 calls lost the earlier messages; the AI repair can't see the files on those providers."
+          python3 - <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+          sys.path.insert(0, 'scripts')
+          from openrouter_provider import is_anthropic, key_var, provider
 
-      - name: Check the model sees earlier messages in a LONG request
-        # The AI repair's real requests are 60k-120k tokens. Same code-word test, with the
-        # earlier messages padded to a few sizes, to find where a provider starts dropping
-        # the start of the request.
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
-        run: |
-          model="${AI_MODEL#openrouter/}"
-          for k in 8 30 70; do
-            python3 - "$model" "$k" > req.json <<'PY'
-          import json, sys
-          model, k = sys.argv[1], int(sys.argv[2])
-          filler = "\n".join(f"def helper_{i}(x):\n    return x + {i}\n" for i in range(k * 1000 // 14))
-          print(json.dumps({"model": model, "max_tokens": 2048, "messages": [
-              {"role": "system", "content": "You are a helpful assistant."},
-              {"role": "user", "content": "Remember this code word for later: PINEAPPLE-4217. Reply only OK."},
-              {"role": "assistant", "content": "OK"},
-              {"role": "user", "content": "Here is a file:\n```\n" + filler + "\n```"},
-              {"role": "assistant", "content": "Noted."},
-              {"role": "user", "content": "What was the code word I gave you earlier? Reply with just the code word."}]}))
-          PY
-            curl -sS https://openrouter.ai/api/v1/chat/completions -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-              -H "Content-Type: application/json" -d @req.json -o resp.json
-            provider=$(jq -r '.provider // "?"' resp.json); answer=$(jq -r '.choices[0].message.content // .error.message // "?"' resp.json | tr -d '\n' | cut -c1-100)
-            tokens=$(jq -r '.usage.prompt_tokens // "?"' resp.json)
-            if echo "$answer" | grep -q 'PINEAPPLE-4217'; then r=OK; else r=LOST; fi
-            echo "~${k}k padding: $r  prompt_tokens=$tokens  provider=$provider  answer=$answer"
-          done
+          model = os.environ['AI_MODEL']
+          var = key_var(model)
+          key = os.environ.get(var, '')
+          if not key:
+              print(f'::error::{var} secret is not set (needed for {model})'); sys.exit(1)
+          anth = is_anthropic(model)
+          mid = model.split('/', 1)[1] if model.startswith(('anthropic/', 'openrouter/')) else model
+          print(f'Model: {model}  via {"Anthropic" if anth else "OpenRouter"} ({var})')
 
-      - name: Same check, streamed and at temperature 0 (how Aider calls the model)
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
-        run: |
-          model="${AI_MODEL#openrouter/}"
-          for k in 1 30 70; do
-            python3 - "$model" "$k" > req.json <<'PY'
-          import json, sys
-          model, k = sys.argv[1], int(sys.argv[2])
-          filler = "\n".join(f"def helper_{i}(x):\n    return x + {i}\n" for i in range(k * 1000 // 14))
-          print(json.dumps({"model": model, "stream": True, "temperature": 0, "usage": {"include": True}, "messages": [
-              {"role": "system", "content": "You are a helpful assistant."},
-              {"role": "user", "content": "Remember this code word for later: PINEAPPLE-4217. Reply only OK."},
-              {"role": "assistant", "content": "OK"},
-              {"role": "user", "content": "Here is a file:\n```\n" + filler + "\n```"},
-              {"role": "assistant", "content": "Noted."},
-              {"role": "user", "content": "What was the code word I gave you earlier? Reply with just the code word."}]}))
-          PY
-            curl -sS -N https://openrouter.ai/api/v1/chat/completions -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-              -H "Content-Type: application/json" -d @req.json -o stream.txt
-            python3 - <<'PY'
-          import json
-          text, provider, usage = '', '?', {}
-          for line in open('stream.txt', encoding='utf-8', errors='replace'):
-              line = line.strip()
-              if not line.startswith('data:') or line == 'data: [DONE]':
-                  continue
+          def call(messages, system='You are a helpful assistant.'):
+              if anth:
+                  body = {'model': mid, 'max_tokens': 2048, 'system': system, 'messages': messages}
+                  req = urllib.request.Request('https://api.anthropic.com/v1/messages',
+                      data=json.dumps(body).encode(),
+                      headers={'x-api-key': key, 'anthropic-version': '2023-06-01',
+                               'content-type': 'application/json'})
+              else:
+                  body = {'model': mid, 'max_tokens': 2048, 'provider': provider(),
+                          'messages': [{'role': 'system', 'content': system}, *messages]}
+                  req = urllib.request.Request('https://openrouter.ai/api/v1/chat/completions',
+                      data=json.dumps(body).encode(),
+                      headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
               try:
-                  d = json.loads(line[5:])
-              except ValueError:
-                  continue
-              provider = d.get('provider', provider)
-              usage = d.get('usage') or usage
-              for c in d.get('choices') or []:
-                  text += (c.get('delta') or {}).get('content') or ''
-          ok = 'PINEAPPLE-4217' in text
-          print(f"stream: {'OK  ' if ok else 'LOST'} prompt_tokens={usage.get('prompt_tokens', '?')} provider={provider} answer={text.strip()[:100]!r}")
+                  r = json.load(urllib.request.urlopen(req, timeout=180))
+              except urllib.error.HTTPError as e:
+                  return '', f'HTTP {e.code}: {e.read()[:300]!r}', {}
+              if anth:
+                  text = ''.join(b.get('text', '') for b in r.get('content') or [] if b.get('type') == 'text')
+                  return text, r.get('model', '?'), r.get('usage') or {}
+              text = r['choices'][0]['message'].get('content') or ''
+              return text, r.get('provider', '?'), r.get('usage') or {}
+
+          text, who, usage = call([{'role': 'user', 'content': 'Reply with exactly: OK'}])
+          print(f'basic: {text.strip()[:40]!r}  ({who})  usage={usage}')
+          if 'OK' not in text:
+              print(f'::error::{model} did not return a usable completion: {who}'); sys.exit(1)
+
+          ok = True
+          for k in (1, 30, 70, 120):
+              filler = '\n'.join(f'def helper_{i}(x):\n    return x + {i}\n' for i in range(k * 1000 // 14))
+              text, who, usage = call([
+                  {'role': 'user', 'content': 'Remember this code word for later: PINEAPPLE-4217. Reply only OK.'},
+                  {'role': 'assistant', 'content': 'OK'},
+                  {'role': 'user', 'content': 'Here is a file:\n```\n' + filler + '\n```'},
+                  {'role': 'assistant', 'content': 'Noted.'},
+                  {'role': 'user', 'content': 'What was the code word I gave you earlier? Reply with just the code word.'}])
+              got = 'PINEAPPLE-4217' in text
+              ok = ok and got
+              tokens = usage.get('input_tokens') or usage.get('prompt_tokens') or '?'
+              print(f'~{k}k padding: {"OK  " if got else "LOST"} input_tokens={tokens} ({who}) answer={text.strip()[:80]!r}')
+          if not ok:
+              print('::error::the model lost earlier messages; the AI repair would not see the files'); sys.exit(1)
+          print(f'::notice::OK: {model} answers and keeps earlier messages up to ~120k tokens.')
           PY
-          done
+
+      - name: The same model through Aider (exactly as the repair calls it)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'anthropic/claude-haiku-5-5' }}
+        run: |
+          pip install --quiet aider-chat==0.86.2
+          mkdir -p /tmp/aidercheck && cd /tmp/aidercheck
+          printf 'def greet():\n    return "hello"\n' > greet.py
+          python3 "$GITHUB_WORKSPACE/scripts/openrouter_provider.py" aider "$AI_MODEL" > settings.json
+          aider --model "$AI_MODEL" --model-settings-file settings.json \
+                --edit-format diff --yes-always --no-git --no-auto-commits --no-auto-lint \
+                --no-auto-test --no-suggest-shell-commands --no-detect-urls \
+                --no-show-model-warnings --no-check-update --no-analytics --no-pretty --map-tokens 0 \
+                --message 'In greet.py, change the returned string from "hello" to "hello world". Change nothing else.' \
+                greet.py
+          cat greet.py
+          grep -q 'hello world' greet.py \
+            || { echo "::error::Aider with $AI_MODEL did not make the edit"; exit 1; }
+          echo "::notice::OK: Aider edited a file with $AI_MODEL."

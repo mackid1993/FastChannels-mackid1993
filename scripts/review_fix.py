@@ -8,7 +8,8 @@ makes it wrong/incomplete? Reading and judging an existing fix costs far fewer t
 regenerating one, and it's a skeptical double-check before anything ships.
 
 Usage:  git diff <upstream-sha> HEAD | review_fix.py <path-to-AGENTS.md>
-Env:    OPENROUTER_API_KEY (required), AI_MODEL (e.g. openrouter/z-ai/glm-5.3-flash)
+Env:    AI_MODEL (default anthropic/claude-haiku-5-5) and its key: ANTHROPIC_API_KEY for an
+        anthropic/ model, OPENROUTER_API_KEY for an openrouter/ one.
 Prints: 'APPROVE' on the first line if safe to merge+release, else 'CONCERNS: <reason>'.
         Fail-safe: any error or missing key prints CONCERNS, so the caller never blind-reuses.
 """
@@ -34,14 +35,51 @@ SYSTEM = (
 )
 
 
+def _call_anthropic(model: str, key: str, user: str) -> str:
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 8192,
+        "system": SYSTEM,
+        "messages": [{"role": "user", "content": user}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body,
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"},
+    )
+    resp = json.load(urllib.request.urlopen(req, timeout=180))
+    return "".join(b.get("text", "") for b in resp.get("content") or [] if b.get("type") == "text")
+
+
+def _call_openrouter(model: str, key: str, user: str) -> str:
+    # Provider routing shared with the AI repair (openrouter_provider.py): never OpenInference.
+    from openrouter_provider import provider
+    body = json.dumps({
+        "model": model,
+        "provider": provider(),
+        "max_tokens": 4096,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": user},
+        ],
+    }).encode()
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions", data=body,
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+    )
+    resp = json.load(urllib.request.urlopen(req, timeout=180))
+    return resp["choices"][0]["message"]["content"] or ""
+
+
 def main() -> None:
-    key = os.environ.get("OPENROUTER_API_KEY", "")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from openrouter_provider import is_anthropic, key_var
+    model = os.environ.get("AI_MODEL", "anthropic/claude-haiku-5-5")
+    var = key_var(model)
+    key = os.environ.get(var, "")
     if not key:
-        print("CONCERNS: no OPENROUTER_API_KEY for the review")
+        print("CONCERNS: no " + var + " for the review")
         return
-    model = os.environ.get("AI_MODEL", "openrouter/z-ai/glm-5.3-flash")
-    if model.startswith("openrouter/"):
-        model = model[len("openrouter/"):]
     diff = sys.stdin.read()
     if len(diff) > 120000:
         # Fail-closed: if the change is too big to show the reviewer in full, don't let a
@@ -59,29 +97,15 @@ def main() -> None:
         "=== AGENTS.md (overlay intent + hook table) ===\n" + agents
         + "\n\n=== FIX DIFF (the cached fix about to be merged + released) ===\n" + diff
     )
-    # Generous max_tokens: GLM 5.3 Flash is a reasoning model and spends tokens thinking before
-    # it answers (same reason model-preflight uses 2048) — too small a budget truncates the
-    # verdict and it reads as CONCERNS, so the cache would never be reused. No temperature:
-    # some reasoning models reject a non-default value.
-    # Provider routing shared with the AI repair (openrouter_provider.py): never OpenInference.
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from openrouter_provider import provider
-    body = json.dumps({
-        "model": model,
-        "provider": provider(),
-        "max_tokens": 4096,
-        "messages": [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": user},
-        ],
-    }).encode()
-    req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions", data=body,
-        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
-    )
+    # Generous output budget: reasoning models spend tokens thinking before the verdict, and
+    # a truncated verdict reads as CONCERNS. No temperature (some models reject it).
     try:
-        resp = json.load(urllib.request.urlopen(req, timeout=180))
-        content = (resp["choices"][0]["message"]["content"] or "").strip()
+        if is_anthropic(model):
+            content = _call_anthropic(model[len("anthropic/"):], key, user)
+        else:
+            content = _call_openrouter(model[len("openrouter/"):] if model.startswith("openrouter/") else model,
+                                       key, user)
+        content = content.strip()
         lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
         verdict = lines[-1] if lines else ""
         # Fail-closed: APPROVE only when the final line is unambiguously APPROVE AND nothing in

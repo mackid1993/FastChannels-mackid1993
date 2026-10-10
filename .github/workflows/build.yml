@@ -10,7 +10,7 @@ name: Build patched image
 #
 # The DEVELOPMENT branch is watched separately (upstream-watch.yml): it dispatches this
 # workflow in drift-check mode (drift_only=true, upstream_branch=development) to warn — and
-# prepare a GLM 5.3 Flash fix — ahead of a release, without ever building or publishing.
+# prepare a Claude Haiku 5.5 fix — ahead of a release, without ever building or publishing.
 
 on:
   schedule:
@@ -182,7 +182,7 @@ jobs:
           cat > body.md <<BODY
           Upstream \`$UPSTREAM_BRANCH\` moved to [\`${{ steps.inputs.outputs.short }}\`](https://github.com/$UPSTREAM_REPO/commit/${{ steps.inputs.outputs.sha }}) and a patch in \`patches/\` conflicts with it, even with a 3-way merge. No image was published; \`:latest\` still points at the last good build.
 
-          If the \`OPENROUTER_API_KEY\` secret is set, an AI is resolving the conflict now. Its fix must pass the static checks and a full image build, smoke test and boot test before it is merged; then a new image is published and this issue closes. If the AI can't fix it, you'll get a comment here.
+          If the \`ANTHROPIC_API_KEY\` (or \`OPENROUTER_API_KEY\`) secret is set, an AI is resolving the conflict now. Its fix must pass the static checks and a full image build, smoke test and boot test before it is merged; then a new image is published and this issue closes. If the AI can't fix it, you'll get a comment here.
 
           cc @${{ github.repository_owner }}
 
@@ -375,7 +375,7 @@ jobs:
       pull-requests: write
       actions: write
     env:
-      HAS_KEY: ${{ secrets.OPENROUTER_API_KEY != '' }}
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' || secrets.OPENROUTER_API_KEY != '' }}
     outputs:
       hit: ${{ steps.cache.outputs.hit }}
     steps:
@@ -395,7 +395,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'anthropic/claude-haiku-5-5' }}
         run: |
           pip install --quiet ruff jinja2
           # `|| true`: the script exits 1 on a cache miss and the default shell is -eo pipefail,
@@ -423,7 +424,7 @@ jobs:
     permissions:
       contents: read
     env:
-      HAS_KEY: ${{ secrets.OPENROUTER_API_KEY != '' }}
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' || secrets.OPENROUTER_API_KEY != '' }}
     steps:
       - name: Check out this repo
         if: env.HAS_KEY == 'true'
@@ -464,9 +465,11 @@ jobs:
         timeout-minutes: 20
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          # Any OpenRouter model, as "openrouter/<model id>". Override with the
-          # AI_MODEL repo variable (set to openrouter/z-ai/glm-5.3-flash).
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The model, as Aider names it: "anthropic/<id>" (ANTHROPIC_API_KEY, the default:
+          # Claude Haiku 5.5) or "openrouter/<id>" (OPENROUTER_API_KEY). Set by the AI_MODEL
+          # repo variable.
+          AI_MODEL: ${{ vars.AI_MODEL || 'anthropic/claude-haiku-5-5' }}
         run: |
           # Pinned: a new Aider release can change or drop flags this step relies on.
           pip install --quiet aider-chat==0.86.2
@@ -528,7 +531,8 @@ jobs:
           # Aider can edit only the files named on the command line; the brief, the
           # patch and AGENTS.md are read-only context. CI does all git operations and
           # validation, so Aider's own git, lint, test, shell and URL features are off.
-          # Provider routing (scripts/openrouter_provider.py): never OpenInference, prefer DeepInfra.
+          # Model settings (scripts/openrouter_provider.py): output budget for Anthropic models;
+          # provider routing for OpenRouter models (never OpenInference, prefer DeepInfra).
           python3 ../overlay/scripts/openrouter_provider.py aider "$AI_MODEL" > ../aider_model_settings.json
           aider --model "$AI_MODEL" --model-settings-file ../aider_model_settings.json \
                 --edit-format diff --yes-always --no-git \
@@ -544,6 +548,7 @@ jobs:
         if: env.HAS_KEY == 'true'
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           cd upstream
           conflicted=$(cat ../conflicted.txt)
@@ -558,9 +563,11 @@ jobs:
           fi
           # Belt and braces: the key is never in the model's context, but make sure
           # it can't end up in files that become a public PR.
-          if grep -qF -- "$OPENROUTER_API_KEY" $conflicted; then
-            echo "::error::the API key appeared in an edited file"; exit 1
-          fi
+          for key in "${ANTHROPIC_API_KEY:-}" "${OPENROUTER_API_KEY:-}"; do
+            if [ -n "$key" ] && grep -qF -- "$key" $conflicted; then
+              echo "::error::an API key appeared in an edited file"; exit 1
+            fi
+          done
           rm -rf .aider*
           git add -- $conflicted
           GIT_EDITOR=true git am --continue
@@ -576,7 +583,8 @@ jobs:
         timeout-minutes: 60
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'anthropic/claude-haiku-5-5' }}
           UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
           APK: ${{ needs.build.outputs.apk }}
           CACHE_BUST: ${{ github.run_id }}
@@ -638,7 +646,7 @@ jobs:
       fixed: ${{ steps.repair.outputs.fixed }}
       cache_hit: ${{ steps.cache.outputs.hit }}
     env:
-      HAS_KEY: ${{ secrets.OPENROUTER_API_KEY != '' }}
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' || secrets.OPENROUTER_API_KEY != '' }}
     steps:
       - name: Check out this repo
         if: env.HAS_KEY == 'true'
@@ -680,7 +688,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'anthropic/claude-haiku-5-5' }}
         run: |
           # Consult the cache of prepared fixes (open held PRs) before running the AI. If a held
           # PR's patches still apply + validate against this upstream, reuse it as-is: merge it
@@ -707,7 +716,8 @@ jobs:
         timeout-minutes: 60
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'anthropic/claude-haiku-5-5' }}
           UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
           APK: ${{ needs.build.outputs.apk }}
           CACHE_BUST: ${{ github.run_id }}
@@ -813,7 +823,7 @@ jobs:
             merge_note="This PR is merged automatically, which starts the publishing build. \`:latest\` only updates if that build passes too."
           fi
           cat > body.md <<BODY
-          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and $reason. The AI (\`${{ vars.AI_MODEL || 'openrouter/z-ai/glm-5.3-flash' }}\` via Aider) $did. The result passed the static checks and a full image build, Player APK check, smoke test and boot test.
+          Upstream moved to [\`$SHORT\`](https://github.com/$UPSTREAM_REPO/commit/$SHA) and $reason. The AI (\`${{ vars.AI_MODEL || 'anthropic/claude-haiku-5-5' }}\` via Aider) $did. The result passed the static checks and a full image build, Player APK check, smoke test and boot test.
 
           $merge_note
 

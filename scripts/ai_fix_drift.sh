@@ -10,10 +10,10 @@
 # In both cases the checkout is already patched and committed as one commit on <base>, so
 # `git diff <base> HEAD` is exactly the patch and the editable set is exactly its files.
 #
-#   UPSTREAM_SHA=<sha> OPENROUTER_API_KEY=<key> [AI_MODEL=<m>] [APK=<id>] [CACHE_BUST=<t>] \
+#   UPSTREAM_SHA=<sha> ANTHROPIC_API_KEY=<key> (or OPENROUTER_API_KEY for openrouter/ models) [AI_MODEL=<m>] [APK=<id>] [CACHE_BUST=<t>] \
 #       scripts/ai_fix_drift.sh <patched-checkout> <overlay-checkout>
 #
-# The AI (Aider on an OpenRouter model, GLM 5.3 Flash by default) sees the failing check's
+# The AI (Aider on Claude Haiku 5.5 via Anthropic by default; any openrouter/ model works too) sees the failing check's
 # log and AGENTS.md as read-only context and may edit only the overlay's own files. Every edit is
 # verified to stay in that set and to carry no API key, amended into the patch commit, then
 # re-checked against the WHOLE gauntlet (not just the stage that failed) — the same bar as a
@@ -35,9 +35,10 @@ set -uo pipefail
 dir=${1:?usage: ai_fix_drift.sh <patched-checkout> <overlay-checkout>}
 overlay_arg=${2:?usage: ai_fix_drift.sh <patched-checkout> <overlay-checkout>}
 base=${UPSTREAM_SHA:?set UPSTREAM_SHA to the upstream commit the patches were applied to}
-: "${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY}"
 root=$(cd "$(dirname "$0")/.." && pwd)
-model=${AI_MODEL:-openrouter/z-ai/glm-5.3-flash}
+model=${AI_MODEL:-anthropic/claude-haiku-5-5}
+key_var=$(python3 "$root/scripts/openrouter_provider.py" key-var "$model")
+[ -n "${!key_var:-}" ] || { echo "::error::$key_var is not set (needed for $model)"; exit 1; }
 max_passes=3
 
 work=$PWD
@@ -181,7 +182,7 @@ PY
   for f in $mods; do upstream_reads+=(--read "$f"); done
   local hist=()
   [ "$pass" -gt 1 ] && [ -f "$up/.aider.chat.history.md" ] && hist=(--read "$up/.aider.chat.history.md")
-  # Provider routing (see openrouter_provider.py): never OpenInference, prefer DeepInfra.
+  # Model settings (see openrouter_provider.py): output budget (Anthropic) or provider routing (OpenRouter).
   python3 "$root/scripts/openrouter_provider.py" aider "$model" > "$work/aider_model_settings.json"
   ( cd "$up" && aider --model "$model" --model-settings-file "$work/aider_model_settings.json" \
         --edit-format diff --yes-always \
@@ -207,9 +208,12 @@ verify_scope_and_commit() {  # 0 if the AI's edits are in-scope, key-free and co
   [ -z "$stray" ] || { echo "::error::the AI changed files outside the patch: $stray"; return 1; }
   # Belt and braces: the key is never in the model's context, but make sure it can't reach a
   # file that becomes a public PR.
-  if ( cd "$up" && grep -qF -- "$OPENROUTER_API_KEY" $changed ); then
-    echo "::error::the API key appeared in an edited file"; return 1
-  fi
+  local k
+  for k in "${ANTHROPIC_API_KEY:-}" "${OPENROUTER_API_KEY:-}"; do
+    if [ -n "$k" ] && ( cd "$up" && grep -qF -- "$k" $changed ); then
+      echo "::error::an API key appeared in an edited file"; return 1
+    fi
+  done
   # Keep Aider's chat history (the per-cycle handoff for the next attempt); drop its other
   # scratch files. Neither is ever staged -- only the patch's files are added and amended.
   ( cd "$up" && find . -maxdepth 1 -name '.aider*' ! -name '.aider.chat.history.md' -exec rm -rf {} + \

@@ -9,7 +9,7 @@
 # A candidate that applies + validates then gets a cautious, adversarial AI review of its actual
 # changes (scripts/review_fix.py) before it is accepted — a cheap second set of eyes that catches
 # a fix which is mechanically fine yet subtly wrong for this upstream. Reuse only on APPROVE;
-# otherwise move on (and the caller's AI fixes it properly). With no OPENROUTER_API_KEY the
+# otherwise move on (and the caller's AI fixes it properly). With no API key for AI_MODEL the
 # reviewer returns CONCERNS, so nothing is ever reused unreviewed (fail-closed).
 #
 # Pure lookup — no side effects. It clones upstream into a temp dir and restores the overlay's
@@ -19,7 +19,7 @@
 # reconcile both merge it and kick a publish, which dedups by build key so it can't over-build).
 #
 #   GH_TOKEN=<token> GITHUB_REPOSITORY=<owner/repo> \
-#       [OPENROUTER_API_KEY=<key> AI_MODEL=<m>]   # enable the adversarial review \
+#       [ANTHROPIC_API_KEY or OPENROUTER_API_KEY=<key> AI_MODEL=<m>]   # enable the adversarial review \
 #       scripts/try_held_fixes.sh <overlay-checkout> <upstream-repo> <upstream-sha>
 set -uo pipefail
 

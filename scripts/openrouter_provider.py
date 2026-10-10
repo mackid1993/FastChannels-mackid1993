@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""The OpenRouter provider routing every AI call in CI uses (the drift repair, the conflict
-repair and the held-fix reviewer).
+"""Model settings for every AI call in CI (the drift repair, the conflict repair and the
+held-fix reviewer). The model is the AI_MODEL repo variable, as Aider names it:
 
-Tested 2026-10-09 with the AI repair's exact request (~130k tokens, a renamed upstream
-function): OpenInference answered as if no files were in the chat, on every try, while
-DeepInfra read everything and wrote the correct fix (Z.AI, Fireworks, Together and Novita
-also read the files). So OpenInference is never used, DeepInfra is preferred, and other
-providers are only a fallback when DeepInfra is down.
+- "anthropic/<id>" (the default, Claude Haiku 5.5): Anthropic's API with ANTHROPIC_API_KEY.
+  Paid from the Claude Max plan's monthly API credit. Gets an explicit output budget, since
+  Anthropic requires max_tokens and a model newer than Aider's model list would otherwise get
+  a small default (and its adaptive thinking spends from the same budget).
+- "openrouter/<id>": OpenRouter with OPENROUTER_API_KEY, plus provider routing. Tested
+  2026-10-09 with the AI repair's exact request (~130k tokens): OpenInference answered as if no
+  files were in the chat, so it is never used, and DeepInfra is preferred. Override with the
+  AI_PROVIDER_ORDER / AI_PROVIDER_IGNORE repo variables (comma-separated).
 
-Override with the AI_PROVIDER_ORDER / AI_PROVIDER_IGNORE repo variables (comma-separated).
-
-    openrouter_provider.py json             -> {"order": [...], "ignore": [...], ...}
+    openrouter_provider.py json             -> OpenRouter routing {"order": [...], ...}
     openrouter_provider.py aider <model>    -> an Aider --model-settings-file for <model>
+    openrouter_provider.py key-var <model>  -> the env var holding <model>'s API key
 """
 import json
 import os
 import sys
+
+ANTHROPIC_MAX_TOKENS = 32000
 
 
 def provider() -> dict:
@@ -26,9 +30,26 @@ def provider() -> dict:
             'allow_fallbacks': True}
 
 
+def is_anthropic(model: str) -> bool:
+    return model.startswith('anthropic/')
+
+
+def key_var(model: str) -> str:
+    return 'ANTHROPIC_API_KEY' if is_anthropic(model) else 'OPENROUTER_API_KEY'
+
+
+def aider_settings(model: str) -> list:
+    if is_anthropic(model):
+        return [{'name': model, 'extra_params': {'max_tokens': ANTHROPIC_MAX_TOKENS}}]
+    # Aider passes extra_body straight into the OpenRouter request.
+    return [{'name': model, 'extra_params': {'extra_body': {'provider': provider()}}}]
+
+
 if __name__ == '__main__':
-    if sys.argv[1:2] == ['aider']:
-        # Aider passes extra_body straight into the OpenRouter request.
-        print(json.dumps([{'name': sys.argv[2], 'extra_params': {'extra_body': {'provider': provider()}}}]))
+    cmd = sys.argv[1:2]
+    if cmd == ['aider']:
+        print(json.dumps(aider_settings(sys.argv[2])))
+    elif cmd == ['key-var']:
+        print(key_var(sys.argv[2]))
     else:
         print(json.dumps(provider()))

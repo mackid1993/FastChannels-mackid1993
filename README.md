@@ -37,7 +37,7 @@ A `:latest` rebuild happens **only** on a real change (a new upstream commit, a 
 
 If upstream `main` doesn't have something the patch needs yet (for example, a feature that's only on his `development` branch so far), the scheduled build waits: it notes why and skips, with no failure and no AI repair, and `:latest` stays on the last good build.
 
-**It watches his `development` branch too.** On each new development commit, `upstream-watch.yml` runs the full test there (`test-development.yml`: build, smoke and boot test; nothing is published). If upstream drifted, the AI (GLM 5.3 Flash via Aider) prepares a fix as a *held* pull request, and a reconcile workflow merges and publishes it once it's proven correct against `main`. So a breaking change is usually fixed before his release lands.
+**It watches his `development` branch too.** On each new development commit, `upstream-watch.yml` runs the full test there (`test-development.yml`: build, smoke and boot test; nothing is published). If upstream drifted, the AI (Claude Haiku 5.5 via Aider) prepares a fix as a *held* pull request, and a reconcile workflow merges and publishes it once it's proven correct against `main`. So a breaking change is usually fixed before his release lands.
 
 To build from development on purpose, run **Build patched image** with `upstream_branch=development`. On its own that's a test run (nothing is published); tick `publish` too to publish it as `:latest`. Scheduled builds always use `main`.
 
@@ -68,7 +68,7 @@ If any step fails, nothing is published, `:latest` stays on the last good build,
 
 Because the patch only adds the overlay's own files, a conflict should only happen if upstream adds a file with one of the overlay's names. If one does, step 2 fails and the workflow opens an issue with the upstream commit and instructions.
 
-It then asks the AI to resolve it: [Aider](https://aider.chat) with an OpenRouter model (the `OPENROUTER_API_KEY` secret; the model is the `AI_MODEL` repo variable, defaulting to GLM 5.3 Flash, `openrouter/z-ai/glm-5.3-flash`), with the patch and `AGENTS.md` as background. It can edit only the overlay's files, and its result must pass the static checks **and** a full image build, Player APK check, smoke test and boot test before anything is merged. If it can't produce a passing fix, nothing is merged and the issue gets a comment saying so.
+It then asks the AI to resolve it: [Aider](https://aider.chat) with Claude Haiku 5.5 on Anthropic's API (the `ANTHROPIC_API_KEY` secret, paid from the Claude Max plan's monthly API credit; the model is the `AI_MODEL` repo variable, `anthropic/claude-haiku-5-5`). An OpenRouter model still works: set `AI_MODEL` to `openrouter/<model id>` and add an `OPENROUTER_API_KEY` secret. After changing the model, run the **Model preflight** workflow, with the patch and `AGENTS.md` as background. It can edit only the overlay's files, and its result must pass the static checks **and** a full image build, Player APK check, smoke test and boot test before anything is merged. If it can't produce a passing fix, nothing is merged and the issue gets a comment saying so.
 
 To fix a conflict by hand instead:
 

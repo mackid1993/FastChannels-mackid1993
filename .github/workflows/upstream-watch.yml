@@ -11,7 +11,7 @@ name: Upstream watch (development)
 #     build.yml  upstream_branch=development  drift_only=true
 #
 # In that mode build.yml applies the patches to development and runs the static checks
-# (no image, no publish — it's a "test run"). If the patch drifts/conflicts, the GLM 5.3
+# (no image, no publish — it's a "test run"). If the patch drifts/conflicts, the Claude Haiku 5.5
 # Flash resolver adapts it and opens a HELD pull request (branch auto/drift-<short>)
 # labelled with the development commit it fixes. Nothing is built, published, or merged
 # here, so it can never touch :latest.
